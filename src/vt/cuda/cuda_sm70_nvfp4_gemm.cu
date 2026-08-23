@@ -14,8 +14,10 @@
 //
 // Dispatch (BACKEND-CUDA-ARCH-ADDITIVITY): this TU registers ONE tactic for
 // TacticFamily::kSm70Nvfp4W4a16; the launcher's portable path is untouched.
-// Current band: SIMT decode M <= 3. QPN (M 4-16) and WMMA (M 17-64) are the
-// next brick; otherwise Launch returns false => caller falls back.
+// Bands: SIMT decode M <= 3 (brick A) and WMMA tiles M 4..64 (brick B, m-padded
+// 16-row tiles, k%512==0 and n%16==0). The QPN m8n8k4 Volta tensor-core band
+// (the bw-optimal M 4..16) remains the next brick; otherwise Launch returns
+// false => caller falls back.
 //
 // Self-check contract (inherited from skinny): the first two eager calls are
 // cross-checked against a CPU fp32 reference on the LIVE arguments; a mismatch
@@ -30,6 +32,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
@@ -195,6 +198,126 @@ __global__ void Sm70Nvfp4SimtDecode(const uint8_t* __restrict__ codes,
 }
 
 // ---------------------------------------------------------------------------
+// WMMA band (brick B): WN x WM warps of 16x16 fp16 tiles, KC-deep smem staging
+// with software pipelining. Operates on the SAME codes/scales layout (dequant
+// in shared); the epilogue undoes the 2^-14 re-bias folded by dequant8_k2.
+// Handles m < MT via m_real (rows padded with zeros) and n % (WN*16) == 0.
+// The original (small-M band 4..16) is served by a single 16-row tile; the
+// QPN m8n8k4 tensor-core variant remains a later brick (this tile is correct,
+// not yet the bw-optimal one for M in 4..16).
+// ---------------------------------------------------------------------------
+template <int WN, int WM, int KC>
+__global__ void Sm70Nvfp4Wmma(const uint8_t* __restrict__ codes,
+                              const uint8_t* __restrict__ scales,
+                              const __half* __restrict__ x,
+                              __half* __restrict__ y, int N, int K,
+                              int m_real, float gscale) {
+  constexpr int NT = WN * 16, MT = WM * 16;
+  constexpr int PW = KC + 16, PX = KC + 16;  // padded smem pitches (halfs)
+  constexpr int NTHREADS = WN * WM * 32;
+  constexpr int CSEG = NT * (KC / 16) / NTHREADS;
+  constexpr int XSEG = MT * (KC / 8) / NTHREADS;
+  static_assert(CSEG * NTHREADS == NT * (KC / 16), "code seg split");
+  static_assert(XSEG * NTHREADS == MT * (KC / 8), "x seg split");
+
+  extern __shared__ char smem_raw[];
+  __half* ws = reinterpret_cast<__half*>(smem_raw);  // [NT][PW]
+  __half* xs = ws + NT * PW;                         // [MT][PX]
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const int wn = warp % WN, wm = warp / WN;
+  const int nb = blockIdx.x * NT;
+
+  uint2 st_c[CSEG];
+  unsigned char st_s[CSEG];
+  uint4 st_x[XSEG];
+
+  auto load_stage = [&](int k0) {
+#pragma unroll
+    for (int i = 0; i < CSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int n = idx / (KC / 16), s = idx % (KC / 16);
+      st_c[i] = __ldcs(reinterpret_cast<const uint2*>(codes + (size_t)(nb + n) * (K >> 1) + (k0 >> 1) + s * 8));
+      st_s[i] = __ldcs(scales + (size_t)(nb + n) * (K >> 4) + (k0 >> 4) + s);
+    }
+#pragma unroll
+    for (int i = 0; i < XSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
+      st_x[i] = (m < m_real) ? *reinterpret_cast<const uint4*>(x + (size_t)m * K + k0 + j4 * 8)
+                             : make_uint4(0, 0, 0, 0);
+    }
+  };
+
+  auto store_stage = [&]() {
+#pragma unroll
+    for (int i = 0; i < CSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int n = idx / (KC / 16), s = idx % (KC / 16);
+      const __half2 sc2 = fp8e4m3_to_half2(st_s[i]);
+      __half2* wrow = reinterpret_cast<__half2*>(ws + n * PW + s * 16);
+      const unsigned qs[2] = {st_c[i].x, st_c[i].y};
+#pragma unroll
+      for (int w = 0; w < 2; w++) {
+        __half2 t[4];
+        dequant8_k2(qs[w], sc2, t);  // values carry a 2^-14 factor here
+        const unsigned* tr = reinterpret_cast<const unsigned*>(t);
+        unsigned lin[4] = {__byte_perm(tr[0], tr[1], 0x5410),
+                           __byte_perm(tr[2], tr[3], 0x5410),
+                           __byte_perm(tr[0], tr[1], 0x7632),
+                           __byte_perm(tr[2], tr[3], 0x7632)};
+#pragma unroll
+        for (int pi = 0; pi < 4; pi++)
+          wrow[w * 4 + pi] = *reinterpret_cast<__half2*>(&lin[pi]);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < XSEG; i++) {
+      const int idx = tid + i * NTHREADS;
+      const int m = idx / (KC / 8), j4 = idx % (KC / 8);
+      *reinterpret_cast<uint4*>(xs + m * PX + j4 * 8) = st_x[i];
+    }
+  };
+
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag;
+  nvcuda::wmma::fill_fragment(cfrag, 0.f);
+
+  load_stage(0);
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    __syncthreads();
+    store_stage();
+    __syncthreads();
+    if (k0 + KC < K) load_stage(k0 + KC);
+
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a[2];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b[2];
+    nvcuda::wmma::load_matrix_sync(a[0], ws + wn * 16 * PW, PW);
+    nvcuda::wmma::load_matrix_sync(b[0], xs + wm * 16 * PX, PX);
+#pragma unroll
+    for (int kk = 0; kk < KC / 16; kk++) {
+      const int cur = kk & 1, nxt = cur ^ 1;
+      if (kk + 1 < KC / 16) {
+        nvcuda::wmma::load_matrix_sync(a[nxt], ws + wn * 16 * PW + (kk + 1) * 16, PW);
+        nvcuda::wmma::load_matrix_sync(b[nxt], xs + wm * 16 * PX + (kk + 1) * 16, PX);
+      }
+      nvcuda::wmma::mma_sync(cfrag, a[cur], b[cur], cfrag);
+    }
+  }
+
+  __syncthreads();
+  float* cs = reinterpret_cast<float*>(smem_raw) + warp * 256;
+  nvcuda::wmma::store_matrix_sync(cs, cfrag, 16, nvcuda::wmma::mem_row_major);
+  __syncwarp();
+  const float gs_eff = gscale * 16384.f;  // undo dequant8_k2's 2^-14
+  for (int e = lane; e < 256; e += 32) {
+    const int i = e >> 4, j = e & 15;  // i: n within 16-tile, j: m within tile
+    const int gm = wm * 16 + j, gn = nb + wn * 16 + i;
+    if (gm < m_real) y[(size_t)gm * N + gn] = __float2half(cs[e] * gs_eff);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Host side helpers (bit-exact against the device arithmetic).
 // ---------------------------------------------------------------------------
 
@@ -248,9 +371,12 @@ bool RunSelfCheck(const Sm70Nvfp4W4a16Args& args, SelfCheckState& state) {
   state.remaining--;
 
   const int m = static_cast<int>(args.m), n = static_cast<int>(args.n), k = static_cast<int>(args.k);
-  if (m <= 0 || m > 3 || n <= 0 || k <= 0 || (size_t)m * n * k > (1 << 22)) {
+  if (m <= 0 || m > 64 || n <= 0 || k <= 0 || (size_t)m * n * k > (1 << 22)) {
     return !state.disabled;  // shape too large to host-check; trust the band
   }
+  // The WMMA band (M 4..64) requires its own preconditions; CPU-verify it
+  // only where it would actually have launched.
+  if (m >= 4 && ((n & 15) != 0 || (k % 512) != 0)) return !state.disabled;
 
   std::vector<__half> x((size_t)m * k);
   std::vector<__half> y((size_t)m * n);
@@ -285,33 +411,78 @@ bool LaunchSm70Nvfp4W4a16(const DeviceCaps&, void* argsPtr) {
   auto& args = *static_cast<Sm70Nvfp4W4a16Args*>(argsPtr);
   const int m = static_cast<int>(args.m), n = static_cast<int>(args.n), k = static_cast<int>(args.k);
   if (m <= 0 || n <= 0 || k <= 0 || (k & 15) || (n & 7)) return false;
-  if (m > 3) return false;  // QPN (M 4-16) / WMMA (M 17-64): next brick
+  if (m > 64) return false;  // beyond the tile family (next band: >64 prefill)
 
   static SelfCheckState self;
   const char* sk = std::getenv("VT_SM70_SELFCHECK");
   const bool check_enabled = !(sk && sk[0] == '0');
-  if (check_enabled && !RunSelfCheck(args, self)) return false;
+  // Band preconditions; the check must only compare output of a kernel that
+  // WILL run (never host-memory of a declined shape).
+  const bool mma_band = m >= 4 && (n & 15) == 0 && k % 512 == 0;
+  if (check_enabled && (((m <= 3) || mma_band) && !RunSelfCheck(args, self))) return false;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(args.stream);
   auto* y = static_cast<__half*>(args.out);
   auto* x = static_cast<const __half*>(args.x);
   auto* codes = static_cast<const uint8_t*>(args.codes);
   auto* scales = static_cast<const uint8_t*>(args.scales);
-  constexpr int KC = 512;
-  const int smem = 3 * (KC / 2) * (int)sizeof(__half2);  // max M = 3
-  switch (m) {
-    case 1:
-      Sm70Nvfp4SimtDecode<1, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
-      break;
-    case 2:
-      Sm70Nvfp4SimtDecode<2, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
-      break;
-    case 3:
-    default:
-      Sm70Nvfp4SimtDecode<3, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
-      break;
+
+if (m <= 3) {
+    constexpr int KC = 512;
+    const int smem = 3 * (KC / 2) * (int)sizeof(__half2);  // max M = 3
+    switch (m) {
+      case 1:
+        Sm70Nvfp4SimtDecode<1, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
+        break;
+      case 2:
+        Sm70Nvfp4SimtDecode<2, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
+        break;
+      case 3:
+      default:
+        Sm70Nvfp4SimtDecode<3, KC><<<n / 8, 256, smem, stream>>>(codes, scales, x, y, n, k, args.gscale);
+        break;
+    }
+    return cudaGetLastError() == cudaSuccess;
   }
-  return cudaGetLastError() == cudaSuccess;
+
+  // WMMA band (brick B): M 4..64 served by 1..4 16-row tiles with row padding.
+  // The tensor-core tiles have no k-tail: require k % 512 == 0 (falls back to
+  // the portable path otherwise). n must be 16-aligned for the tile grid.
+  if (m >= 4 && (n & 15) == 0 && k % 512 == 0) {
+    constexpr int KC = 512;
+    const int wm = m <= 16 ? 1 : (m <= 32 ? 2 : 4);  // splits must divide 512:  1/2/4
+    const int mt = wm * 16;
+    const int smem = (int)((16 + mt) * (KC + 16) * (int)sizeof(__half));
+    // V100: 48KB default dynamic smem; larger tiles need the attribute (one
+    // per kernel config; repeated SetAttribute is a cheap no-op).
+    const bool need_attr = smem > 48 * 1024;
+    switch (wm) {
+      case 1:
+        if (need_attr) {
+          cudaFuncSetAttribute((const void*)Sm70Nvfp4Wmma<1, 1, KC>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+        Sm70Nvfp4Wmma<1, 1, KC><<<n / 16, 32, smem, stream>>>(codes, scales, x, y, n, k, m, args.gscale);
+        break;
+      case 2:
+        if (need_attr) {
+          cudaFuncSetAttribute((const void*)Sm70Nvfp4Wmma<1, 2, KC>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+        Sm70Nvfp4Wmma<1, 2, KC><<<n / 16, 64, smem, stream>>>(codes, scales, x, y, n, k, m, args.gscale);
+        break;
+      case 4:
+      default:
+        if (need_attr) {
+          cudaFuncSetAttribute((const void*)Sm70Nvfp4Wmma<1, 4, KC>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        }
+        Sm70Nvfp4Wmma<1, 4, KC><<<n / 16, 128, smem, stream>>>(codes, scales, x, y, n, k, m, args.gscale);
+        break;
+    }
+    return cudaGetLastError() == cudaSuccess;
+  }
+  return false;
 }
 
 struct Registrar {
