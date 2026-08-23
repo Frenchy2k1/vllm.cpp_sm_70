@@ -19,6 +19,7 @@ extern "C" int vt_cuda_nccl_group_selfcheck(void);
 extern "C" int vt_cuda_tp_seam_selfcheck(void);
 extern "C" int vt_cuda_loader_slice_selfcheck(void);
 extern "C" int vt_cuda_sharded_forward_selfcheck(void);
+extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void);
 extern "C" void* vt_cuda_tp_acquire(int tp_size);
 extern "C" void vt_cuda_tp_release(void* handle);
 
@@ -60,6 +61,15 @@ TEST_CASE("engine bridge: acquire a retained NCCL TP group for tp>1, null at tp1
   REQUIRE(h != nullptr);
   vt_cuda_tp_release(h);                // and the runner can release it
 #endif
+}
+
+TEST_CASE("dense-body shard: merged gate/up column-slice + down row-parallel reduce == MLP single-GPU") {
+  const int rc = vt_cuda_dense_mlp_shard_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); dense shard skipped");
+    return;
+  }
+  CHECK(rc == 0);
 }
 
 TEST_CASE("runner forward: device-sharded GEMM + group all-reduce == single-GPU forward") {

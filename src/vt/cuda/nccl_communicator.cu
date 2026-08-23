@@ -551,6 +551,105 @@ extern "C" int vt_cuda_sharded_forward_selfcheck(void) {
   return bad.load();
 }
 
+// Dense-body shard (tp-rollout step 2 primitive): per-rank column-slice of the
+// merged gate/up, one thread per output row, row-parallel over the group reduce.
+__global__ void DenseMlpRankPartial(const float* x, int H, const float* gate,
+                                    const float* up, const float* downfull,
+                                    float* out, int per_i, int i0, int I, int O) {
+  const int o = blockIdx.x * blockDim.x + threadIdx.x;
+  if (o >= O) return;
+  float acc = 0.f;
+  for (int q = 0; q < per_i; ++q) {
+    const int gi = i0 + q;
+    float g = 0.f, u = 0.f;
+    for (int k = 0; k < H; ++k) { g += x[k] * gate[gi * H + k]; u += x[k] * up[gi * H + k]; }
+    const float sg = 1.f / (1.f + __expf(-g));
+    acc += (g * sg) * u * downfull[o * I + gi];
+  }
+  out[o] = acc;
+}
+
+extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void) {
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  constexpr int O = 16, H = 32, I = 32;   // I % W == 0
+  const int64_t per = I / W;
+
+  std::vector<float> x(H), gate(I * H), up(I * H), down(O * I);
+  for (int k = 0; k < H; ++k) x[k] = 0.5f + (float)(k % 3);
+  for (int i = 0; i < I; ++i) for (int k = 0; k < H; ++k) gate[i * H + k] = 0.1f * ((i * 3 + k) % 7) + 0.05f;
+  for (int i = 0; i < I; ++i) for (int k = 0; k < H; ++k) up[i * H + k] = 0.05f * ((i * 5 + k * 2) % 9) + 0.2f;
+  for (int o = 0; o < O; ++o) for (int i = 0; i < I; ++i) down[o * I + i] = 0.02f * ((o * 7 + i * 3) % 11) + 0.4f;
+
+  std::vector<float> ref(O, 0.f);
+  for (int o = 0; o < O; ++o) {
+    double a = 0.0;
+    for (int i = 0; i < I; ++i) {
+      float gu = 0.f;
+      for (int k = 0; k < H; ++k) gu += x[k] * gate[i * H + k];
+      float uu = 0.f;
+      for (int k = 0; k < H; ++k) uu += x[k] * up[i * H + k];
+      const float sg = 1.f / (1.f + (float)std::exp(-(double)gu));
+      a += (double)((gu * sg) * uu) * down[o * I + i];
+    }
+    ref[o] = (float)a;
+  }
+
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      cudaStream_t st = nullptr;
+      float *dx = nullptr, *dgu = nullptr, *dd = nullptr, *dout = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, (size_t)H * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dgu, (size_t)(2 * I * H) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dd, (size_t)(O * I) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dout, (size_t)O * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); if (st) cudaStreamDestroy(st);
+        return;
+      }
+      std::vector<float> gu((size_t)(2 * I * H), 0.f);
+      for (int64_t i = ib; i < ib + per; ++i)
+        for (int k = 0; k < H; ++k) {
+          gu[(size_t)(i * H + k)] = gate[i * H + k];
+          gu[(size_t)(((I + i) * H + k))] = up[i * H + k];
+        }
+      std::vector<float> dmask((size_t)(O * I), 0.f);
+      for (int o = 0; o < O; ++o) for (int64_t i = ib; i < ib + per; ++i) dmask[o * I + i] = down[o * I + i];
+      cudaMemcpyAsync(dx, x.data(), (size_t)H * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dgu, gu.data(), (size_t)(2 * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dd, dmask.data(), (size_t)(O * I) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      DenseMlpRankPartial<<<(unsigned)((O + 31) / 32), 32, 0, st>>>(
+          dx, H, dgu, dgu + (size_t)(I * H), dd, dout, (int)per, (int)ib, (int)I, (int)O);
+      Queue q;
+      q.device = Device{DeviceType::kCUDA, r};
+      q.handle = st;
+      g->Rank(r)->AllReduce(q, dout, (size_t)O, DType::kF32, ReduceOp::kSum);
+      std::vector<float> back((size_t)O, 0.f);
+      cudaMemcpyAsync(back.data(), dout, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      for (int o = 0; o < O; ++o) {
+        if (std::fabs(back[(size_t)o] - ref[(size_t)o]) > 1e-3f) {
+          fprintf(stderr, "vt dense-mlp-shard: rank %d out[%d]=%.4f want %.4f\n", r, o,
+                  (double)back[(size_t)o], (double)ref[(size_t)o]);
+          bad.store(1, std::memory_order_relaxed);
+        }
+      }
+      cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
 }  // namespace
 }  // namespace vt
 #endif  // VT_NCCL
