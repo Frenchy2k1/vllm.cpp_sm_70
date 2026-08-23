@@ -55,6 +55,32 @@ void Check(cudaError_t err, const char* what) {
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
 
+// Multi-device (TP) phase-2 affinity: sets the current CUDA device to `dev`
+// for the method's lifetime when it differs from the ambient device, restoring
+// the caller's device on exit. On a single-GPU box (device == current) this is
+// a strict no-op, so the single-GPU engine path is byte-identical. It is what
+// lets a Device{kCUDA,i} backend actually allocate/create streams/launch on
+// GPU i instead of the ambient (device-0) context.
+class CudaDeviceScope {
+ public:
+  explicit CudaDeviceScope(int device) noexcept
+      : device_(device), prev_(0), active_(false) {
+    if (cudaGetDevice(&prev_) == cudaSuccess && prev_ != device_) {
+      active_ = (cudaSetDevice(device_) == cudaSuccess);  // else leave ambient; op's Check surfaces the error
+    }
+  }
+  ~CudaDeviceScope() noexcept {
+    if (active_) (void)cudaSetDevice(prev_);
+  }
+  CudaDeviceScope(const CudaDeviceScope&) = delete;
+  CudaDeviceScope& operator=(const CudaDeviceScope&) = delete;
+
+ private:
+  int device_;
+  int prev_;
+  bool active_;
+};
+
 class CudaBackend final : public Backend {
  public:
   // Non-throwing by design: constructed during static init by the registrar,
@@ -77,27 +103,32 @@ class CudaBackend final : public Backend {
   // cudaMalloc returns allocations aligned to at least 256 bytes, which
   // satisfies the >=64B contract on Backend::Alloc (StepArena depends on it).
   void* Alloc(size_t bytes) override {
+    CudaDeviceScope ds(device_);
     void* p = nullptr;
     Check(cudaMalloc(&p, bytes), "cudaMalloc");
     return p;
   }
-  void Free(void* p) override { Check(cudaFree(p), "cudaFree"); }
+  void Free(void* p) override {
+    CudaDeviceScope ds(device_);
+    Check(cudaFree(p), "cudaFree");
+  }
   void Memset(Queue& q, void* p, int value, size_t bytes) override {
+    CudaDeviceScope ds(device_);
     Check(cudaMemsetAsync(p, value, bytes, AsStream(q)), "cudaMemsetAsync");
   }
-  // cudaMemcpyDefault infers the direction from the pointer values, so one
-  // entry point covers h2d, d2h, and d2d (and pageable host pointers on
-  // unified-memory devices such as GB10).
   void Copy(Queue& q, void* dst, const void* src, size_t bytes) override {
+    CudaDeviceScope ds(device_);
     Check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, AsStream(q)), "cudaMemcpyAsync");
   }
   Queue CreateQueue() override {
+    CudaDeviceScope ds(device_);
     cudaStream_t stream = nullptr;
     Check(cudaStreamCreate(&stream), "cudaStreamCreate");
     return Queue{Device{DeviceType::kCUDA, device_}, stream};
   }
   void DestroyQueue(Queue& q) override {
     if (q.handle == nullptr) return;
+    CudaDeviceScope ds(device_);
 #ifdef VLLM_CPP_FLASH_ATTN
     ReleaseFa2Scratch(device_, q.handle);
 #endif
@@ -108,6 +139,7 @@ class CudaBackend final : public Backend {
     q.handle = nullptr;
   }
   void Synchronize(Queue& q) override {
+    CudaDeviceScope ds(device_);
     Check(cudaStreamSynchronize(AsStream(q)), "cudaStreamSynchronize");
   }
   bool UnifiedMemory() const override { return unified_memory_; }
@@ -137,6 +169,7 @@ class CudaBackend final : public Backend {
     if (p != nullptr) Check(cudaFreeHost(p), "cudaFreeHost");
   }
   Event CreateEvent(bool blocking = false) override {
+    CudaDeviceScope ds(device_);
     cudaEvent_t ev = nullptr;
     // cudaEventDisableTiming: we only ever wait on completion, never measure —
     // this is the cheaper synchronization-only event (mirrors torch.Event()).
@@ -151,19 +184,23 @@ class CudaBackend final : public Backend {
   }
   void DestroyEvent(Event& e) override {
     if (e.handle == nullptr) return;
+    CudaDeviceScope ds(device_);
     Check(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(e.handle)),
           "cudaEventDestroy");
     e.handle = nullptr;
   }
   void RecordEvent(Event& e, Queue& q) override {
+    CudaDeviceScope ds(device_);
     Check(cudaEventRecord(reinterpret_cast<cudaEvent_t>(e.handle), AsStream(q)),
           "cudaEventRecord");
   }
   void SynchronizeEvent(Event& e) override {
+    CudaDeviceScope ds(device_);
     Check(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(e.handle)),
           "cudaEventSynchronize");
   }
   bool QueryEvent(Event& e) override {
+    CudaDeviceScope ds(device_);
     // cudaEventQuery returns cudaErrorNotReady (NOT an error) while the event
     // is outstanding; anything else is a real failure. Clear the sticky
     // not-ready status so it cannot be mistaken for a later launch error.
@@ -176,6 +213,7 @@ class CudaBackend final : public Backend {
     return true;
   }
   void QueueWaitEvent(Queue& q, Event& e) override {
+    CudaDeviceScope ds(device_);
     Check(cudaStreamWaitEvent(AsStream(q),
                               reinterpret_cast<cudaEvent_t>(e.handle), 0),
           "cudaStreamWaitEvent");
@@ -204,10 +242,12 @@ class CudaBackend final : public Backend {
   // between-steps host readback the depth-2 async input-combine needs is valid.
   bool SupportsAsyncSampledTokenReadback() const override { return true; }
   void BeginCapture(Queue& q) override {
+    CudaDeviceScope ds(device_);
     Check(cudaStreamBeginCapture(AsStream(q), cudaStreamCaptureModeThreadLocal),
           "cudaStreamBeginCapture");
   }
   void EndCapture(Queue& q) override {
+    CudaDeviceScope ds(device_);
     cudaGraph_t graph = nullptr;
     Check(cudaStreamEndCapture(AsStream(q), &graph), "cudaStreamEndCapture");
     if (exec_ != nullptr) {
@@ -218,6 +258,7 @@ class CudaBackend final : public Backend {
     cudaGraphDestroy(graph);
   }
   void Replay(Queue& q) override {
+    CudaDeviceScope ds(device_);
     Check(cudaGraphLaunch(exec_, AsStream(q)), "cudaGraphLaunch");
   }
 
@@ -225,6 +266,7 @@ class CudaBackend final : public Backend {
   // stream graph and hand the exec back as an opaque handle the driver owns +
   // selects per padded batch size. Unlike EndCapture, nothing is stored here.
   void* EndCaptureGraph(Queue& q) override {
+    CudaDeviceScope ds(device_);
     cudaGraph_t graph = nullptr;
     Check(cudaStreamEndCapture(AsStream(q), &graph), "cudaStreamEndCapture");
     // ENG-CUDAGRAPH-DEDUP (#1162): with VT_CUDA_GRAPH_DEDUP set, hand the RAW graph to
@@ -245,6 +287,7 @@ class CudaBackend final : public Backend {
     return reinterpret_cast<void*>(exec);
   }
   void ReplayGraph(Queue& q, void* graph) override {
+    CudaDeviceScope ds(device_);
 #ifdef VT_BENCH_PROFILE_CONTROL
     const bool eligible =
         g_cuda_profile_eligible_pending && graph == g_cuda_profile_pending_graph;

@@ -11,6 +11,7 @@
 #endif
 
 #include "vt/backend.h"
+#include "vt/device.h"
 
 namespace {
 
@@ -200,5 +201,56 @@ TEST_CASE("CUDA backend reports the device compute capability") {
   CHECK(major > 0);
   CHECK(cuda.DeviceCapabilityMajor() == major);
   CHECK(cuda.DeviceCapabilityMinor() == minor);
+#endif
+}
+
+// Multi-device (TP) phase-2 device AFFINITY: a Device{kCUDA,i} backend must
+// allocate / run on GPU i, NOT the ambient (device-0) context. Every CUDA
+// backend now enters a CudaDeviceScope for the device-touching methods (set
+// when device != current, restores the caller's device on exit), and this is
+// gated on a real >=2-GPU box: on a single GPU, device == current so every
+// scope is a no-op and the legacy path is byte-identical.
+TEST_CASE("CUDA backend: per-device index allocates/initializes on the addressed GPU") {
+#ifndef VLLM_CPP_CUDA
+  MESSAGE("CUDA support not built; skipping");
+  CHECK(true);
+#else
+  int count = 0;
+  REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
+  if (count < 2) {
+    MESSAGE("single-GPU box; multi-device affinity skipped");
+    return;
+  }
+  for (int i = 0; i < count; ++i) {
+    Backend* b = vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, i});
+    REQUIRE(b != nullptr);
+    Queue q = b->CreateQueue();
+    CHECK(q.device.index == i);
+    constexpr size_t kBytes = 64 * 1024;
+    void* d = b->Alloc(kBytes);
+    REQUIRE(d != nullptr);
+    cudaPointerAttributes attr{};
+    REQUIRE(cudaPointerGetAttributes(&attr, d) == cudaSuccess);
+    CHECK(attr.type == cudaMemoryTypeDevice);
+
+    // THE AFFINITY ASSERTION: an Alloc issued to the device-i backend must
+    // physically live on GPU i (the guard calls cudaMalloc on device i).
+    MESSAGE("GPU " << i << ": alloc of " << kBytes << "B -> device " << attr.device);
+    CHECK(attr.device == i);
+
+    // Attach-side affinity: Memset/Copy via ITS queue also lands on GPU i
+    // (Memset on the wrong device would not be readable back here as 0xCD on
+    // non-P2P-disjoint devices; compare the round-trip for each index).
+    std::vector<unsigned char> host(kBytes, 0);
+    b->Memset(q, d, 0xCD, kBytes);
+    b->Synchronize(q);
+    b->Copy(q, host.data(), d, kBytes);
+    b->Synchronize(q);
+    CHECK(host.front() == 0xCD);
+    CHECK(host.back() == 0xCD);
+
+    b->Free(d);
+    b->DestroyQueue(q);
+  }
 #endif
 }
