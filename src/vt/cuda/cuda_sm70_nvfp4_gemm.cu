@@ -427,6 +427,109 @@ __global__ void Sm70Nvfp4PackQpn(const uint8_t* __restrict__ codes,
   qscales[(size_t)(tile * G + g) * 32 + lane] = scales[(size_t)row * G + g];
 }
 
+// Fused greedy-argmax decode (M == 1): the same row- decode as the SIMT band
+// but, instead of writing the fp16 row, each 8-warp block keeps its per-column
+// winner and emits one (val, idx) pair per block (frontier semantics of the
+// v100-skinny `gemm_simt_argmax`: the caller reduces across blocks). Used by
+// the drafter's lm_head. `y` may stay null (no row materialization).
+__global__ void Sm70Nvfp4SimtArgmax(const uint8_t* __restrict__ codes,
+                                    const uint8_t* __restrict__ scales,
+                                    const __half* __restrict__ x,
+                                    __half* __restrict__ y,
+                                    __half* __restrict__ argmax_val,
+                                    int* __restrict__ argmax_idx, int N, int K,
+                                    float gscale) {
+  constexpr int KC = 512;
+  constexpr int P2 = KC / 2;
+  extern __shared__ char smem_raw[];
+  __half2* xs = reinterpret_cast<__half2*>(smem_raw);  // [1][P2]
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int col = blockIdx.x * 8 + warp;  // one of the block's 8 columns
+  const uint8_t* crow = codes + (size_t)col * (K >> 1);
+  const uint8_t* srow = scales + (size_t)col * (K >> 4);
+  const __half2 gm2 = __float2half2_rn(gscale * 16384.f);
+  float acc = 0.f;
+
+  int k0 = 0;
+  for (; k0 + KC <= K; k0 += KC) {
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < KC / 8; idx += blockDim.x) {
+      const uint4 v = *reinterpret_cast<const uint4*>(x + k0 + idx * 8);
+      stage_pairs(xs, idx * 4, v);
+    }
+    __syncthreads();
+    for (int t = 0; t < KC / 512; t++) {
+      const int s = lane + 32 * t;
+      const uint2 q2 = *reinterpret_cast<const uint2*>(crow + (k0 >> 1) + s * 8);
+      const __half2 sc = __hmul2(fp8e4m3_to_half2(srow[(k0 >> 4) + s]), gm2);
+      __half2 acch = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+#pragma unroll
+      for (int w = 0; w < 2; w++) {
+        __half2 w8[4];
+        dequant8_k2(w == 0 ? q2.x : q2.y, sc, w8);
+#pragma unroll
+        for (int pi = 0; pi < 4; pi++) {
+          const int ps = swz(s * 8 + w * 4 + pi);
+          acch = __hfma2(w8[pi], xs[ps], acch);
+        }
+      }
+      const float2 f = __half22float2(acch);
+      acc += f.x + f.y;
+    }
+    __syncthreads();
+  }
+  const int tail = K - k0;
+  if (tail > 0) {
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < (tail + 7) / 8; idx += blockDim.x) {
+      const uint4 v = *reinterpret_cast<const uint4*>(x + k0 + idx * 8);
+      stage_pairs(xs, idx * 4, v);
+    }
+    __syncthreads();
+    const int nseg = tail >> 4;
+    for (int s = lane; s < nseg; s += 32) {
+      const uint2 q2 = *reinterpret_cast<const uint2*>(crow + (k0 >> 1) + s * 8);
+      const __half2 sc = __hmul2(fp8e4m3_to_half2(srow[(k0 >> 4) + s]), gm2);
+      __half2 acch = __halves2half2(__ushort_as_half(0), __ushort_as_half(0));
+#pragma unroll
+      for (int w = 0; w < 2; w++) {
+        __half2 w8[4];
+        dequant8_k2(w == 0 ? q2.x : q2.y, sc, w8);
+#pragma unroll
+        for (int pi = 0; pi < 4; pi++) {
+          const int ps = swz(s * 8 + w * 4 + pi);
+          acch = __hfma2(w8[pi], xs[ps], acch);
+        }
+      }
+      const float2 f = __half22float2(acch);
+      acc += f.x + f.y;
+    }
+  }
+
+  // Sum-reduce the lane partials -> column value at lane0; then the block's
+  // 8 columns reduce to one (val, idx) through a smem tail (offsets past the
+  // staging region; the launch reserves the bytes).
+  float vsum = acc;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) vsum += __shfl_xor_sync(~0u, vsum, o);
+  if (lane == 0 && col < N) {
+    float* cvals = reinterpret_cast<float*>(smem_raw) + P2;
+    // Round to the fp16 value BEFORE the max compare: the fork's argmax is
+    // over half outputs (strict >, lowest index wins), and two f32 sums that
+    // differ by ~1e-7 can tie after __float2half. Store the rounded value.
+    cvals[warp] = __half2float(__float2half_rn(vsum));
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float* cvals = reinterpret_cast<float*>(smem_raw) + P2;
+    int best = 0;
+    for (int w = 1; w < 8; w++)
+      if (cvals[w] > cvals[best]) best = w;  // strict > => lowest index wins
+    argmax_val[blockIdx.x] = __float2half(cvals[best]);
+    argmax_idx[blockIdx.x] = blockIdx.x * 8 + best;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Host side helpers (bit-exact against the device arithmetic).
 // ---------------------------------------------------------------------------
@@ -481,6 +584,33 @@ bool RunSelfCheck(const Sm70Nvfp4W4a16Args& args, SelfCheckState& state) {
   state.remaining--;
 
   const int m = static_cast<int>(args.m), n = static_cast<int>(args.n), k = static_cast<int>(args.k);
+  // Fused-argmax mode (M == 1, single 8-column block is self-verifiable here):
+  // compare the winner (val, idx) against the CPU row argmax.
+  if (args.argmax_idx != nullptr) {
+    if (m != 1 || n != 8 || state.disabled) return !state.disabled;
+    std::vector<__half> x((size_t)k);
+    std::vector<uint8_t> codes((size_t)k >> 1), scales((size_t)k >> 4);
+    __half amval = 0;
+    int amidx = -1;
+    cudaMemcpyAsync(x.data(), args.x, x.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(codes.data(), args.codes, codes.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(scales.data(), args.scales, scales.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(&amval, args.argmax_val, sizeof(__half), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(&amidx, args.argmax_idx, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(args.stream));
+    if (amidx < 0) { state.disabled = true; return false; }
+    // CPU row (single m == 1) via the generic reference.
+    std::vector<__half> xm(1 * k);
+    for (int i = 0; i < k; i++) xm[i] = x[i];
+    std::vector<float> ref = CpuReference(1, n, k, xm, codes, scales, args.gscale);
+    int best = 0;
+    for (int c = 1; c < n; c++) if (ref[(size_t)c] > ref[(size_t)best]) best = c;
+    const float gotv = __half2float(amval);
+    if (amidx != best || std::fabs(gotv - ref[(size_t)best]) > 1.0e-3f * std::max(1.0f, std::fabs(ref[(size_t)best]))) {
+      state.disabled = true;
+    }
+    return !state.disabled;
+  }
   if (m <= 0 || m > 64 || n <= 0 || k <= 0 || (size_t)m * n * k > (1 << 22)) {
     return !state.disabled;  // shape too large to host-check; trust the band
   }
@@ -539,6 +669,19 @@ bool LaunchSm70Nvfp4W4a16(const DeviceCaps&, void* argsPtr) {
 
 if (m <= 3) {
     constexpr int KC = 512;
+    // Fused greedy-argmax: single-row decode that emits the per-8-column
+    // winners instead of the row (n%8; cross-block reduce is the caller's).
+    if (m == 1 && args.argmax_idx != nullptr && args.argmax_val != nullptr &&
+        (k % 128) == 0) {
+      const int smem = (KC / 2) * (int)sizeof(__half2) + 8 * (int)sizeof(float) +
+                       8 * (int)sizeof(int);
+      Sm70Nvfp4SimtArgmax<<<n / 8, 256, smem, stream>>>(
+          codes, scales, x, static_cast<__half*>(args.out),
+          static_cast<__half*>(args.argmax_val),
+          static_cast<int*>(args.argmax_idx), n, k, args.gscale);
+      if (check_enabled && !RunSelfCheck(args, self)) return false;
+      return cudaGetLastError() == cudaSuccess;
+    }
     const int smem = 3 * (KC / 2) * (int)sizeof(__half2);  // max M = 3
     switch (m) {
       case 1:
