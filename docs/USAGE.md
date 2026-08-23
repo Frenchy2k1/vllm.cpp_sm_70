@@ -314,6 +314,18 @@ thread count they actually got beside the count that was asked for.
   than `max_model_len` tokens and would be refused after tokenizing anyway.
   Send a shorter prompt, or load a checkpoint with a longer context.
 
+- A video render writes `<output_dir>/phase-log.json` beside its frames, and
+  `unaccounted_seconds` there is time the render spent inside no named phase.
+  Read `gaps` to find out WHERE: it holds one interval before each named phase
+  and one after the last, each naming the two phases it lies between, and they
+  add to `unaccounted_seconds` exactly. The largest entry is the region worth
+  naming next. Subtract `instrument_seconds` first — that is what the
+  instrument itself spent on its own phase boundaries, and on a short render it
+  can be about half the residue. Every phase record carries its own
+  `instrument_seconds` too, which is what that phase paid for the boundaries of
+  its sub-phases. The C ABI hands back the same file's path through
+  `vllm_video_last_phase_log`.
+
 ## Find a focused guide
 
 [Task guides](guides/README.md) cover workflows that apply to more than one

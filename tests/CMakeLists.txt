@@ -290,6 +290,14 @@ target_include_directories(test_video_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_video_engine PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# The render phase INSTRUMENT, on its own, over synthetic timelines (row
+# LTX25-PHASE-INSTRUMENT, #1668/#1569/#1571). Its own executable rather than a
+# block inside `test_ltx2_video`, because two of its cases need a table of
+# thousands of records that no render produces, and because an instrument
+# question should not cost a model fixture build. The reachability half — that a
+# render through the ABI actually emits what these cases pin — stays in
+# `test_ltx2_video`, which is the only place that can prove it.
+vllm_cpp_add_test(test_render_phase_log vllm/multimodal/test_render_phase_log.cpp)
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
