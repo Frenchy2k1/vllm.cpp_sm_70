@@ -14,6 +14,7 @@
 extern "C" int vt_cuda_nccl_group_selfcheck(void);
 extern "C" int vt_cuda_tp_seam_selfcheck(void);
 extern "C" int vt_cuda_loader_slice_selfcheck(void);
+extern "C" int vt_cuda_sharded_forward_selfcheck(void);
 
 TEST_CASE("in-process NCCL collectives across the discrete GPUs (multi-device)") {
   const int rc = vt_cuda_nccl_group_selfcheck();
@@ -37,6 +38,15 @@ TEST_CASE("TP loader slice: per-rank shard placed on the addressed GPU, reconstr
   const int rc = vt_cuda_loader_slice_selfcheck();
   if (rc == 2) {
     MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); loader slice skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("runner forward: device-sharded GEMM + group all-reduce == single-GPU forward") {
+  const int rc = vt_cuda_sharded_forward_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); runner forward skipped");
     return;
   }
   CHECK(rc == 0);
