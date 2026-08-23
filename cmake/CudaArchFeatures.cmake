@@ -383,7 +383,12 @@ set(VT_CUDA_FEATURE_TABLE
   "fa2|8.0,8.6,8.7,8.9,12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)"
   # Volta W4A16 NVFP4 decode GEMM (cuda_sm70_nvfp4_gemm.cu), Phase-2 brick A.
   # upstream: none (Volta removed upstream); source: dnv2003/v100-skinny SIMT.
-  "sm70-nvfp4-gemm|7.0|sm70 W4A16 NVFP4 SIMT decode (M<=3; QPN/WMMA next)")
+  "sm70-nvfp4-gemm|7.0|sm70 W4A16 NVFP4 SIMT decode (M<=3; QPN/WMMA next)"
+  # Volta FA2 fragment core, vendored (third_party/flash_attn_v100/; upstream
+  # 1Cat-vLLM flash-attention-v100). sm_70-only by construction. The attention
+  # kernels (ATen-decoupled port) come in the follow-up; this cell gates the
+  # vendored core's compile en that arch.
+  "sm70-fa2-v1|7.0|Volta FA2 fragment core (cuda_flash_attn_v100.cu)")
 
 # vt_cuda_feature_archs(<OUT_ARCHS> <FEATURE>)
 #   Resolves FEATURE against the requested VLLM_CPP_CUDA_ARCHITECTURES and sets

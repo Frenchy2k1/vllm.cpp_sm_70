@@ -530,6 +530,7 @@ if(VLLM_CPP_CUDA)
   vt_cuda_feature_archs(VT_MARLIN_NVFP4_ARCHS  "marlin-nvfp4")
   vt_cuda_feature_archs(VT_FA2_ARCHS           "fa2")
   vt_cuda_feature_archs(VT_SM70_NVFP4_GEMM_ARCHS "sm70-nvfp4-gemm")
+  vt_cuda_feature_archs(VT_SM70_FA2_V100_ARCHS  "sm70-fa2-v1")
   vt_cuda_report_feature("fp4-mma"       "${VT_FP4_MMA_ARCHS}")
   vt_cuda_report_feature("cutlass-nvfp4" "${VT_CUTLASS_NVFP4_ARCHS}")
   vt_cuda_report_feature("cutlass-nvfp4-sm100" "${VT_CUTLASS_NVFP4_SM100_ARCHS}")
@@ -539,6 +540,7 @@ if(VLLM_CPP_CUDA)
   vt_cuda_report_feature("marlin-nvfp4"  "${VT_MARLIN_NVFP4_ARCHS}")
   vt_cuda_report_feature("fa2"           "${VT_FA2_ARCHS}")
   vt_cuda_report_feature("sm70-nvfp4-gemm" "${VT_SM70_NVFP4_GEMM_ARCHS}")
+  vt_cuda_report_feature("sm70-fa2-v1"     "${VT_SM70_FA2_V100_ARCHS}")
   # The native block-scaled fp4xfp4 MMA (cuda_matmul_nvfp4.cu) needs the
   # architecture-specific sm_12xa target. Advertise it to the code so the host
   # launcher enables the native path only when it was actually compiled in.
@@ -2351,6 +2353,14 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_sm70_nvfp4_gemm.cu)
     list(APPEND _VT_CUDA_FEATURE_SOURCES
       src/vt/cuda/cuda_sm70_nvfp4_gemm.cu)
+  endif()
+  if(VT_SM70_FA2_V100_ARCHS)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_flash_attn_v100.cu)
+    set_source_files_properties(src/vt/cuda/cuda_flash_attn_v100.cu PROPERTIES
+      COMPILE_OPTIONS "-isystem;${CMAKE_SOURCE_DIR}/third_party")
+    vt_cuda_set_source_gencode("${VT_SM70_FA2_V100_ARCHS}"
+      src/vt/cuda/cuda_flash_attn_v100.cu)
+    list(APPEND _VT_CUDA_FEATURE_SOURCES src/vt/cuda/cuda_flash_attn_v100.cu)
   endif()
   if(_MARLIN_SRCS)
     vt_cuda_set_source_gencode("${VT_MARLIN_NVFP4_ARCHS}" ${_MARLIN_SRCS})
