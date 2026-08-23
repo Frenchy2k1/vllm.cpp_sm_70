@@ -794,6 +794,144 @@ extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I,
   return vt_cuda_mlp_shard_run(O, H, I, x.data(), gate.data(), up.data(), down.data(), out);
 }
 
+// ---------------------------------------------------------------------------
+// KV/GQA-shard attention primitive (TP step-2, the attention sibling of the
+// dense-MLP shard). Softmax numerator (sum exp(score)*v over kv) and denominator
+// (sum exp(score)) are BOTH additive over the kv dimension, so a rank owning a
+// contiguous slice of the Hkv kv-heads computes its partial num/den on ITS device
+// and the group AllReduceSum reduces both before out = num/den. This is the
+// standard cross-rank KV-split attention (TpAllReduce over KV heads instead of
+// AllGather), mirroring the runner-attach row-reduce on the o_proj side. Each
+// rank holds its slice of k/v; q is the full [T,Hq,D] on every rank (q heads
+// are dense; only the KV-intermediate is sharded). Returns 0 on parity with the
+// on-host full-kv reference, 1 mismatch, 2 on fewer than 2 GPUs (NCCL unbuilt).
+// ---------------------------------------------------------------------------
+static void AttnKvHostRef(int T, int Hq, int Hkv, int D, float scale,
+                          const float* q, const float* k, const float* v,
+                          std::vector<float>& ref, std::vector<float>& den_ref) {
+  ref.assign((size_t)T * Hq * D, 0.f);
+  den_ref.assign((size_t)T * Hq, 0.f);
+  for (int t = 0; t < T; ++t)
+    for (int hq = 0; hq < Hq; ++hq) {
+      const float* qt = q + ((size_t)t * Hq + hq) * D;
+      double den = 0.0;
+      for (int kh = 0; kh < Hkv; ++kh) {
+        const float* kp = k + (size_t)kh * D;
+        float s = 0.f;
+        for (int d = 0; d < D; ++d) s += qt[d] * kp[d];
+        const float e = std::exp((double)(s * scale));
+        den += e;
+        const float* vp = v + (size_t)kh * D;
+        for (int d = 0; d < D; ++d)
+          ref[(size_t)((t * Hq + hq) * D) + d] += (float)(e * (double)vp[d]);
+      }
+      den_ref[(size_t)(t * Hq + hq)] = (float)den;
+    }
+  for (size_t i = 0; i < ref.size(); ++i)
+    ref[i] /= den_ref[i / D];
+}
+
+// One output element per thread over (T*Hq*D); each rank sums exp(score)*v over
+// its kv-head slice. dnum: partial exp(v); dden[hq']: exp-sum per (t,hq).
+__global__ void AttnKvShardPartial(const float* dq, const float* dk,
+                                    const float* dv, float* dnum, float* dden,
+                                    int Hq, int D, int Hhkv, float scale) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = Hq * D;
+  const int ntok = blockIdx.y;  // token index (one grid.y per token)
+  if (idx >= total) return;
+  const int hq = idx / D, d0 = idx % D;
+  const float* qt = dq + ((size_t)ntok * Hq + hq) * D;
+  float acc = 0.f;
+  double sum_exp_over_hv = 0.0;
+  for (int kh = 0; kh < Hhkv; ++kh) {
+    const float* kp = dk + (size_t)kh * D;
+    float s = 0.f;
+    for (int d = 0; d < D; ++d) s += qt[d] * kp[d];
+    const double e = std::exp((double)(s * scale));
+    sum_exp_over_hv += e;
+  }
+  for (int kh = 0; kh < Hhkv; ++kh) {
+    const float* kp = dk + (size_t)kh * D, *vp = dv + (size_t)kh * D;
+    float s = 0.f;
+    for (int d = 0; d < D; ++d) s += qt[d] * kp[d];
+    const double e = std::exp((double)(s * scale));
+    acc += (float)(e * (double)vp[d0]);
+  }
+  dnum[(size_t)ntok * Hq * D + idx] = acc;  // partial exp(v)
+  if (d0 == 0) dden[(size_t)ntok * Hq + hq] = (float)sum_exp_over_hv;
+}
+
+extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int Hkv, int D,
+                                          const float* q, const float* k, const float* v,
+                                          float* out) {
+  if (T <= 0 || Hq <= 0 || Hkv <= 0 || D <= 0) return 1;
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  if (Hkv % W != 0) { delete g; return 1; }
+  const int per = Hkv / W;
+  const float scale = 1.0F / std::sqrt((float)D);
+  std::vector<float> ref, den_ref;
+  AttnKvHostRef(T, Hq, Hkv, D, scale, q, k, v, ref, den_ref);
+  // expected = ref
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const size_t qn = (size_t)T * Hq * D, den_n = (size_t)T * Hq;
+      cudaStream_t st = nullptr;
+      float *dq = nullptr, *dk = nullptr, *dv = nullptr, *dnum = nullptr, *dden = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dq, qn * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dk, (size_t)per * D * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dv, (size_t)per * D * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dnum, qn * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dden, den_n * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dnum); cudaFree(dden);
+        if (st) cudaStreamDestroy(st);
+        return;
+      }
+      cudaMemsetAsync(dnum, 0, qn * sizeof(float), st);
+      cudaMemsetAsync(dden, 0, den_n * sizeof(float), st);
+      cudaMemcpyAsync(dq, q, qn * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dk, k + (size_t)(per * r * D), (size_t)per * D * sizeof(float),
+                      cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dv, v + (size_t)(per * r * D), (size_t)per * D * sizeof(float),
+                      cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      dim3 grid_dim((unsigned)((Hq * D + 31) / 32), (unsigned)T);
+      AttnKvShardPartial<<<grid_dim, 32, 0, st>>>(
+          dq, dk, dv, dnum, dden, Hq, (int)D, per, scale);
+      Queue qq; qq.device = Device{DeviceType::kCUDA, r}; qq.handle = st;
+      g->Rank(r)->AllReduce(qq, dnum, qn, DType::kF32, ReduceOp::kSum);
+      g->Rank(r)->AllReduce(qq, dden, den_n, DType::kF32, ReduceOp::kSum);
+      std::vector<float> num(qn), den(den_n);
+      cudaMemcpyAsync(num.data(), dnum, qn * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaMemcpyAsync(den.data(), dden, den_n * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      for (size_t i = 0; i < qn; ++i)
+        num[i] /= den[(size_t)(i / D)];
+      if (r == 0) std::copy(num.begin(), num.end(), out);
+      for (size_t i = 0; i < qn; ++i) {
+        if (std::fabs(num[i] - ref[i]) > 1e-3f) {
+          fprintf(stderr, "vt attn-kv-shard: rank %d elem %zu %.4f want %.4f\n",
+                  r, i, (double)num[i], (double)ref[i]);
+          bad.store(1, std::memory_order_relaxed);
+        }
+      }
+      cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dnum); cudaFree(dden);
+      cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
 }  // namespace
 }  // namespace vt
 #endif  // VT_NCCL
