@@ -5525,7 +5525,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // the reference (host-parity in-process group) path — correct, not fast; the
   // paged tp==tp1 gate is the target. Slow-but-correct, perf out of scope.
   if (tp != nullptr && tp->tp_size() > 1) {
-    const int64_t S = meta.seq_lens_cpu[0];  // context length after this step
+    [[maybe_unused]] const int64_t S = meta.seq_lens_cpu[0];  // context length after this step
 #ifdef VT_NCCL
     if (meta.num_reqs != 1)
       throw std::runtime_error(
@@ -7565,7 +7565,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                    const Tensor& dh, int64_t T,
                    const vllm::TensorParallel* tp = nullptr) {
   const int64_t I = cfg.intermediate_size;
-  const int64_t H = cfg.hidden_size;  // dense in/out width == hidden size
+  [[maybe_unused]] const int64_t H = cfg.hidden_size;  // dense in/out width == hidden size
   const bool fp4 = !w.gate_proj_fp4.Empty();
   // Multi-device (tp>1): the real per-rank shard. Host-decode the resident
   // fp4/bf16 weights into the shard's [out,in] f32 layout, then run the whole
