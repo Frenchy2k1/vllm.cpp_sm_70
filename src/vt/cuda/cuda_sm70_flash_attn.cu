@@ -439,7 +439,7 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
 extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
   const DeviceCaps& caps = GetDeviceCaps();
   if (!caps.valid || caps.sm_major != 7 || caps.sm_minor != 0) return 2;
-  const int64_t num_reqs = 2, hq = 4, nkv = 2, d = 128, bs = 16, maxblocks = 4;
+  const int64_t num_reqs = 2, hq = 4, nkv = 2, d = 64, bs = 16, maxblocks = 4;
   const int q1[2] = {40, 12}, s1[2] = {56, 20};  // GQA + multi-slice + tails
   const int64_t pages = num_reqs * maxblocks;
   const size_t kv = (size_t)pages * (bs * nkv * d);
