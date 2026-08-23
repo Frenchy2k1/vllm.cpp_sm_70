@@ -889,8 +889,11 @@ jobs:
     permissions:
       contents: read
     concurrency:
-      group: ci-cuda-sm70-build-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      group: ci-cuda-sm70-build-${{ github.event_name }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.run_id || github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     container: nvidia/cuda:12.9.1-devel-ubuntu24.04

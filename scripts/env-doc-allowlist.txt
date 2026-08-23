@@ -230,3 +230,13 @@ VT_W4A4_TRUE
 # var must be documented in docs/ENVIRONMENT.md OR added here.
 VT_DUMP_ACT_SUB
 VT_DUMP_ATTN
+# VT_SM70_SELFCHECK runs the sm70 NVFP4 brick self-check on startup
+# (kernel-internal self-test switch, not a user knob)
+VT_SM70_SELFCHECK
+# VT_SM70_FA2_DECODE / VT_SM70_FA2_PREFILL select the FA2 kernel-internal decode/prefill
+# fragment-core path on sm_70 (kernel-internal A/B switches, not user knobs)
+VT_SM70_FA2_DECODE
+VT_SM70_FA2_PREFILL
+# VT_SM70_MOE_WMMA selects the fp16 WMMA expert GEMM path on the sm_70 MoE arm
+# (brick H kernel-internal A/B switch, not a user knob)
+VT_SM70_MOE_WMMA

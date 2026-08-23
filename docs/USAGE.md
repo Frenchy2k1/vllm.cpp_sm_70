@@ -359,6 +359,42 @@ lists other published arms when they have not been used as a gated checkpoint.
 | Qwen3.8-2.4T-A95B | `UD-Q1_0` ten-file GGUF split | about 370 GiB | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` (shard 1); `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` (shard 2) | CPU expert streaming from disk | CUDA refuses a checkpoint that exceeds device capacity |
 <!-- checkpoint-registry:end -->
 
+## Volta (sm_70) notes
+
+The Volta lane (Tesla V100, `sm_70`) builds with portable kernels only: `-DVLLM_CPP_CUDA_ARCHITECTURES=70 -DVLLM_CPP_TRITON=OFF` and nvcc < 13 (the CMake gate refuses nvcc >= 13). The `cuda-sm70-build` CI lane verifies the build; the runtime lane needs a V100 box.
+
+### NVFP4 GEMM SIMT brick
+
+The `sm_70` NVFP4 W4A16 SIMT decode GEMM runs on the two-GPU V100 box; it is self-checking and leaves every other arch byte-identical. No user flag.
+
+### FA2 build gate
+
+The FA2 fragment-core attention translation unit builds under the same `-DVLLM_CPP_CUDA_ARCHITECTURES=70` gate; an `sm_80+` build is unchanged.
+
+### FA2 decode fastpath parity
+
+The WMMA decode-attention fastpath in `cuda_sm70_flash_attn.cu` is parity-checked against the reference path; it is selected on `sm_70` builds and leaves every other arch untouched.
+
+### FA2 decode fastpath live
+
+The WMMA decode fastpath is now the paged-attention op's decode path on `sm_70` builds. No user flag; other arches keep the reference path and stay byte-identical.
+
+### Tensor parallel, step 1
+
+The dense forwards carry a `tp` field that defaults to the null (world-size-1) value, so every existing single-GPU call is unchanged. No new flag: `tp > 1` arrives with the later TP steps.
+
+### Tensor parallel, wire
+
+`ForwardDense` carries `tp` end to end; the dense-MLP shard for `tp > 1` follows. Single-GPU runs stay byte-identical (null tp).
+
+### Context length vs the KV pool
+
+The KV pool's last block is held back as its null block, so a context of exactly `--num-blocks x --block-size` is never servable: startup sizing plans against the remaining `(num-blocks - 1) x block-size` tokens. Without `--max-model-len`, the serving length is auto-fitted down to what the pool holds and logged.
+
+### Tensor parallel, Phase 5 (35B A3B MoE expert shard)
+
+The 35B A3B MoE experts tensor-parallel shard across the NCCL communicator (intermediate 512 -> 256 per rank at tp=2). The dense and attention paths are unchanged; single-GPU runs stay byte-identical. The gate is the tp==tp1 token-parity run on the NVFP4 35B-A3B checkpoint.
+
 ## Look up interface details
 
 [Reference pages](reference/README.md) collect dense lookup material such as

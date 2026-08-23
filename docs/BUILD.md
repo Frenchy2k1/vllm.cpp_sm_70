@@ -90,12 +90,16 @@ cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=90a \
 # Ampere consumer (RTX 3090 = 86), Ada (89), Jetson Orin (87)
 cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=86 \
   -DVLLM_CPP_CUTLASS_FETCH=ON
+
+# Volta (Tesla V100, sm_70): portable kernels only, needs nvcc < 13
+cmake -S . -B build-cuda-sm70 -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=70 -DVLLM_CPP_TRITON=OFF
 ```
 
 Of these, only `sm_87` (Orin) and `sm_110` (Thor) have been run on real
 hardware. `sm_80/86/89`, `sm_90a` and `sm_100a/103a` are build-verified: they
 compile `-Werror`-clean and emit the expected SASS, but no board here has
-executed them. See [Project status](../README.md#project-status) for what that label means and
+executed them. `sm_70` (Volta) is build-verified by the `cuda-sm70-build` CI lane (CUDA 12.9.1, portable kernels only) and runtime-proven on a two-GPU V100 box. See [Project status](../README.md#project-status) for what that label means and
 `.agents/specs/cuda-arch-ampere-fastpath.md` for the per-arch detail. Reports
 from those boards are welcome.
 
@@ -221,7 +225,7 @@ defaults.
 | Option | Default | Purpose |
 |---|---|---|
 | `VLLM_CPP_CUDA` | `AUTO` | Build the CUDA backend: `ON`, `OFF`, or `AUTO` (on when a CUDA toolchain is found) |
-| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
+| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`, plus `70` (Volta/V100, portable kernels only, requires nvcc < 13). The `a` suffix is required for the native fp4 MMA |
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed |
 | `VLLM_CPP_TENSTORRENT` | `AUTO` (= `OFF`) | Build the Tenstorrent backend. Opt-in with `-DVLLM_CPP_TENSTORRENT=ON`; requires TT-Metalium and TT-NN and fails configure if either package is missing |

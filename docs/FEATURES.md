@@ -272,7 +272,7 @@ both refuse, naming what is missing.
 
 | Backend | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
-| CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
+| CUDA | ✅ sm_70 (Volta, runtime-proven) to sm_121a | ✅ | ✅ | ✅ |
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ `CPU_ATTN` registered (#1371/#1392, [spec](../.agents/specs/attn-validate-configuration.md)) | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ builds under Apple Clang with project warnings promoted to errors, the Qwen3.5 MoE loader included; its layout-refusal path uses the same messages and behavior on every platform (#1054) | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
@@ -349,7 +349,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Mode | vllm.cpp | vLLM | SGLang |
 |---|---|---|---|
-| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run; TP-W1 LANDED 2026-08-08 (rank-layout group table + per-rank handle); TP-W2..W4+W7 CPU-completable | ✅ | ✅ |
+| Tensor parallel (TP) | ◐ runtime-proven on a 2-GPU V100 box (27B dense and 35B A3B MoE expert-shard tp==tp1 token gates GREEN on GPUs 2,3, NVFP4); TP-W1 LANDED 2026-08-08 (rank-layout group table + per-rank handle); TP-W2..W7 CPU-completable | ✅ | ✅ |
 | Collective / process-group abstraction | ✅ CPU + NCCL transport | ✅ | ✅ |
 | Pipeline parallel (PP) | ☐ spike written | ✅ | ✅ |
 | Expert parallel (EP) + EPLB | ☐ spike written | ✅ | ✅ |
