@@ -86,24 +86,30 @@ earlier ones):
    threads parked on futex/pipe — the engine thread enters `execute_model`
    once and NEVER returns.
 
-So the block is INSIDE `execute_model`, on a host-only path, BEFORE the forward
-is entered at all. Two decisive observations: (1) an instrumented `Forward`
-entry (qwen3_5.cpp) with the same `VT_ENGINE_STEP_LOG` gate never printed
-while `core-step begin` did — the stall is in the runner between the step and
-`ModelRegistry::Forward`, not in the model forward; (2) GPU 0% on all ranks
-and no CUDA/NCCL thread busy — no kernel, no shard primitive, no
-fan-out thread was ever launched. The block is a lane-0-local host-side wait
-in the runner's step-input assembly (the region between `execute_model` entry
-and line ~1823 `ModelRegistry::Forward`), ahead of any collective.
+So the block is a REAL collective stall inside the first fp4 sharded-MLP
+primitive. A 1-token pure-decode tp2 request (T==num_reqs, the wired decode
+path) is admitted (heartbeat unfinished=1), reaches the runner (markers
+A drain -> B update_states -> C prepare_inputs [num_reqs=1] -> D attn_meta ->
+E pre-forward all print), enters the dense forward (densebody T=1 tp=yes,
+embed done), and then STALLS INSIDE THE FIRST fp4 SHARDED-MLP COLLECTIVE:
+`vt_cuda_mlp_shard_run` (qwen3_5.cpp dense-MLP tp>1 branch) is reached and
+NEVER returns. Every earlier premise is superseded: not scheduler admission
+(heartbeat shows unfinished=1), not runner-body prep (A-E all print), not
+pre-forward. The prior "pre-Forward" record (75f6278d6) was also superseded:
+the HOST `Forward` entry probe stayed silent because tp>1 routes through
+`ForwardDevice`/`DenseForwardBody` — the deeper densebody trace above proves
+it. The decisive finding: the fp4 dense-MLP group collective, called from lane
+0's single-lane attach, never completes.
 
-Per-lane forward dispatch is a possible eventual fix but is NOT the diagnosis:
-the stall never reaches the primitives that dispatch would feed. The next
-implementer's first move should be instrumenting the runner body between the
-step entry and `ModelRegistry::Forward` (the `prepare_inputs` /
-`MakeCommonAttentionMetadata` / `forward_input` assembly) to find the exact
-host wait, non multi-lane dispatch. `VT_TP_ALLOW` is a scratch scaffold (never
-a production knob); production keeps the loud refusal until a tp>1 step
-returns and the tp2==tp1 gate passes.
+Per-lane forward dispatch is the likely fix, but the diagnosis is now exact:
+the stall is the shard primitive's group collective on a REAL tp2 request. The
+same primitive PASSES the 2-GPU nccl gate, so the difference from the gate is
+the runner's single-lane attach. The next implementer should debug
+`vt_cuda_mlp_shard_run` queue/device binding on a real tp2 request, starting
+from its internal per-rank queue+thread fan-out (nccl_communicator.cu) versus
+the gate that drives per-rank queues. All probes (VT_TP_ALLOW,
+VT_ENGINE_STEP_LOG, the runner/dense markers above) were REVERTED after each
+measurement; production keeps the loud refusal until tp2==tp1 passes.
 
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
