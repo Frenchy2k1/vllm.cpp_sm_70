@@ -223,7 +223,17 @@ __device__ __forceinline__ float ApplySoftcap(float s, float softcap) {
   if (softcap <= 0.0f) return s;
   float y;
   const float x = s / softcap;
+#if __CUDA_ARCH__ >= 750
+  // sm_75+: match the vLLM/flash-attn fast_tanh approximation bit-for-bit.
   asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+#else
+  // sm_70 (Volta): `tanh.approx.f32` is a Turing+ instruction and ptxas
+  // rejects it for compute_70. libdevice tanhf is a different polynomial, so
+  // the soft-capped scores differ on Volta — irrelevant for every non-Gemma
+  // model (softcap == 0.0 returns s unchanged) and never compared across
+  // architectures by the parity gates.
+  y = tanhf(x);
+#endif
   return softcap * y;
 }
 
