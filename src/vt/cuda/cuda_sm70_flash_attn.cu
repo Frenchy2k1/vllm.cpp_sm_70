@@ -31,14 +31,16 @@ constexpr int kF2D = 64;       // head dim served
 constexpr int kF2Keys = 16;    // 16-key tile (m16n16k16 N)
 constexpr int kF2Threads = 32;
 
-// One block per (token, q-head); 32 threads (one warp).
+// One block per (token, q-head); 32 threads (one warp). Head-dim-TD templated
+// (instantiated for 64 and 128) so real Llama/Mistral/Qwen head widths run.
+template <int TD>
 __global__ void Sm70Fa2DecodeAttn(
     float* out, const __half* query, const __half* k_cache, const __half* v_cache,
     const int32_t* block_table, const int32_t* seq_lens, const int32_t* query_start,
     int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d, int64_t block_size,
     int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
     int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale, float softcap) {
-  if (d != kF2D) return;
+  if (d != TD) return;
   const int64_t t = blockIdx.x;
   const int64_t h = blockIdx.y;
   if (h >= hq) return;
@@ -47,18 +49,17 @@ __global__ void Sm70Fa2DecodeAttn(
   const int64_t qoff = (t * hq + h) * d;
 
   extern __shared__ __half sm[];  // carve in __half
-  __half* sq = sm;                // [16][64] fp16, row0 = 64-elem query
-  __half* sk = sq + 16 * 64;      // key tile [16][64] key-major
-  __half* sb = sk + 16 * 64;      // transposed B panel [16][16]
+  __half* sq = sm;                // [16][TD] fp16, row0 = the query row
+  __half* sk = sq + 16 * TD;      // key tile [16][TD] key-major
+  __half* sb = sk + 16 * TD;      // transposed B panel [16][16]
   float* sc = reinterpret_cast<float*>(sb + 16 * 16);  // [16][16] f32 scores
-  float* sacc = sc + 16 * 16;     // [64] running acc
+  float* sacc = sc + 16 * 16;     // [TD] running acc
 
-  // Load query dp0 row 0; zero rows 1..15; zero acc.
-  for (int e = threadIdx.x; e < kF2D; e += blockDim.x)
+  for (int e = threadIdx.x; e < TD; e += blockDim.x)
     sq[e] = query[qoff + e];
-  for (int e = threadIdx.x + kF2D; e < 16 * kF2D; e += blockDim.x)
+  for (int e = threadIdx.x + TD; e < 16 * TD; e += blockDim.x)
     sq[e] = __ushort_as_half(0);
-  for (int e = threadIdx.x; e < kF2D; e += blockDim.x) sacc[e] = 0.f;
+  for (int e = threadIdx.x; e < TD; e += blockDim.x) sacc[e] = 0.f;
   __syncthreads();
 
   float m = -CUDART_INF_F, l = 0.f;
@@ -115,7 +116,7 @@ __global__ void Sm70Fa2DecodeAttn(
       const int64_t key = jb + e;
       const int64_t blk = block_table[(int64_t)t * bt_row + (key / block_size) * bt_col];
       const int64_t off = key % block_size;
-      for (int ee2 = threadIdx.x; ee2 < kF2D; ee2 += blockDim.x)
+      for (int ee2 = threadIdx.x; ee2 < TD; ee2 += blockDim.x)
         sacc[ee2] = sacc[ee2] * corr +
                     pw * __half2float(v_cache[blk * vc_blk + off * vc_pg + g * vc_hd + ee2]);
       __syncwarp();
@@ -126,7 +127,7 @@ __global__ void Sm70Fa2DecodeAttn(
   }
 
   const float inv = 1.0f / l;
-  for (int e = threadIdx.x; e < kF2D; e += blockDim.x) out[qoff + e] = sacc[e] * inv;
+  for (int e = threadIdx.x; e < TD; e += blockDim.x) out[qoff + e] = sacc[e] * inv;
 }
 
 
@@ -281,14 +282,22 @@ extern "C" void vt_sm70_fa2_decode(
     int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d, int64_t block_size,
     int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
     int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale, cudaStream_t stream) {
-  const int smem =
-      (16*64 + 16*64 + 16*16) /*halves*/ * 2 + (16*16 + 64 + 32) /*floats*/ * 4;
-  const dim3 grid((unsigned)num_reqs, (unsigned)hq);  // x=token, y=head (ref parity)
-  Sm70Fa2DecodeAttn<<<grid, kF2Threads, smem, stream>>>(
-      out, static_cast<const __half*>(query), static_cast<const __half*>(k),
-      static_cast<const __half*>(v), block_table, seq_lens, nullptr,
-      num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
-      vc_blk, vc_pg, vc_hd, scale, 0.f);
+  const int td = (int)d;
+  if (td != 64 && td != 128) return;  // caller-side gate; do not launch garbage
+  const dim3 grid((unsigned)num_reqs, (unsigned)hq);
+#define VT_DECODE_LAUNCH(TD)                                                        \
+  do {                                                                               \
+    const int smem = (2 * 16 * (TD) /*sq,sk*/ + 16 * 16 /*sb*/) * 2 +               \
+                     (16 * 16 + (TD) + 32) /*sc,sacc,pad*/ * 4;                     \
+    Sm70Fa2DecodeAttn<(TD)><<<grid, kF2Threads, smem, stream>>>(                     \
+        out, static_cast<const __half*>(query), static_cast<const __half*>(k),       \
+        static_cast<const __half*>(v), block_table, seq_lens, nullptr,               \
+        num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,    \
+        vc_blk, vc_pg, vc_hd, scale, 0.f);                                             \
+  } while (0)
+  if (td == 64) VT_DECODE_LAUNCH(64);
+  else          VT_DECODE_LAUNCH(128);
+#undef VT_DECODE_LAUNCH
 }
 
 // Oracle (defined in cuda_paged_attn.cu as extern "C"): reference decode path
@@ -310,15 +319,17 @@ extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose) {
   // per-group k/v offsets g*kc/vc_hd get exercised on-device against the
   // oracle). Device-synced before the host diff so a kernel-mode fault reports
   // as a run error, not a stale-buffer comparison.
-  struct Cfg { int64_t nr, hq, nkv; int64_t seqs[8]; };
-  const Cfg cfgs[2] = {
-      {3, 1, 1, {20, 17, 33, 0, 0, 0, 0, 0}},
-      {2, 8, 2, {9, 25, 0, 0, 0, 0, 0, 0}},
+  struct Cfg { int64_t nr, hq, nkv, d; int64_t seqs[8]; };
+  const Cfg cfgs[3] = {
+      {3, 1, 1, 64, {20, 17, 33, 0, 0, 0, 0, 0}},
+      {2, 8, 2, 64, {9, 25, 0, 0, 0, 0, 0, 0}},
+      {2, 4, 1, 128, {25, 17, 0, 0, 0, 0, 0, 0}},  // D=128 (Llama/Mistral width)
   };
   double worst = 0.0;
-  for (int ci = 0; ci < 2; ++ci) {
+  const int ncfg = 3;
+  for (int ci = 0; ci < ncfg; ++ci) {
     const Cfg& c = cfgs[ci];
-    const int64_t d = 64, bn = 16;
+    const int64_t d = c.d, bn = 16;
     int64_t maxblocks = 1;
     for (int64_t r = 0; r < c.nr; ++r) {
       const int64_t nb = (c.seqs[r] + bn - 1) / bn;
