@@ -177,6 +177,46 @@ TEST_CASE("attention KV/GQA-shard (seq): kv split + causal == single-GPU softmax
   for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
 }
 
+extern "C" int vt_cuda_attn_gqa_shard_run(int T,int Hq,int Hkv,int S,int D,const int* key_end,const float* q,const float* k,const float* v,float* out);
+// host GQA reference: query head hq attends to its ONE kv head g=hq/(Hq/Hkv).
+static void gqa_ref(const int* key_end,int T,int Hq,int Hkv,int D,const float* q,const float* k,const float* v,std::vector<float>& ref){
+  const float scale=1.0F/std::sqrt((float)D); const int qpk=Hq/Hkv;
+  ref.assign((size_t)T*Hq*D,0.f);
+  for (int t=0;t<T;++t)for(int hq=0;hq<Hq;++hq){
+    const int g=hq/qpk, ke=key_end[t]; const float* qt=q+(size_t)(t*Hq+hq)*D; double dn=0.0;
+    for (int s=0;s<ke;++s){ const float* kp=k+(size_t)(s*Hkv+g)*D; float a=0; for(int d=0;d<D;++d)a+=qt[d]*kp[d]; dn+=std::exp((double)(a*scale));}
+    for (int s=0;s<ke;++s){ const float* kp=k+(size_t)(s*Hkv+g)*D,*vp=v+(size_t)(s*Hkv+g)*D; float a=0; for(int d=0;d<D;++d)a+=qt[d]*kp[d]; double e=std::exp((double)(a*scale)); for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*vp[d]/dn);}
+  }
+}
+TEST_CASE("GQA-exact KV-shard (causal): one kv head per q-head + causal == single-GPU GQA") {
+  constexpr int S=3,Hq=12,Hkv=4,D=16;  // qpk=3 (3 q-heads per kv head); Hkv%W==0 on 2/4-GPU box
+  std::vector<int> ke(S); for (int t=0;t<S;++t) ke[t]=t+1;  // causal bound
+  std::vector<float> q(S*Hq*D),k(S*Hkv*D),v(S*Hkv*D);
+  for (size_t i=0;i<q.size();++i) q[i]=0.1f*((int)(i%13))-0.3f;
+  for (int s=0;s<S;++s)for (int kh=0;kh<Hkv;++kh)for(int d=0;d<D;++d){
+    k[(size_t)(s*Hkv+kh)*D+d]=0.05f*((kh*3+s+d)%9)-0.1f; v[(size_t)(s*Hkv+kh)*D+d]=0.2f*((kh*5+s*2+d)%7)+0.1f;}
+  std::vector<float> out((size_t)S*Hq*D,0.f);
+  int rc=vt_cuda_attn_gqa_shard_run(S,Hq,Hkv,S,D,ke.data(),q.data(),k.data(),v.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); gqa shard skipped");return;}
+  CHECK(rc==0);
+  std::vector<float> ref; gqa_ref(ke.data(),S,Hq,Hkv,D,q.data(),k.data(),v.data(),ref);
+  for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
+}
+TEST_CASE("GQA-exact KV-shard (decode/full window): each query sees all S keys == single-GPU GQA") {
+  constexpr int S=5,Hq=12,Hkv=4,D=16;  // qpk=3; Hkv%W==0 on 2/4-GPU box
+  std::vector<int> ke(S); for (int t=0;t<S;++t) ke[t]=S;    // full window (paged decode)
+  std::vector<float> q(S*Hq*D),k(S*Hkv*D),v(S*Hkv*D);
+  for (size_t i=0;i<q.size();++i) q[i]=0.07f*((int)(i%11))-0.2f;
+  for (int s=0;s<S;++s)for (int kh=0;kh<Hkv;++kh)for(int d=0;d<D;++d){
+    k[(size_t)(s*Hkv+kh)*D+d]=0.04f*((kh*4+s+d)%13)-0.15f; v[(size_t)(s*Hkv+kh)*D+d]=0.13f*((kh*2+s*3+d)%11)+0.05f;}
+  std::vector<float> out((size_t)S*Hq*D,0.f);
+  int rc=vt_cuda_attn_gqa_shard_run(S,Hq,Hkv,S,D,ke.data(),q.data(),k.data(),v.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); gqa decode shard skipped");return;}
+  CHECK(rc==0);
+  std::vector<float> ref; gqa_ref(ke.data(),S,Hq,Hkv,D,q.data(),k.data(),v.data(),ref);
+  for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
+}
+
 TEST_CASE("lm_head column-shard: vocab split across ranks + AllGather == full-vocab logits") {
   constexpr int T=4,H=16,V=64;  // V%W==0 on 2/4-GPU box
   std::vector<float> x(T*H),w(V*H);
@@ -190,4 +230,43 @@ TEST_CASE("lm_head column-shard: vocab split across ranks + AllGather == full-vo
   std::vector<float> ref(T*V);
   for (int m=0;m<T;++m) for (int v=0;v<V;++v){ double a=0; for(int d=0;d<H;++d) a+=(double)x[m*H+d]*(double)w[v*H+d]; ref[m*V+v]=(float)a;}
   for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-4));
+}
+
+extern "C" int vt_cuda_mlp_shard_run_b(int T,int O,int H,int I,int verify,const float* x,const float* gate,const float* up,const float* down,float* out);
+// host batched-MLP reference (f32 weights -> f32 out), one (t,o) at a time.
+static float mlp_ref_one(int t,int o,int H,int I,const float* x,const float* gate,const float* up,const float* down){
+  double a=0.0;
+  for(int i=0;i<I;++i){float g=0.f,u=0.f;for(int k=0;k<H;++k){g+=x[(size_t)t*H+k]*gate[i*H+k];u+=x[(size_t)t*H+k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[(size_t)o*I+i];}
+  return (float)a;
+}
+TEST_CASE("batched mlp_shard_run_b: fresh shape, verify=1 (full internal parity)") {
+  constexpr int T=3,O=16,H=32,I=64;  // I%2==0 on 2-GPU box
+  std::vector<float> x(T*H), gate(I*H), up(I*H), down(O*I), out(T*O,0.f);
+  for (size_t n=0;n<x.size();++n) x[n]=0.3f+0.1f*(float)(n%5);
+  for (size_t i=0;i<gate.size();++i){ gate[i]=0.01f*((int)(i%917))+0.07f; up[i]=0.01f*((int)(i%1223))+0.13f; }
+  for (size_t i=0;i<down.size();++i) down[i]=0.02f*((int)(i%1541))+0.2f;
+  int rc=vt_cuda_mlp_shard_run_b(T,O,H,I,1,x.data(),gate.data(),up.data(),down.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL unbuilt); batched mlp shard skipped");return;}
+  CHECK(rc==0);
+  for (int t=0;t<T;++t) for (int o=0;o<O;++o)
+    CHECK(out[(size_t)t*O+o]==doctest::Approx(mlp_ref_one(t,o,H,I,x.data(),gate.data(),up.data(),down.data())).epsilon(2e-4));
+}
+TEST_CASE("batched mlp_shard_run_b holds at 27B production shape (T=9, H=5120, I=17408)") {
+  // Production-scale shapes: the verify=0 compute-only path is what the paged
+  // engine gate runs; parity is spot-checked here against the host reference
+  // (a full reference is ~1.7e14 double-FMA, so sample a few (t,o)).
+  constexpr int T=9,O=5120,H=5120,I=17408;  // I%2==0
+  std::vector<float> x(T*H), gate((size_t)I*H), up((size_t)I*H), down((size_t)O*I), out((size_t)T*O,0.f);
+  for (size_t n=0;n<x.size();++n) x[n]=0.05f+0.01f*(float)(n%37);
+  for (size_t i=0;i<gate.size();++i){ gate[i]=0.002f*((int)(i%997))+0.01f; up[i]=0.002f*((int)(i%1009))+0.015f; }
+  for (size_t i=0;i<down.size();++i) down[i]=0.001f*((int)(i%1003))+0.05f;
+  int rc=vt_cuda_mlp_shard_run_b(T,O,H,I,0,x.data(),gate.data(),up.data(),down.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); big batched mlp shard skipped");return;}
+  CHECK(rc==0);
+  // deterministic (t,o) sample set covering token and output extremes.
+  const int ts[5]={0,1,4,8,9-1}, os[5]={0,1,4096,5119,2600};
+  for (int a=0;a<5;++a) for (int b=0;b<5;++b){
+    const int t=ts[a], o=os[b];
+    CHECK(out[(size_t)t*O+o]==doctest::Approx(mlp_ref_one(t,o,H,I,x.data(),gate.data(),up.data(),down.data())).epsilon(5e-4));
+  }
 }

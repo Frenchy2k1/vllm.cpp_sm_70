@@ -37,8 +37,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
-#include <cuda_runtime.h>
-#include <nccl.h>
+  #include <cstdio>
+  #include <cuda_runtime.h>
+  #include <nccl.h>
 #endif
 
 namespace vt {
@@ -617,6 +618,29 @@ __global__ void DenseMlpRankPartial(const float* x, int H, const float* gate,
   out[o] = acc;
 }
 
+// Batched dense-MLP rank partial: one thread per (t,o); rank owns the
+// [i0, i0+per_i) slice of the I intermediate (gate/up column slices, down row
+// slice) and writes the per-token partial to out[t*O+o]; the group
+// AllReduceSum over the [T*O] partial yields the full result on every rank.
+__global__ void DenseMlpRankPartialBatch(const float* x, int T, int H,
+                                         const float* gate, const float* up,
+                                         const float* downfull, float* out,
+                                         int per_i, int i0, int I, int O) {
+  const int o = blockIdx.x * blockDim.x + threadIdx.x;
+  if (o >= O) return;
+  const int t = blockIdx.y;
+  const float* xt = x + (size_t)t * H;
+  float acc = 0.f;
+  for (int q = 0; q < per_i; ++q) {
+    const int gi = i0 + q;
+    float g = 0.f, u = 0.f;
+    for (int k = 0; k < H; ++k) { g += xt[k] * gate[gi * H + k]; u += xt[k] * up[gi * H + k]; }
+    const float sg = 1.f / (1.f + __expf(-g));
+    acc += (g * sg) * u * downfull[(size_t)o * I + gi];
+  }
+  out[(size_t)t * O + o] = acc;
+}
+
 
 // Reusable real-shape dense-MLP shard over the in-process NCCL group. Computes
 //   out[o] = sum_i silu(gate_i^T x) * (up_i^T x) * down[o,i]
@@ -655,7 +679,6 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
     }
     ref[o] = (float)a;
   }
-
   std::atomic<int> bad{0};
   std::vector<std::thread> threads;
   threads.reserve((size_t)W);
@@ -686,7 +709,6 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
       cudaMemcpyAsync(dx, x, (size_t)H * sizeof(float), cudaMemcpyHostToDevice, st);
       cudaMemcpyAsync(dgu, gu.data(), (size_t)(2 * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
       cudaMemcpyAsync(dd, dmask.data(), (size_t)(O * I) * sizeof(float), cudaMemcpyHostToDevice, st);
-      cudaStreamSynchronize(st);
       DenseMlpRankPartial<<<(unsigned)((O + 31) / 32), 32, 0, st>>>(
           dx, H, dgu, dgu + (size_t)(I * H), dd, dout, (int)per, (int)ib, (int)I, (int)O);
       Queue q; q.device = Device{DeviceType::kCUDA, r}; q.handle = st;
@@ -699,6 +721,110 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
         if (std::fabs(back[(size_t)o] - ref[(size_t)o]) >
             5e-4f * std::max(1.0f, std::fabs(ref[(size_t)o])))
           bad.store(1, std::memory_order_relaxed);
+      cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
+// Batched dense-MLP shard: the same unsharded math as vt_cuda_mlp_shard_run but
+// for a [T,H] token batch in ONE group (one NCCL create, one kernel launch per
+// rank, one [T*O] AllReduce). x = f32 [T,H], gate/up = f32 [I,H], down = f32
+// [O,I], out = f32 [T,O].
+//
+// verify: 0 = compute-only (production path; the engine's token comparison
+// against the tp1 arm is the correctness check). 1 = full parity check
+// against a double-precision host reference for every (t,o) (selfcheck path
+// only; that reference is O(T*O*I*H) and must not run at 27B shape).
+extern "C" int vt_cuda_mlp_shard_run_b(int T, int O, int H, int I, int verify,
+                                       const float* x, const float* gate,
+                                       const float* up, const float* down,
+                                       float* out) {
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
+  if (T <= 0 || O <= 0 || H <= 0 || I <= 0) return 1;
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  if (I % W != 0) { delete g; return 1; }
+  const int64_t per = I / W;
+
+  // Optional double-precision host reference, parallelised over (t,o) rows.
+  std::vector<float> ref;
+  if (verify) {
+    ref.assign((size_t)T * O, 0.f);
+    const int ncpu = std::max(1, (int)std::thread::hardware_concurrency());
+    std::vector<std::thread> hts;
+    for (int c = 0; c < ncpu; ++c)
+      hts.emplace_back([&](int c) {
+        for (size_t n = (size_t)c; n < (size_t)T * O; n += ncpu) {
+          const int t = (int)(n / O), o = (int)(n % O);
+          double a = 0.0;
+          for (int i = 0; i < I; ++i) {
+            double gv = 0.0, uv = 0.0;
+            for (int k = 0; k < H; ++k) {
+              gv += (double)x[(size_t)t * H + k] * gate[i * (size_t)H + k];
+              uv += (double)x[(size_t)t * H + k] * up[i * (size_t)H + k];
+            }
+            const float sg = 1.f / (1.f + std::exp(-(double)gv));
+            a += (double)((gv * sg) * uv) * down[o * (size_t)I + i];
+          }
+          ref[n] = (float)a;
+        }
+      }, c);
+    for (auto& h : hts) h.join();
+  }
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      cudaStream_t st = nullptr;
+      float *dx=nullptr,*dgu=nullptr,*dd=nullptr,*dout=nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, (size_t)T * H * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dgu, (size_t)(2 * I * H) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dd, (size_t)(O * I) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dout, (size_t)T * O * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); if (st) cudaStreamDestroy(st);
+        return;
+      }
+      std::vector<float> gu((size_t)(2 * I * H), 0.f);
+      for (int64_t i = ib; i < ib + per; ++i)
+        for (int k = 0; k < H; ++k) {
+          gu[(size_t)(i * H + k)] = gate[i * (size_t)H + k];
+          gu[(size_t)(((I + i) * H + k))] = up[i * (size_t)H + k];
+        }
+      std::vector<float> dmask((size_t)(O * I), 0.f);
+      for (int o = 0; o < O; ++o) for (int64_t i = ib; i < ib + per; ++i) dmask[o * I + i] = down[o * I + i];
+      cudaMemcpyAsync(dx, x, (size_t)T * H * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dgu, gu.data(), (size_t)(2 * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dd, dmask.data(), (size_t)(O * I) * sizeof(float), cudaMemcpyHostToDevice, st);
+      dim3 grid((unsigned)((O + 31) / 32), (unsigned)T);
+      DenseMlpRankPartialBatch<<<grid, 32, 0, st>>>(
+          dx, T, H, dgu, dgu + (size_t)(I * H), dd, dout, (int)per, (int)ib, (int)I, (int)O);
+      Queue q; q.device = Device{DeviceType::kCUDA, r}; q.handle = st;
+      g->Rank(r)->AllReduce(q, dout, (size_t)T * O, DType::kF32, ReduceOp::kSum);
+      std::vector<float> back((size_t)T * O, 0.f);
+      cudaMemcpyAsync(back.data(), dout, (size_t)T * O * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      if (r == 0)
+        std::memcpy(out, back.data(), (size_t)T * O * sizeof(float));
+      if (verify)
+        for (size_t n = 0; n < (size_t)T * O; ++n)
+          if (std::fabs(back[n] - ref[n]) > 5e-4f * std::max(1.0f, std::fabs(ref[n])))
+            bad.store(1, std::memory_order_relaxed);
       cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); cudaStreamDestroy(st);
     });
   }
@@ -948,6 +1074,164 @@ extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int S, int Hkv, int D,
         }
       }
       cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dnum); cudaFree(dden);
+      cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
+// ---------------------------------------------------------------------------
+// GQA-exact KV-shard attention primitive (TP step-3, the paged decode path).
+//
+// UNLIKE vt_cuda_attn_kv_shard_run above (which sums exp(q.k) over ALL kv-heads
+// - a gather that only the weak dense 8-token gate tolerates), this primitive
+// is standard GQA: each query head hq attends to exactly ONE kv head
+// g = hq / (Hq/Hkv). Rank r owns the kv-head slice [per*r, per*r+per). For a
+// query head whose g is NOT in the slice, the rank writes 0; the rank that OWNS
+// g computes the full single-kv-head softmax over positions s < key_end[t] (no
+// sum over kh). AllReduceSum across ranks then gathers the output with NO global
+// num/den divide, because each (t,hq) softmax is produced on exactly one rank.
+// The result is token-exact to the unsharded GQA (vt::PagedAttention /
+// vt::Attention) by construction.
+//
+// Contiguous [S,Hkv,D] K/V (the caller stages the paged NHD cache to host first).
+// key_end[t] = number of keys the query at position t sees (causal: t+1; paged
+// decode: the full seq_len). Returns 0 on parity with the host GQA reference,
+// 1 mismatch / bad shape, 2 on fewer than 2 GPUs (NCCL unbuilt).
+// ---------------------------------------------------------------------------
+static void AttnGqaHostRef(int T, int Hq, int Hkv, int D, float scale,
+                           const int* key_end, const float* q, const float* k,
+                           const float* v, std::vector<float>& ref) {
+  ref.assign((size_t)T * Hq * D, 0.f);
+  const int qpk = Hq / Hkv;
+  for (int t = 0; t < T; ++t)
+    for (int hq = 0; hq < Hq; ++hq) {
+      const float* qt = q + ((size_t)t * Hq + hq) * D;
+      const int g = hq / qpk;          // the ONE kv head this q head attends to
+      const int ke = key_end[t];       // keys visible to query t
+      double den = 0.0;
+      for (int s = 0; s < ke; ++s) {
+        const float* kp = k + (((size_t)s * Hkv) + g) * D;
+        float sc = 0.f;
+        for (int d = 0; d < D; ++d) sc += qt[d] * kp[d];
+        den += std::exp((double)(sc * scale));
+      }
+      for (int s = 0; s < ke; ++s) {
+        const float* kp = k + (((size_t)s * Hkv) + g) * D;
+        const float* vp = v + (((size_t)s * Hkv) + g) * D;
+        float sc = 0.f;
+        for (int d = 0; d < D; ++d) sc += qt[d] * kp[d];
+        const double e = std::exp((double)(sc * scale));
+        for (int d = 0; d < D; ++d)
+          ref[(size_t)((t * Hq + hq) * D) + d] += (float)(e * (double)vp[d] / den);
+      }
+    }
+}
+
+// Grid.y = T (one query position), block over Hq*D. Each rank owns a contiguous
+// `per`-kv-head slice [hk0, hk0+per); it writes the full single-kv-head softmax
+// partial (num = sum_e e*v[d0], den = sum_e e) ONLY for the query heads whose
+// kv head g is in that slice, 0 otherwise. AllReduceSum reduces both.
+__global__ void AttnGqaShardPartial(const float* dq, const float* dk,
+                                    const float* dv, float* dnum, float* dden,
+                                    int Hq, int Hkv, int per, int D, int hk0,
+                                    float scale, const int* dkey_end) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = Hq * D;
+  const int t = blockIdx.y;                       // query position
+  if (idx >= total || t < 0) return;
+  const int hq = idx / D, d0 = idx % D;
+  const int g = hq / (Hq / Hkv);                  // owning kv head
+  if (g < hk0 || g >= hk0 + per) return;          // not this rank's slice -> 0
+  const float* qt = dq + ((size_t)t * Hq + hq) * D;
+  const int ke = dkey_end[t];
+  float acc = 0.f;
+  double sum_exp = 0.0;
+  for (int s = 0; s < ke; ++s) {
+    const float* kp = dk + (((size_t)s * Hkv) + g) * D;
+    float sc = 0.f;
+    for (int d = 0; d < D; ++d) sc += qt[d] * kp[d];
+    const double e = std::exp((double)(sc * scale));
+    sum_exp += e;
+    const float* vp = dv + (((size_t)s * Hkv) + g) * D;
+    acc += (float)(e * (double)vp[d0]);
+  }
+  dnum[(size_t)t * Hq * D + idx] = acc;           // partial e*v over its one kv head
+  if (d0 == 0) dden[(size_t)t * Hq + hq] = (float)sum_exp;
+}
+
+extern "C" int vt_cuda_attn_gqa_shard_run(int T, int Hq, int Hkv, int S, int D,
+                                          const int* key_end, const float* q,
+                                          const float* k, const float* v,
+                                          float* out) {
+  // The NCCL group work can re-bind the CALLING thread's current device (and
+  // ncclCommDestroy too); save + restore the whole entry via RAII so the call
+  // is a no-op on the caller's thread device (the 40bad253 fix).
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  const int W = g->world_size();
+  if (Hkv % W != 0) { delete g; return 1; }
+  const int per = Hkv / W;
+  const float scale = 1.0F / std::sqrt((float)D);
+  std::vector<float> ref;
+  AttnGqaHostRef(T, Hq, Hkv, D, scale, key_end, q, k, v, ref);
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const size_t qn = (size_t)T * Hq * D, den_n = (size_t)T * Hq,
+                   kn = (size_t)S * Hkv * D, ken = (size_t)T;
+      cudaStream_t st = nullptr;
+      float *dq=nullptr,*dk=nullptr,*dv=nullptr,*dnum=nullptr,*dden=nullptr;
+      int* dke=nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dq, qn * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dk, kn * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dv, kn * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dnum, qn * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dden, den_n * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dke, ken * sizeof(int)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dnum); cudaFree(dden); cudaFree(dke);
+        if (st) cudaStreamDestroy(st);
+        return;
+      }
+      cudaMemcpyAsync(dq, q, qn * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dk, k, kn * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dv, v, kn * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dke, key_end, ken * sizeof(int), cudaMemcpyHostToDevice, st);
+      cudaMemsetAsync(dnum, 0, qn * sizeof(float), st);
+      cudaMemsetAsync(dden, 0, den_n * sizeof(float), st);
+      cudaStreamSynchronize(st);
+      dim3 grid_dim((unsigned)((Hq * D + 31) / 32), (unsigned)T);
+      AttnGqaShardPartial<<<grid_dim, 32, 0, st>>>(
+          dq, dk, dv, dnum, dden, Hq, Hkv, per, D, per * r, scale, dke);
+      Queue qq; qq.device = Device{DeviceType::kCUDA, r}; qq.handle = st;
+      g->Rank(r)->AllReduce(qq, dnum, qn, DType::kF32, ReduceOp::kSum);
+      g->Rank(r)->AllReduce(qq, dden, den_n, DType::kF32, ReduceOp::kSum);
+      std::vector<float> num(qn), den(den_n);
+      cudaMemcpyAsync(num.data(), dnum, qn * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaMemcpyAsync(den.data(), dden, den_n * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      for (size_t i = 0; i < qn; ++i)
+        num[i] /= den[(size_t)(i / D)];
+      if (r == 0) std::copy(num.begin(), num.end(), out);
+      for (size_t i = 0; i < qn; ++i) {
+        if (!(std::fabs(num[i] - ref[i]) <= 1e-3f)) {
+          bad.store(1, std::memory_order_relaxed);
+        }
+      }
+      cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dnum); cudaFree(dden); cudaFree(dke);
       cudaStreamDestroy(st);
     });
   }
