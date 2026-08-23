@@ -693,17 +693,32 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
   if (I % W != 0) { delete g; return 1; }
   const int64_t per = I / W;
 
-  // host reference.
-  std::vector<float> ref((size_t)O, 0.f);
-  for (int o = 0; o < O; ++o) {
-    double a = 0.0;
-    for (int i = 0; i < I; ++i) {
-      float gv = 0.f, uv = 0.f;
-      for (int k = 0; k < H; ++k) { gv += x[k] * gate[i * (size_t)H + k]; uv += x[k] * up[i * (size_t)H + k]; }
-      const float sg = 1.f / (1.f + std::exp(-(double)gv));
-      a += (double)((gv * sg) * uv) * down[o * (size_t)I + i];
+  // host reference. The double-loop O×I×H with an expf per (o,i) is ~5e11
+  // ops at 27B dims per MLP layer — a debug self-check, not production math.
+  // Run it ONLY under VT_TP_DIAG (the 2-GPU nccl self-score); the serving path
+  // skips it and validates the shard by its own error channels (rc from the
+  // group primitive). Byte-identical result: `out`/`ref` are compared only on
+  // the diag branch, and this bool is read once.
+  const bool kVerify = std::getenv("VT_TP_DIAG") != nullptr;
+  std::vector<float> ref;
+  if (kVerify) {
+    ref.assign((size_t)O, 0.f);
+    for (int o = 0; o < O; ++o) {
+      double a = 0.0;
+      for (int i = 0; i < I; ++i) {
+        float gv = 0.f, uv = 0.f;
+        for (int k = 0; k < H; ++k) { gv += x[k] * gate[i * (size_t)H + k]; uv += x[k] * up[i * (size_t)H + k]; }
+        const float sg = 1.f / (1.f + std::exp(-(double)gv));
+        a += (double)((gv * sg) * uv) * down[o * (size_t)I + i];
+      }
+      ref[o] = (float)a;
     }
-    ref[o] = (float)a;
+  }
+  // DIAG (VT_ENGINE_STEP_LOG): did the host REFERENCE loop complete? SCRATCH.
+  if (kVerify && std::getenv("VT_ENGINE_STEP_LOG") != nullptr) {
+    std::fprintf(stderr, "INFO mlp-shard ref-loop done O=%d I=%d H=%d (verify ON)\n",
+                 (int)O, (int)I, (int)H);
+    std::fflush(stderr);
   }
 
   std::atomic<int> bad{0};
@@ -712,6 +727,10 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
   for (int r = 0; r < W; ++r) {
     threads.emplace_back([&, r]() {
       if (bad.load(std::memory_order_relaxed)) return;
+      if (std::getenv("VT_ENGINE_STEP_LOG") != nullptr) {
+        std::fprintf(stderr, "[mlp] thread r=%d enter\n", r);
+        std::fflush(stderr);
+      }
       NcclDevScope scope(r);
       const int64_t ib = per * r;
       cudaStream_t st = nullptr;
@@ -745,10 +764,12 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
       cudaMemcpyAsync(back.data(), dout, (size_t)O * sizeof(float), cudaMemcpyDeviceToHost, st);
       cudaStreamSynchronize(st);
       if (r == 0) { for (int o = 0; o < O; ++o) out[o] = back[(size_t)o]; }
-      for (int o = 0; o < O; ++o)
-        if (std::fabs(back[(size_t)o] - ref[(size_t)o]) >
-            5e-4f * std::max(1.0f, std::fabs(ref[(size_t)o])))
-          bad.store(1, std::memory_order_relaxed);
+      if (kVerify) {
+        for (int o = 0; o < O; ++o)
+          if (std::fabs(back[(size_t)o] - ref[(size_t)o]) >
+              5e-4f * std::max(1.0f, std::fabs(ref[(size_t)o])))
+            bad.store(1, std::memory_order_relaxed);
+      }
       cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); cudaStreamDestroy(st);
     });
   }
