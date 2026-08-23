@@ -208,6 +208,27 @@ Verification for the perf change (measured 2026-08-20, GPUs 2,3):
   re-reads. Non-regression: dense tp==tp1 gate green (112 s), `test_nccl_group`
   green; only `nccl_communicator.cu` (levers A+B) and these records changed.
 
+### Mutation proof (measured 2026-08-20, GPUs 2,3)
+
+The paged tp>1 attention call site (`FullAttnBlockPaged` →
+`vt_cuda_attn_gqa_shard_run`, qwen3_5.cpp) was mutated in the canonical
+working tree, rebuilt, re-gated, and the tree restored byte-for-byte (git
+blob-verified before and after):
+- **Guard-disabled variant is VACUOUS** — reading the fall-through
+  (`vt::PagedAttention` over the per-rank full paged cache) shows it computes
+  correct attention under tp>1 when the cache is replicated per rank, so that
+  mutation would stay green and prove nothing. Not run; recorded as the
+  reason it was skipped.
+- **Value-corrupting variant goes RED**: `oh[0] += 1000.0f` after the shard
+  call flips the tp>1 arm — `REQUIRE(t1 == tw)` fails
+  ({6511,314,9564,369,19241,13,271,248068,271} vs {6511,138104,...}), EXIT=1,
+  1 failed / 0 passed. The first (prefill) token still matches; corruption
+  diverges decode from token 2, as the paged cache accumulates.
+- **Restore is GREEN**: rebuilt clean, paged gate re-ran and matched the known
+  9 tokens (EXIT=0).
+
+Full no-regression sweep after the restore (GPUs 2,3): `test_sm70_fa2_decode`
+5/5, `test_cuda_backend` 7/7, `test_nccl_group` 16/16, paged tp==tp1 green.
 
 
 ## Owed
