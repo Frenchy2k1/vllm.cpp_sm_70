@@ -12,11 +12,21 @@
 #include <doctest/doctest.h>
 
 extern "C" int vt_cuda_nccl_group_selfcheck(void);
+extern "C" int vt_cuda_tp_seam_selfcheck(void);
 
 TEST_CASE("in-process NCCL collectives across the discrete GPUs (multi-device)") {
   const int rc = vt_cuda_nccl_group_selfcheck();
   if (rc == 2) {
     MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); multi-GPU NCLL skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("W2 TP seam over NCCL (TpShard + row-parallel all-reduce per rank)") {
+  const int rc = vt_cuda_tp_seam_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); TP seam skipped");
     return;
   }
   CHECK(rc == 0);
