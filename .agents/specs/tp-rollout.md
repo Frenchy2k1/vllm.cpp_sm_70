@@ -163,6 +163,53 @@ present in the box HF cache (13 shards, 21.98 GiB).
 - Mutation proof: delete the paged production call site in a scratch copy →
   gate must go red; restore byte-for-byte.
 
+### Performance levers (token-exact; landed 2026-08-19)
+
+The paged tp>1 27B gate ran ~86 min. Per-layer (GDN/MLP) cost split into two
+**single-threaded, weight-derived** host loops plus a GPU span:
+fp4→f32 decode (~4.7 s, `vt_host_decode_nvfp4_f32`) + masked `gu`/`dmask`
+weight-buffer build + pageable H2D (~3.5 s, inside `vt_cuda_mlp_shard_run_b`)
+ GEMM+AllReduce (~1 s). The decode and build loops are each **token-exact to
+parallelize**: every output element is written exactly once by deterministic
+per-element math (LUT + sign + scale, bf16-RNE round / masked copy) with no
+cross-element accumulation, so any row partition is bit-identical.
+
+Landed levers (scheduling/caching only — the f32 values feeding the same
+kernel are unchanged, so the paged tp==tp1 token gate must still match):
+- **A: parallel fp4 host decode** in `vt_host_decode_nvfp4_f32` — row-partition
+  the N rows across `min(ncpu, N)` host threads (`std::thread`, same idiom as
+  the verify reference). 1 thread → N threads, ~N× on the 4.7 s decode.
+- **B: hoisted + parallel `gu`/`dmask` build** in `vt_cuda_mlp_shard_run_b` —
+  the full merged `[2I,H]` gate/up and `[O,I]` down are built ONCE on the main
+  thread, in parallel over I rows, before the rank loop, instead of serially
+  inside each rank worker. The full mask equals the union of the per-rank
+  slices (rank r reads its `[i0, i0+per)` rows, strides by the full I), so the
+  per-rank result is unchanged. Each rank worker now only H2D-copies (reading
+  the shared host buffers is safe: read-only) + launches + reduces.
+
+Rejected / deferred (recorded, not implemented):
+- **Decode-once host cache**: a full f32 cache is ~68 GB host (64 layers ×
+  ~1.07 GB) — memory-prohibitive on this 125 GB shared box; an LRU < 64 layers
+  has ~0 hit-rate against the sequential 64-layer sweep. Parallel-per-layer
+  (A/B) gives the same ~N× win with no 68 GB.
+- **Persistent `CudaCommGroup`**: saves only the ~16 ms `ncclCommInitAll`
+  per call (~2 s over the whole run) for a signature thread-through across the
+  primitives. Poor ROI; the GEMM (HBM-bound on weight re-reads, ~1 s/layer
+  floor at 27B T=1) dominates the remainder.
+
+Verification for the perf change (measured 2026-08-20, GPUs 2,3):
+- `test_nccl_group` (host-decode known-nibble selfcheck + fresh + 27B-shaped
+  batched f32 parity, world=2) green: 16/16 cases, 2092/2092 assertions, ~23 s.
+- 27B paged tp==tp1 token gate still matches the known tokens
+  (6511 314 9564 369 19241 13 271 248068 271): **wall 2935 s (49 min) vs the
+  5139 s (85.7 min) marker-span baseline** (both `[pagedtp]`/wall on the same
+  2x16 GB V100 pair, same binary family) — the ~8.3 s GDN/MLP host span is
+  now overlapped, the residual floor is the HBM-bound f32 GEMM weight
+  re-reads. Non-regression: dense tp==tp1 gate green (112 s), `test_nccl_group`
+  green; only `nccl_communicator.cu` (levers A+B) and these records changed.
+
+
+
 ## Owed
 - **Fix the dense tp>1 attention from gather to GQA-exact.** Real latent
   correctness bug (see KNOWN DISCREPANCY). Cannot file a GitHub issue from this

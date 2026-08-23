@@ -590,6 +590,31 @@ extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
                                         float* out) {
   if (N < 0 || K <= 0 || K == 1) return 1;
   const int halves = K / 2, groups = K / 16;
+  // Token-exact parallelism: every out[n*K+2j(+1)] element is written exactly
+  // once by deterministic per-element math (E2M1 LUT + sign + F8E4M3*scale2,
+  // bf16-RNE rounded) with NO cross-element or cross-row accumulation, so
+  // partitioning the N rows across host threads yields a bit-identical
+  // output. The single-threaded loop was the documented ~4.7 s/layer decode
+  // cost on the 27B tp>1 paged path (64 layers x 9 forwards).
+  const int ncpu = std::max(1, (int)std::thread::hardware_concurrency());
+  if (N >= 2 && ncpu > 1) {
+    const int nthreads = std::min(ncpu, N);
+    std::vector<std::thread> ts;
+    ts.reserve((size_t)nthreads);
+    for (int c = 0; c < nthreads; ++c)
+      ts.emplace_back([=]() {
+        for (int n = c; n < N; n += nthreads)
+          for (int j = 0; j < halves; ++j) {
+            const uint8_t b = packed[n * halves + j];
+            const float gs = HostF8E4M3ToF32(scale8[n * groups + (2*j) / 16]) * scale2[n];
+            const int lo = b & 0xFu, hi = b >> 4;
+            out[n * K + 2 * j]     = HostRoundBf16(kHostE2M1[lo & 7] * ((lo & 8) ? -1.f : 1.f) * gs);
+            out[n * K + 2 * j + 1]  = HostRoundBf16(kHostE2M1[hi & 7] * ((hi & 8) ? -1.f : 1.f) * gs);
+          }
+      });
+    for (auto& t : ts) t.join();
+    return 0;
+  }
   for (int n = 0; n < N; ++n)
     for (int j = 0; j < halves; ++j) {
       const uint8_t b = packed[n * halves + j];
@@ -781,6 +806,45 @@ extern "C" int vt_cuda_mlp_shard_run_b(int T, int O, int H, int I, int verify,
       }, c);
     for (auto& h : hts) h.join();
   }
+  // The merged [2I,H] gate/up + [O,I] down weight buffers. The FULL merged
+  // gu (rows [0,I)=gate, [I,2I)=up) and the full down are built ONCE on the
+  // main thread, in parallel over the I rows, before the rank loop. This is
+  // token-exact: every element is written exactly once (a masked copy, no
+  // cross-element accumulation), and the full mask equals the union of the
+  // per-rank slices (rank r reads its [i0, i0+per) rows and strides by the
+  // full I). The serial in-worker build of the masked buffers was the ~3.5 s
+  // per-layer cost on the 27B tp>1 paged path. Each rank worker then only
+  // H2D-copies (reading these shared host buffers is safe: read-only) and
+  // launches its slice.
+  std::vector<float> gu((size_t)(2 * I * H), 0.f);
+  std::vector<float> dmask((size_t)(O * I), 0.f);
+  const int bncpu = std::max(1, (int)std::thread::hardware_concurrency());
+  if (I >= 2 && bncpu > 1) {
+    const int bthreads = std::min(bncpu, (int)I);
+    std::vector<std::thread> bts;
+    bts.reserve((size_t)bthreads);
+    for (int c = 0; c < bthreads; ++c)
+      bts.emplace_back([&, c]() {
+        for (int64_t i = c; i < I; i += bthreads) {
+          const float* gsrc = gate + (size_t)i * H;
+          const float* usrc = up + (size_t)i * H;
+          float* gd = gu.data() + (size_t)(i * H);
+          float* ud = gu.data() + (size_t)((I + i) * H);
+          for (int k = 0; k < H; ++k) { gd[k] = gsrc[k]; ud[k] = usrc[k]; }
+          for (int o = 0; o < O; ++o) dmask[(size_t)o * I + i] = down[(size_t)o * I + i];
+        }
+      });
+    for (auto& t : bts) t.join();
+  } else {
+    for (int64_t i = 0; i < I; ++i) {
+      const float* gsrc = gate + (size_t)i * H;
+      const float* usrc = up + (size_t)i * H;
+      float* gd = gu.data() + (size_t)(i * H);
+      float* ud = gu.data() + (size_t)((I + i) * H);
+      for (int k = 0; k < H; ++k) { gd[k] = gsrc[k]; ud[k] = usrc[k]; }
+      for (int o = 0; o < O; ++o) dmask[(size_t)o * I + i] = down[(size_t)o * I + i];
+    }
+  }
   std::atomic<int> bad{0};
   std::vector<std::thread> threads;
   threads.reserve((size_t)W);
@@ -800,14 +864,6 @@ extern "C" int vt_cuda_mlp_shard_run_b(int T, int O, int H, int I, int verify,
         cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dout); if (st) cudaStreamDestroy(st);
         return;
       }
-      std::vector<float> gu((size_t)(2 * I * H), 0.f);
-      for (int64_t i = ib; i < ib + per; ++i)
-        for (int k = 0; k < H; ++k) {
-          gu[(size_t)(i * H + k)] = gate[i * (size_t)H + k];
-          gu[(size_t)(((I + i) * H + k))] = up[i * (size_t)H + k];
-        }
-      std::vector<float> dmask((size_t)(O * I), 0.f);
-      for (int o = 0; o < O; ++o) for (int64_t i = ib; i < ib + per; ++i) dmask[o * I + i] = down[o * I + i];
       cudaMemcpyAsync(dx, x, (size_t)T * H * sizeof(float), cudaMemcpyHostToDevice, st);
       cudaMemcpyAsync(dgu, gu.data(), (size_t)(2 * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
       cudaMemcpyAsync(dd, dmask.data(), (size_t)(O * I) * sizeof(float), cudaMemcpyHostToDevice, st);

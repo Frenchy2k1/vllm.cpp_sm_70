@@ -167,6 +167,33 @@ After Qwen3.5 dense (and MoE) reach token-equal, the spec's "all Forwards
 threading" phase: add the null-default `tp` to the ~58 other hand-rolled arch
 `::Forward` classes (mechanical; the sharding math stays in `tensor_parallel.h`).
 
+## TP step 3 — paged tp>1 performance levers (token-exact)
+
+After the paged tp==tp1 token gate went green (2-GPU == tp1, 9 tokens, ~86 min
+wall), the perf work targeted the measured ~99% cost: the MLP shard's
+per-layer fp4→f32 host decode (4.7 s) + masked `gu`/`dmask` weight-buffer
+build/pageable H2D (3.5 s). Both are **single-threaded host loops, token-exact
+to parallelize** (each element written once by deterministic per-element math,
+no cross-element accumulation). Landed in `nccl_communicator.cu`:
+- **A:** `vt_host_decode_nvfp4_f32` row-partitions the N rows across
+  `min(ncpu, N)` host threads.
+- **B:** `vt_cuda_mlp_shard_run_b` builds the full merged `[2I,H]` + `[O,I]`
+  weight buffers ONCE on the main thread, in parallel over I rows, before the
+  rank loop (was: serially inside each rank worker); workers now only H2D +
+  launch + AllReduce.
+Rejected (recorded in spec + PLAN.md): decode-once host cache (~68 GB host,
+prohibitive; LRU < 64 layers ~0 hit-rate) and persistent `CudaCommGroup`
+(~16 ms/call ≈ 2 s total; the HBM-bound f32 GEMM weight re-reads are the
+remaining floor).
+**Measured (2026-08-20, GPUs 2,3, same binary family):** `test_nccl_group`
+green (16/16 cases, 2092 assertions, ~23 s); the 27B paged tp==tp1 token gate
+still matches the known tokens (6511 314 9564 369 19241 13 271 248068 271) and
+wall drops from the **5139 s (85.7 min) marker-span baseline to 2935 s (49
+min)**; dense tp==tp1 gate green (112 s) — no regression. The token-exact
+levers are confirmed: the f32 values feeding the kernel are unchanged, only
+their host-thread scheduling is.
+
+
 ## Working agreements / do-not-break
 
 - **tp1 is the load-bearing path** and must stay byte-identical at every TP
