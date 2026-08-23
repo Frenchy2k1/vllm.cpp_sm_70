@@ -889,6 +889,78 @@ extern "C" int vt_sm70_nvfp4_selfcheck(void) {
     if (bad) return 1;
   }
 
+  // Case D: QPN band (brick C) — M=8 n=64 k=512 (n%32==0, k%64==0 -> QPN,
+  // checked before WMMA). Device-tensor-core decode vs CpuReference.
+  {
+    const int m = 8, n = 64, k = 512;
+    uint64_t s = 0x44aa;
+    std::vector<__half> x((size_t)m * k), y((size_t)m * n);
+    std::vector<uint8_t> codes((size_t)n * (k >> 1)), scales((size_t)n * (k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd(s);
+    for (auto& v : scales) v = (uint8_t)rnd(s);
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 2000) - 10.f);
+    void* dx; void* dc; void* ds; void* dy;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, y.size() * sizeof(__half));
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&ds, scales.size());
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    args.m = m; args.n = n; args.k = k; args.out = dy; args.x = dx;
+    args.codes = dc; args.scales = ds;
+    args.argmax_val = nullptr; args.argmax_idx = nullptr;
+    const bool ok = LaunchSm70Nvfp4W4a16(caps, &args);
+    cudaDeviceSynchronize();
+    if (!ok) { cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); return 1; }
+    cudaMemcpy(y.data(), dy, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    const auto ref = CpuReference(m, n, k, x, codes, scales, args.gscale);
+    bool bad = false;
+    for (size_t i = 0; i < y.size(); ++i) {
+      if (std::fabs((double)__half2float(y[i]) - (double)ref[i]) >
+          2.0e-2 * std::max(1.0, std::fabs((double)ref[i]))) { bad = true; break; }
+    }
+    fprintf(stderr, " [selfcheck] case D (QPN M8xN64) parity OK=%d\n", bad ? 0 : 1);
+    cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds);
+    if (bad) return 1;
+  }
+
+  // Case E: WMMA band (brick B) — M=32 n=48 k=512 (n%32!=0 so NOT QPN;
+  // n%16==0 and k%512==0 -> WMMA wm=2). Device tensor-core vs CpuReference.
+  {
+    const int m = 32, n = 48, k = 512;
+    uint64_t s = 0x55bb;
+    std::vector<__half> x((size_t)m * k), y((size_t)m * n);
+    std::vector<uint8_t> codes((size_t)n * (k >> 1)), scales((size_t)n * (k >> 4));
+    for (auto& v : codes) v = (uint8_t)rnd(s);
+    for (auto& v : scales) v = (uint8_t)rnd(s);
+    for (auto& v : x) v = f2h(0.01f * (float)(rnd(s) % 2000) - 10.f);
+    void* dx; void* dc; void* ds; void* dy;
+    cudaMalloc(&dx, x.size() * sizeof(__half));
+    cudaMalloc(&dy, y.size() * sizeof(__half));
+    cudaMalloc(&dc, codes.size());
+    cudaMalloc(&ds, scales.size());
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    args.m = m; args.n = n; args.k = k; args.out = dy; args.x = dx;
+    args.codes = dc; args.scales = ds;
+    args.argmax_val = nullptr; args.argmax_idx = nullptr;
+    const bool ok = LaunchSm70Nvfp4W4a16(caps, &args);
+    cudaDeviceSynchronize();
+    if (!ok) { cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds); return 1; }
+    cudaMemcpy(y.data(), dy, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    const auto ref = CpuReference(m, n, k, x, codes, scales, args.gscale);
+    bool bad = false;
+    for (size_t i = 0; i < y.size(); ++i) {
+      if (std::fabs((double)__half2float(y[i]) - (double)ref[i]) >
+          2.0e-2 * std::max(1.0, std::fabs((double)ref[i]))) { bad = true; break; }
+    }
+    fprintf(stderr, " [selfcheck] case E (WMMA M32xN48 k=512) parity OK=%d\n", bad ? 0 : 1);
+    cudaFree(dx); cudaFree(dy); cudaFree(dc); cudaFree(ds);
+    if (bad) return 1;
+  }
+
   // Case C: argmax requested at k%128 != 0 must be DECLINED (portable path),
   // not silently plain-decoded.
   {
