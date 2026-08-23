@@ -1638,7 +1638,11 @@ if(VLLM_CPP_SERVER)
     # /v1/embeddings dispatch + socket smoke run against the REAL engine path
     # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
     # (ARCH-ONE-SURFACE ROW 6).
-    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+    LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+    # #1681: the REAL published Qwen3.8 chat template, rendered through the
+    # production /v1/chat/completions dispatch. Absolute so it resolves from
+    # whatever working directory ctest runs the suite in.
+    VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
   target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
@@ -1702,7 +1706,11 @@ target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
-  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+  # #1681: the real published Qwen3.8 chat template, rendered through the C
+  # ABI's own vllm_chat path. Absolute so it resolves from whatever working
+  # directory ctest runs the suite in.
+  VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
