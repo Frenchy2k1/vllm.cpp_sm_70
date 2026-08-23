@@ -30,11 +30,13 @@
 #include "vt/ops.h"
 
 #if defined(VT_NCCL)
+#include <atomic>
 #include <cuda_runtime.h>
 #include <nccl.h>
 
 #include <stdexcept>
 #include <string>
+#include <thread>
 #endif
 
 namespace vt {
@@ -159,6 +161,103 @@ struct NcclProviderRegistrar {
                reinterpret_cast<void*>(&CudaRecv));
   }
 } nccl_provider_registrar;
+
+// Multi-device (TP) phase-3 collective self-check: build a REAL process-local
+// NCCL communicator over every discrete GPU (ncclCommInitAll on devices
+// 0..N-1), give each device an NcclCommunicator (rank==device), then run an
+// AllReduce + AllGather across them and diff against the host ground truth.
+// Proves the in-process collective primitive works end-to-end on this box
+// (this is the transport the runner slice will call per layer). Per-op device
+// affinity: each collective runs with the queue's device current (the CUDA
+// backend now carries that affinity). Returns 0 ok / 1 mismatch / 2 not
+// multi-GPU (or NCCL unbuilt).
+class NcclDevScope {
+ public:
+  explicit NcclDevScope(int dev) noexcept : dev_(dev), prev_(0), set_(false) {
+    if (cudaGetDevice(&prev_) == cudaSuccess && prev_ != dev_) {
+      set_ = (cudaSetDevice(dev_) == cudaSuccess);
+    }
+  }
+  ~NcclDevScope() noexcept {
+    if (set_) (void)cudaSetDevice(prev_);
+  }
+
+ private:
+  int dev_;
+  int prev_;
+  bool set_;
+};
+
+extern "C" int vt_cuda_nccl_group_selfcheck(void) {
+  int ngpu = 0;
+  if (cudaGetDeviceCount(&ngpu) != cudaSuccess || ngpu < 2) return 2;
+  std::vector<int> devs(ngpu);
+  for (int i = 0; i < ngpu; ++i) devs[i] = i;
+
+  std::vector<ncclComm_t> comms(ngpu);
+  if (ncclCommInitAll(comms.data(), ngpu, devs.data()) != ncclSuccess) return 1;
+  std::vector<NcclCommunicator> cs;
+  cs.reserve(ngpu);
+  for (int i = 0; i < ngpu; ++i) cs.emplace_back(comms[i], i, ngpu);
+
+  // NCCL collectives are blocking per rank: ALL ranks must participate
+  // concurrently, so each rank's collective runs on its OWN host thread (a
+  // serial loop deadlocks — rank r waits for ranks > r that never call).
+  const float expectation = static_cast<float>(ngpu * (ngpu + 1) / 2);
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)ngpu);
+  for (int r = 0; r < ngpu; ++r) {
+    threads.emplace_back([r, ngpu, &cs, &bad, expectation]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      cudaStream_t st = nullptr;
+      float *d = nullptr, *dg = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&d, sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dg, (size_t)ngpu * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(d); cudaFree(dg); if (st) cudaStreamDestroy(st);
+        return;
+      }
+      const float mine = static_cast<float>(r + 1);
+      cudaMemcpyAsync(d, &mine, sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      Queue q{{DeviceType::kCUDA, r}, st};
+      cs[r].AllReduce(q, d, 1u, DType::kF32, ReduceOp::kSum);  // blocking, all ranks
+      float agg = 0.f;
+      cudaMemcpyAsync(&agg, d, sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      if (std::fabs(agg - expectation) > 1e-6f) {
+        fprintf(stderr, "vt nccl self-check: rank %d allreduce %.3f want %.3f\n",
+                r, (double)agg, (double)expectation);
+        bad.store(1, std::memory_order_relaxed);
+      }
+      // AllGather a FRESH per-rank value (the reduced `d` is now identical on
+      // every rank, so gathering it only re-checks replication). Use (r+1000)
+      // and require the ordered [1000..1000+ngpu-1] vector.
+      const float sendv = static_cast<float>(1000 + r);
+      cudaMemcpyAsync(d, &sendv, sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      cs[r].AllGather(q, d, dg, 1u, DType::kF32);  // blocking, all ranks
+      std::vector<float> got((size_t)ngpu, 0.f);
+      cudaMemcpyAsync(got.data(), dg, (size_t)ngpu * sizeof(float),
+                      cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      for (int i = 0; i < ngpu; ++i) {
+        if (std::fabs(got[(size_t)i] - (float)(1000 + i)) > 1e-6f) {
+          fprintf(stderr, "vt nccl self-check: rank %d allgather[%d]=%.3f want %d\n",
+                  r, i, (double)got[(size_t)i], 1000 + i);
+          bad.store(1, std::memory_order_relaxed);
+        }
+      }
+      cudaFree(d); cudaFree(dg); cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  for (int i = 0; i < ngpu; ++i) ncclCommDestroy(comms[i]);
+  return bad.load();
+}
 
 #endif  // VT_NCCL
 
