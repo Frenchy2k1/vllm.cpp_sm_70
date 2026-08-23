@@ -270,3 +270,59 @@ TEST_CASE("batched mlp_shard_run_b holds at 27B production shape (T=9, H=5120, I
     CHECK(out[(size_t)t*O+o]==doctest::Approx(mlp_ref_one(t,o,H,I,x.data(),gate.data(),up.data(),down.data())).epsilon(5e-4));
   }
 }
+
+extern "C" int vt_cuda_moe_shard_run_b(int P,int H,int I,int E,int verify,const float* x,const int32_t* exp,const float* gate,const float* up,const float* down,float* out);
+extern "C" int vt_cuda_moe_shard_selfcheck(void);
+// host MoE reference (per-pair expert), one (p,o) at a time.
+static float moe_ref_one(int p,int o,int H,int I,const float* x,const int32_t* exp,const float* gate,const float* up,const float* down){
+  double a=0.0; const int e=exp[p];
+  for(int i=0;i<I;++i){
+    double gv=0.0, uv=0.0;
+    for(int k=0;k<H;++k){ gv+=(double)x[(size_t)p*H+k]*gate[((size_t)e*I+i)*H+k]; uv+=(double)x[(size_t)p*H+k]*up[((size_t)e*I+i)*H+k]; }
+    const float sg=1.f/(1.f+(float)std::exp(-(double)gv));
+    a+=(double)((gv*sg)*uv)*down[((size_t)e*H+o)*I+i];
+  }
+  return (float)a;
+}
+TEST_CASE("moe expert-shard selfcheck: per-pair expert + intermediate slice + AllReduce (verify=1)") {
+  const int rc = vt_cuda_moe_shard_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); moe shard skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+TEST_CASE("moe shard: fresh shape, verify=1 (full internal parity)") {
+  constexpr int P=8,H=48,I=64,E=4;  // I%2==0 on 2-GPU box
+  std::vector<float> x((size_t)P*H), gate((size_t)E*I*H), up((size_t)E*I*H), down((size_t)E*H*I), out((size_t)P*H,0.f);
+  std::vector<int32_t> exp(P);
+  for (size_t n=0;n<x.size();++n) x[n]=0.2f+0.1f*(float)(n%7);
+  for (size_t i=0;i<gate.size();++i){ gate[i]=0.01f*((int)(i%131)); up[i]=0.01f*((int)(i%139)); }
+  for (size_t i=0;i<down.size();++i) down[i]=0.01f*((int)(i%137));
+  for (int p=0;p<P;++p) exp[p]=(p*5)%E;
+  int rc=vt_cuda_moe_shard_run_b(P,H,I,E,1,x.data(),exp.data(),gate.data(),up.data(),down.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL unbuilt); moe shard skipped");return;}
+  CHECK(rc==0);
+  for (int p=0;p<P;++p) for (int o=0;o<H;o+=7)
+    CHECK(out[(size_t)p*H+o]==doctest::Approx(moe_ref_one(p,o,H,I,x.data(),exp.data(),gate.data(),up.data(),down.data())).epsilon(5e-4));
+}
+TEST_CASE("moe shard holds at 35B production shape (H=2048, I=512, E=256, P=3)") {
+  // The 35B A3B MoE shape at decode T=1, top_k=8 (P=T*top_k=3 covers the
+  // prefill-1 + 2 decode tokens). The verify=0 compute-only path is what the
+  // paged engine gate runs; parity is spot-checked against the host reference.
+  constexpr int P=3,H=2048,I=512,E=256;  // I%2==0
+  std::vector<float> x((size_t)P*H), gate((size_t)E*I*H), up((size_t)E*I*H), down((size_t)E*H*I), out((size_t)P*H,0.f);
+  std::vector<int32_t> exp(P);
+  for (size_t n=0;n<x.size();++n) x[n]=0.05f+0.01f*(float)(n%37);
+  for (size_t i=0;i<gate.size();++i){ gate[i]=0.002f*((int)(i%997)); up[i]=0.002f*((int)(i%1009)); }
+  for (size_t i=0;i<down.size();++i) down[i]=0.001f*((int)(i%1003));
+  for (int p=0;p<P;++p) exp[p]=17*p+3;
+  int rc=vt_cuda_moe_shard_run_b(P,H,I,E,0,x.data(),exp.data(),gate.data(),up.data(),down.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); big moe shard skipped");return;}
+  CHECK(rc==0);
+  const int ps[3]={0,1,2}, os[6]={0,1,1000,2046,2047,1500};
+  for (int a=0;a<3;++a) for (int b=0;b<6;++b){
+    const int p=ps[a], o=os[b];
+    CHECK(out[(size_t)p*H+o]==doctest::Approx(moe_ref_one(p,o,H,I,x.data(),exp.data(),gate.data(),up.data(),down.data())).epsilon(5e-4));
+  }
+}

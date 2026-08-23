@@ -57,6 +57,10 @@ extern "C" int vt_cuda_attn_gqa_shard_run(int T, int Hq, int Hkv, int S, int D,
                                           const int* key_end, const float* q,
                                           const float* k, const float* v,
                                           float* out);
+extern "C" int vt_cuda_moe_shard_run_b(int P, int H, int I, int E, int verify,
+                                       const float* x, const int32_t* exp,
+                                       const float* gate, const float* up,
+                                       const float* down, float* out);
 #endif  // VT_NCCL
 #include <cstdint>
 #include <cstdio>
@@ -7220,7 +7224,8 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 }
 
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
-              const Tensor& dh, int64_t T) {
+              const Tensor& dh, int64_t T,
+              const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const int64_t E = cfg.num_experts;
   const int64_t top_k = cfg.num_experts_per_tok;
@@ -7229,6 +7234,117 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // (synthetic / GGUF). Exactly one set is populated (see qwen3_5_weights.h).
   const bool fp4 = !w.expert_gate_fp4.empty();
 
+  // Multi-device (tp>1): the per-rank MoE expert-MLP shard. Every rank holds
+  // the FULL expert set (the kernel strides by the full I); rank r owns the
+  // intermediate slice [r*per_i, (r+1)*per_i) of EVERY expert (gate/up column
+  // slice, down row slice) and the group AllReduceSum over the [P,H] partial
+  // yields the full expert_out on every rank. This is the MoE twin of the
+  // proven 27B dense per-rank MLP shard (DenseMlpBlock above), generalized
+  // from a single [I,H] expert to E per-pair-indexed experts. The router,
+  // shared expert and weighted combine below run UNCHANGED on-device,
+  // replicated on every rank (byte-identical inputs -> byte-identical output
+  // on all ranks), so only the three grouped-GEMM launches are replaced by
+  // the shard. tp1 (null) never enters, so the fp4-resident fused path below
+  // stays byte-identical. Host-decoding the full expert set per layer needs
+  // the resident fp4 host bytes, which the production Marlin build frees
+  // (BuildMoeMarlinResident -> ReleaseHost) unless VT_MOE_HOST_FREE=0 -- the
+  // tp>1 gate runs with that toggle, same binary, device compute unchanged.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    if (!fp4)
+      throw std::runtime_error(
+          "qwen3_5 moe: tp>1 expert shard supports the fp4-resident path only "
+          "(bf16/split-Matmul-B expert weights are not host-decodable here)");
+    // The pair-row map: row p = t*top_k+j of the [T,top_k,H] expert_out the
+    // fused path builds (Reshape(ddown,{T,top_k,H})). The per-pair expert is
+    // the router's top-k id dtid[t,j]; its activation is dh[t].
+    DBuf dlog(d, DType::kBF16, {T, E});
+    MoeRouterLogits(d, dlog.t(), dh, w.router_gate);
+    DBuf dtw(d, DType::kF32, {T, top_k});
+    DBuf dtid(d, DType::kI32, {T, top_k});
+    vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                      vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+    const int64_t P = T * top_k;
+    std::vector<int32_t> tid(static_cast<size_t>(T) * top_k);
+    dtid.Download(d, tid.data());
+    // Pair-ordered f32 activation rows (the shard's x[P,H]).
+    std::vector<uint16_t> hid(static_cast<size_t>(T) * H);
+    d.b.Copy(d.q, hid.data(), (const void*)dh.data,
+             (size_t)T * H * sizeof(uint16_t));
+    std::vector<float> xb(static_cast<size_t>(P) * H);
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t j = 0; j < top_k; ++j)
+        for (int64_t k = 0; k < H; ++k)
+          xb[(t * top_k + j) * H + k] = vt::BF16ToF32(hid[t * H + k]);
+    // Host-decode the FULL expert set (gate/up [I,H], down [H,I] per expert).
+    // The decoder demands a per-row scale2 array (indexed by n); the resident
+    // Nvfp4Weight holds a single per-tensor scalar, so broadcast it per row
+    // (identical decode to the 27B dense MLP shard above).
+    const auto row_scales = [](const Nvfp4Weight& wn) {
+      std::vector<float> s(static_cast<size_t>(wn.n), wn.scale2);
+      return s;
+    };
+    const auto dec = [&](const Nvfp4Weight& wn, float* dst,
+                         int n_rows, int n_k) {
+      std::vector<float> s2 = row_scales(wn);
+      return vt_host_decode_nvfp4_f32(n_rows, n_k, wn.packed.bytes.data(),
+                                       wn.scale.bytes.data(), s2.data(), dst);
+    };
+    std::vector<float> gate_host(static_cast<size_t>(E) * I * H, 0.f);
+    std::vector<float> up_host(static_cast<size_t>(E) * I * H, 0.f);
+    std::vector<float> down_host(static_cast<size_t>(E) * H * I, 0.f);
+    {
+      float* g = gate_host.data();
+      float* u = up_host.data();
+      float* dn = down_host.data();
+      for (int64_t e = 0; e < E; ++e) {
+        if (dec(w.expert_gate_fp4[static_cast<size_t>(e)], g, (int)I, (int)H) != 0 ||
+            dec(w.expert_up_fp4[static_cast<size_t>(e)], u, (int)I, (int)H) != 0 ||
+            dec(w.expert_down_fp4[static_cast<size_t>(e)], dn, (int)H, (int)I) != 0)
+          throw std::runtime_error("qwen3_5 moe: tp>1 fp4 expert host-decode failed");
+        g += (size_t)I * H;
+        u += (size_t)I * H;
+        dn += (size_t)H * I;
+      }
+    }
+    // One group for the whole pair batch (one NCCL create, one kernel per
+    // rank, one [P,H] AllReduce). The reduced [P,H] is authoritative on
+    // group rank 0; the shard H2D's the per-layer full f32 expert set to
+    // every rank (measured 7.5 GB/s; the kernel slices its intermediate).
+    std::vector<float> ob(static_cast<size_t>(P) * H, 0.f);
+    const int rc = vt_cuda_moe_shard_run_b(
+        (int)P, (int)H, (int)I, (int)E, /*verify=*/0, xb.data(), tid.data(),
+        gate_host.data(), up_host.data(), down_host.data(), ob.data());
+    if (rc == 2)
+      throw std::runtime_error(
+          "qwen3_5 moe: tp>1 requires >=2 GPUs (fault loudly)");
+    if (rc != 0)
+      throw std::runtime_error(
+          "qwen3_5 moe: tp>1 expert shard failed (mismatch/bad shape)");
+    // The shard's out[P,H] IS the fused path's [T,top_k,H] expert_out (same
+    // row map: p = t*top_k+j), so the shared expert + weighted combine below
+    // consume it byte-for-byte as the fused path would.
+    DBuf ddown(d, DType::kBF16, {P, H});
+    std::vector<uint16_t> red16(static_cast<size_t>(P) * H);
+    for (size_t n = 0; n < red16.size(); ++n) red16[n] = vt::F32ToBF16(ob[n]);
+    d.b.Copy(d.q, ddown.ptr(), red16.data(), red16.size() * sizeof(uint16_t));
+    d.b.Synchronize(d.q);
+    Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
+    if (MoeGlueFuseEnabled()) {
+      SharedExpertParts sp = SharedExpertUngated(d, w, cfg, dh, T, true);
+      DBuf dout(d, DType::kBF16, {T, H});
+      vt::MoeCombineGate(d.q, dout.t(), expert_out, dtw.t(), sp.sd.t(), sp.gl.t());
+      return dout;
+    }
+    DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
+    DBuf dout2(d, DType::kBF16, {T, H});
+    vt::MoeCombine(d.q, dout2.t(), expert_out, dtw.t(), &shared.t());
+    return dout2;
+#else
+    throw std::runtime_error(
+        "qwen3_5 moe: tp>1 requires an NCCL build (VLLM_CPP_NCCL)");
+#endif  // VT_NCCL
+  }
   // M2.4/M2.5 fused MoE: CUDA + fp4-resident does the expert compute in ~3
   // grouped GEMM launches fully on-device (no host round-trip — capturable).
   // The bf16 / CPU / GGUF reference below keeps the per-expert token-gather
@@ -7735,7 +7851,8 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
                    const CommonAttentionMetadata& attn_meta,
                    const GDNAttentionMetadata& gdn_meta,
                    const PagedKvCache* attn_kv, const GdnStateCache* gdn_state,
-                   int64_t T) {
+                   int64_t T,
+                   const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7750,7 +7867,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
     }
     VT_CHECK(attn_kv != nullptr, "paged layer: full-attn layer needs a PagedKvCache");
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
-                              *attn_kv, T, h_fp8);
+                              *attn_kv, T, h_fp8, tp);
   }();
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
@@ -7767,7 +7884,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
     vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   }
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T, tp);
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -8317,7 +8434,8 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<float>* mrope_cos_sin = nullptr,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
                           const Tensor* aux_out = nullptr,
-                          StepDevInputs* persistent_sdi = nullptr) {
+                          StepDevInputs* persistent_sdi = nullptr,
+                          const vllm::TensorParallel* tp = nullptr) {
   // ONE decode step, for the PAGED forwards: ForwardBody, the VL path and the
   // graph driver's eager fallback all funnel through here exactly once per
   // forward. This is the step boundary the expert slot cache is defined against,
@@ -8415,7 +8533,7 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
-                  kv, gs, T);
+                  kv, gs, T, tp);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -8478,14 +8596,16 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const std::vector<int32_t>& logits_indices = {},
                         const Tensor* hidden_tap = nullptr,
                         const std::vector<int32_t>* aux_layer_ids = nullptr,
-                        const Tensor* aux_out = nullptr) {
+                        const Tensor* aux_out = nullptr,
+                        const vllm::TensorParallel* tp = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices, hidden_tap,
-                       /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
+                       /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out,
+                       /*persistent_sdi=*/nullptr, tp);
 }
 
 // Shared shape/count validation for the paged forward entry points.
@@ -8756,12 +8876,15 @@ std::vector<float> Qwen3_5Model::Forward(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
     const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices,
+    const vllm::TensorParallel* tp) {
   CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                     gdn_state, weights, config);
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                             gdn_state, weights, config, logits_indices);
+                             gdn_state, weights, config, logits_indices,
+                             /*hidden_tap=*/nullptr, /*aux_layer_ids=*/nullptr,
+                             /*aux_out=*/nullptr, tp);
   // dlogits is [n_out, vocab]: n_out == num_reqs when gathered (prefill/mixed),
   // else T. Download exactly the produced rows (the ONE host Download).
   const int64_t n_out = dlogits.t().shape[0];

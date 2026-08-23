@@ -143,9 +143,126 @@ tp>1, so nothing regresses).
 
 vLLM's MoE TP default is weight-parallel: every rank holds all `E` experts;
 per-expert `gate`/`up` are column-sharded in the intermediate, `down` is
-row-sharded; AllReduceSum combines. tp1 keeps the fused WMMA path. Thread `tp`
-through the MoE `ForwardDense` (`qwen3_5.cpp:8198` takes no `tp` today); the
-paged path currently throws on tp>1 (`8733-8737`).
+row-sharded; AllReduceSum combines. tp1 keeps the fused path byte-identical.
+
+**Wire chain (corrected).** The MoE paged forward takes **no `tp` today and
+would silently run tp=1** — `ForwardLayers` (`qwen3_5.cpp:8019`), `ForwardBody`
+(`:8182`) and `Forward` (`:8197`) carry no `tp` parameter; `MoeBlock`
+(`:6943`) / `RunLayerPaged` (`:7454`) take none either. The
+"tp>1 per-rank sharding not yet landed" throws at `:9656-9708` are the DENSE
+legacy `Qwen3_5DenseModel::ForwardDevice*` guards, **not** the MoE path — the
+earlier draft of this section mis-attributed them. Mirror the dense chain
+(`DenseForwardBody:9092` → `DenseForwardLayers:8954` → `RunDenseLayerPaged`
+→ `DenseMlpBlock:7183` hook): thread `tp` through `Forward`/`ForwardBody`/
+`ForwardLayers` → `RunLayerPaged` → `MoeBlock`, and put the tp>1 shard inside
+`MoeBlock` (`:6943`) exactly where `DenseMlpBlock` has its hook.
+`RunLayerPaged` ALSO passes `tp` to `FullAttnBlockPaged` (the 10 full-attn
+layers take the same per-rank GQA KV-head shard the 27B dense gate already
+exercises; GDN layers and the MoE router/shared-expert/combine replicate on
+every rank), mirroring `RunDenseLayerPaged`'s `FullAttnBlockPaged(tp)` +
+`DenseMlpBlock(tp)` split.
+
+**Host-bytes prerequisite.** The production 35B MoE path is
+`MoeBlockFusedMarlinCuda` (`MarlinMoeEnabled()` default ON); its resident build
+`BuildMoeMarlinResident` (`:6413`) **releases the host fp4 bytes**
+(`w.expert_*_fp4[].packed.ReleaseHost()`, `:6609-6614`) when
+`VT_MOE_HOST_FREE` is ON (default). The tp>1 shard host-decodes from those
+bytes (`vt_host_decode_nvfp4_f32`), so the gate must run with
+`VT_MOE_HOST_FREE=0` (a documented same-binary A/B toggle: it retains the host
+copies, device compute unchanged). tp1 keeps the Marlin path regardless.
+
+**Cost model (measured, 2026-08-21).** The prior "5.4 h infeasible" verdict is
+superseded, and the *single-thread* "0.805 s/tensor conservative" figure is
+retired by measurement: `vt_host_decode_nvfp4_f32` parallelizes the row strip
+9× (1.14 s single-thread → **0.126 s per full `[E,I,H]` tensor at 48 threads**;
+row-strip decode is memory-bandwidth bound and does parallelize across the
+E·I rows). Per MoE layer (gate `[E·I,H]` + up `[E·I,H]` + down `[E·H,I]`) ≈
+**0.378 s**, ×40 layers ×9 forwards ≈ **136 s** decode (single-thread worst
+case ≈ 465 s — still in budget). Decode re-runs every forward (a 40×3.14 GB ≈
+125 GB host f32 cache is rejected, matching the dense 27B's rejected 68 GB
+cache).
+
+**H2D is NOT a lever here (measured, not calibrated).** Each rank's f32 shard
+is the FULL expert set (the kernel strides by the full I and reads its slice):
+`[E·I,H]×2 + [E·H,I]` = **3.00 GB/rank**. Measured H2D at that size is
+**7.5 GB/s (pageable ≈ pinned, both ≈ 0.43 s)** — the 27B's "~430 MB/s" was a
+mis-calibration, not a real pageable rate. Per-rank H2D ≈ 0.43 s/layer,
+comparable to the 0.38 s decode; ×40×9 ×2 ranks ≈ 326 s. The naive per-call
+pageable H2D design therefore costs ≈ 136 s decode + 326 s H2D + a small
+per-rank f32 GEMM ≈ **~500 s**, well inside the 3600 s clamp. **No
+device-residency lever is required** — the earlier "GO conditional on a
+device-resident per-rank shard" was premised on the 430 MB/s figure; at the
+measured 7.5 GB/s the simple per-layer decode + per-layer H2D design fits.
+The end-to-end wall is still validated by the real 35B paged gate.
+
+**Design (selfcheck-first).** Generalize the proven batched dense shard
+(`vt_cuda_mlp_shard_run_b` `:766`, `DenseMlpRankPartialBatch` kernel `:650`)
+to per-pair expert indexing:
+- `MoeMlpRankPartialBatch(x[P,H], exp[P] i32, gate[E,I,H], up[E,I,H],
+  down[E,H,I] f32, out[P,H], per_i, i0, I, E)` — one thread per (p,o); rank r
+  owns the intermediate slice `[i0, i0+per)` of **every** expert; `e=exp[p]`
+  selects the per-expert weight base; partial `[P,H]`; the group AllReduceSum
+  over `[P*H]` yields the full expert_out on every rank.
+- `vt_cuda_moe_shard_run_b(P,H,I,E,verify,x,exp,gate,up,down,out)` — spawns W
+  rank threads (`NcclDevScope`), each H2D's the per-layer full expert-set f32
+  buffer to its device (7.5 GB/s, measured), launches its intermediate slice,
+  AllReduceSum. `verify=0` (production) is compute-only; `verify=1` computes a
+  double-precision host reference (parallel over (p,o)) and enforces the 5e-4
+  relative tolerance — selfcheck only (the reference is O(P·H·I·H) and
+  unrunnable at production shape, same as the dense `verify`).
+- Model hook in `MoeBlock` (`:6943`): when tp>1, host-decode the full expert
+  set (requires `VT_MOE_HOST_FREE=0`), H2D the per-layer full f32 buffer to
+  every rank, produce `expert_out [P,H]` via the shard, then the **UNCHANGED**
+  router (`MoeRouterLogits`+`MoeRouterTopK`) and `MoeCombine` (shared +
+  weighted). Replaces only the grouped-GEMM launches
+  (`MoeBlockFusedCuda:6382-6389` / the Marlin pair); router and combine run
+  on-device as in the fused path, replicated on every rank.
+- **Model-free selfcheck first** (`vt_cuda_moe_shard_selfcheck`, wired into
+  `test_nccl_group`): random `[P,H]` x + `[P]` exp + random expert weights at a
+  representative MoE shape (E=16, I=128, H=96, P=32, world=2 — enough pairs
+  over enough experts to prove per-pair indexing + intermediate slicing +
+  AllReduce without the 3.14 GB production H2D), `verify=1` parity vs the
+  double reference. Red-first: the selfcheck is red until the kernel is
+  correct, green after. The real-shape correctness is then the 35B paged gate.
+
+**Acceptance (this phase):** 35B A3B paged tp==tp1 token gate (world=2,
+Hkv=2, `CUDA_VISIBLE_DEVICES=2,3`, `VT_MOE_HOST_FREE=0`), same-binary A/B,
+device compute unchanged; then the full no-regression sweep (fa2, backend,
+nccl, 27B dense tp==tp1, 35B paged engine) + the reachability mutation
+(delete the `MoeBlock` tp>1 call site in a scratch copy → gate red).
+
+**Outcome (measured 2026-08-21, GPUs 2,3, V100 32 GB, world=2, Hkv=2 →
+per-rank 1 KV head).** The 35B A3B paged tp==tp1 token gate is **GREEN**:
+`2-GPU == tp1` (9 tokens `6511 314 9564 369 19241 13 198 760 6511`), 1 passed
+| 0 failed, **wall 3205.89 s (~53 min)**. The tp>1 expert shard (f32
+host-decode weights → per-pair expert GEMM → NCCL AllReduceSum over `[P,H]`,
+the intermediate `I` sliced per rank) reproduces the tp1 Marlin arm
+TOKEN-FOR-TOKEN over all 40 MoE layers, so the **replicate-vs-shard fork
+resolves in favor of SHARD** — no fallback to a replicated MoE is needed, and
+the MoE expert shard is a first-class TP path, not a perf-only approximation.
+The first (prefill) argmax `6511` matches the 27B dense gate's first token;
+the divergent decode tail (`198 760 6511` vs the 27B's `271 248068 271`) is
+expected — a different model family, not a divergence signal (the gate is
+tp==tp1 within the 35B, not 35B==27B). Note: the decode runs are
+prefill+8 at `VT_MOE_HOST_FREE=0`; the wall is decode-host-decode dominated
+(~0.378 s/layer MoE decode × 40 × 9 forwards × 2 arms), not GPU-bound.
+
+**MoE reachability mutation (measured 2026-08-21, GPUs 2,3).** The tp>1
+expert-shard call site in `MoeBlock` (`qwen3_5.cpp`) was mutated in the
+canonical working tree, rebuilt, re-gated, and restored byte-for-byte (git
+verified the mutation line absent after restore):
+- **Value-corrupting variant goes RED**: `ob[0] += 1000.0f` after the
+  `vt_cuda_moe_shard_run_b` call (corrupting the reduced `expert_out[P,H]`
+  row 0 before the shared-expert + `MoeCombine` consume it) flips the tp>1
+  arm — `REQUIRE(t1 == tw)` fails
+  ({6511,314,9564,369,19241,13,198,760,6511} vs {6511,1305,1305,1305,1305,
+  1305,1305,1305,1305}), EXIT=1, 1 failed / 0 passed. The first (prefill)
+  argmax still matches; the corrupted pair-0 expert contribution diverges
+  decode from step 2 as the paged state accumulates — proving the shard
+  output is load-bearing (the gate measures the capability, not a class).
+- **Restore is GREEN**: rebuilt clean, gate re-ran to the known 9 tokens
+  (the bg_1 green on the byte-identical pre-mutation source).
+
 
 ### Qwen3.8-27B-NVFP4 gate
 

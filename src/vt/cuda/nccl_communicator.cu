@@ -970,6 +970,183 @@ extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void) {
   return bad.load();
 }
 
+// ---------------------------------------------------------------------------
+// MoE expert-MLP rank shard (the MoeBlock tp>1 feed). The weight-parallel
+// generalization of the batched dense shard: every rank holds the FULL expert
+// set (the kernel strides by the full I), rank r owns the intermediate slice
+// [i0, i0+per_i) of EVERY expert (gate/up column slice, down row slice), and
+// the group AllReduceSum over the [P,H] partial yields the full expert_out on
+// every rank. out[p*H+o] = sum_i silu(gate[e,i]^T x[p]) * (up[e,i]^T x[p]) *
+// down[e,o,i], where e = exp[p] selects the per-expert weight base. This is
+// the MoE twin of vt_cuda_mlp_shard_run_b, which is the single-expert
+// (exp[p]=0) case; the per-pair indexing is the only structural difference.
+// ---------------------------------------------------------------------------
+__global__ void MoeMlpRankPartialBatch(const float* x, const int32_t* exp,
+                                       int P, int H, const float* gate,
+                                       const float* up, const float* downfull,
+                                       float* out, int per_i, int i0, int I) {
+  const int o = blockIdx.x * blockDim.x + threadIdx.x;
+  if (o >= H) return;
+  const int p = blockIdx.y;
+  const float* xp = x + (size_t)p * H;
+  const int e = exp[p];
+  const float* gbase = gate + (size_t)e * I * H;
+  const float* ubase = up + (size_t)e * I * H;
+  const float* dbase = downfull + (size_t)e * H * I;
+  float acc = 0.f;
+  for (int q = 0; q < per_i; ++q) {
+    const int gi = i0 + q;
+    float g = 0.f, u = 0.f;
+    for (int k = 0; k < H; ++k) { g += xp[k] * gbase[(size_t)gi * H + k]; u += xp[k] * ubase[(size_t)gi * H + k]; }
+    const float sg = 1.f / (1.f + __expf(-g));
+    acc += (g * sg) * u * dbase[(size_t)o * I + gi];
+  }
+  out[(size_t)p * H + o] = acc;
+}
+
+// Batched MoE expert-MLP shard: the same unsharded math as
+// vt_cuda_mlp_shard_run_b but per-pair expert indexed. x = f32 [P,H] (the
+// per-pair activation row map is collapsed by the caller into a [P,H]
+// gather), exp = i32 [P] expert id, gate/up = f32 [E,I,H], down = f32 [E,H,I],
+// out = f32 [P,H].
+//
+// verify: 0 = compute-only (production path; the engine's token comparison
+// against the tp1 arm is the correctness check). 1 = full parity check
+// against a double-precision host reference for every (p,o) (selfcheck path
+// only; that reference is O(P*H*I*H) and must not run at 35B shape).
+extern "C" int vt_cuda_moe_shard_run_b(int P, int H, int I, int E, int verify,
+                                       const float* x, const int32_t* exp,
+                                       const float* gate, const float* up,
+                                       const float* down, float* out) {
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
+  if (P <= 0 || H <= 0 || I <= 0 || E <= 0) return 1;
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  if (I % W != 0) { delete g; return 1; }
+  const int64_t per = I / W;
+
+  // Optional double-precision host reference, parallelised over (p,o) rows.
+  std::vector<float> ref;
+  if (verify) {
+    ref.assign((size_t)P * H, 0.f);
+    const int ncpu = std::max(1, (int)std::thread::hardware_concurrency());
+    std::vector<std::thread> hts;
+    hts.reserve((size_t)ncpu);
+    for (int c = 0; c < ncpu; ++c)
+      hts.emplace_back([&](int c) {
+        for (size_t n = (size_t)c; n < (size_t)P * H; n += ncpu) {
+          const int p = (int)(n / H), o = (int)(n % H);
+          const int e = exp[p];
+          double a = 0.0;
+          for (int i = 0; i < I; ++i) {
+            double gv = 0.0, uv = 0.0;
+            for (int k = 0; k < H; ++k) {
+              gv += (double)x[(size_t)p * H + k] * gate[((size_t)e * I + i) * H + k];
+              uv += (double)x[(size_t)p * H + k] * up[((size_t)e * I + i) * H + k];
+            }
+            const float sg = 1.f / (1.f + std::exp(-(double)gv));
+            a += (double)((gv * sg) * uv) * down[((size_t)e * H + o) * I + i];
+          }
+          ref[n] = (float)a;
+        }
+      }, c);
+    for (auto& h : hts) h.join();
+  }
+
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      cudaStream_t st = nullptr;
+      float *dx=nullptr; int32_t *de=nullptr;
+      float *dg=nullptr,*du=nullptr,*dd=nullptr,*dout=nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, (size_t)P * H * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&de, (size_t)P * sizeof(int32_t)) != cudaSuccess ||
+          cudaMalloc(&dg, (size_t)(E * I * H) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&du, (size_t)(E * I * H) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dd, (size_t)(E * H * I) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dout, (size_t)P * H * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree((void*)de); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dout);
+        if (st) cudaStreamDestroy(st);
+        return;
+      }
+      // The rank reads the FULL expert set (strides by the full I) and reads
+      // its intermediate slice [ib, ib+per). H2D the whole set per layer —
+      // the kernel does the slicing, so the device buffers are full-width.
+      cudaMemcpyAsync(dx, x, (size_t)P * H * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(de, exp, (size_t)P * sizeof(int32_t), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dg, gate, (size_t)(E * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(du, up, (size_t)(E * I * H) * sizeof(float), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dd, down, (size_t)(E * H * I) * sizeof(float), cudaMemcpyHostToDevice, st);
+      dim3 grid((unsigned)((H + 31) / 32), (unsigned)P);
+      MoeMlpRankPartialBatch<<<grid, 32, 0, st>>>(
+          dx, de, P, H, dg, du, dd, dout, (int)per, (int)ib, (int)I);
+      Queue q; q.device = Device{DeviceType::kCUDA, r}; q.handle = st;
+      g->Rank(r)->AllReduce(q, dout, (size_t)P * H, DType::kF32, ReduceOp::kSum);
+      std::vector<float> back((size_t)P * H, 0.f);
+      cudaMemcpyAsync(back.data(), dout, (size_t)P * H * sizeof(float), cudaMemcpyDeviceToHost, st);
+      cudaStreamSynchronize(st);
+      if (r == 0)
+        std::memcpy(out, back.data(), (size_t)P * H * sizeof(float));
+      if (verify)
+        for (size_t n = 0; n < (size_t)P * H; ++n)
+          if (std::fabs(back[n] - ref[n]) > 5e-4f * std::max(1.0f, std::fabs(ref[n])))
+            bad.store(1, std::memory_order_relaxed);
+      cudaFree(dx); cudaFree((void*)de); cudaFree(dg); cudaFree(du); cudaFree(dd); cudaFree(dout);
+      cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
+  delete g;
+  return bad.load();
+}
+
+extern "C" int vt_cuda_moe_shard_selfcheck(void) {
+  // Model-free MoE expert-shard selfcheck: deterministic [P,H] x + [P] exp +
+  // random-ish expert weights at a representative MoE shape, verify=1 parity
+  // vs the double reference inside vt_cuda_moe_shard_run_b. Proves per-pair
+  // expert indexing + intermediate slicing + AllReduce without the
+  // production-size H2D. The run_b call creates + destroys its own group, so
+  // this wrapper only supplies the data. Returns 0 parity, 1 mismatch, 2 on
+  // fewer than 2 GPUs (or NCCL unbuilt; caller keeps its tp1 path).
+  constexpr int P = 32, H = 96, I = 128, E = 16;   // I % W == 0 for W in {2,4,8,16}
+  std::vector<float> x((size_t)P * H), gate((size_t)E * I * H), up((size_t)E * I * H), down((size_t)E * H * I);
+  std::vector<int32_t> exp(P);
+  // Deterministic index-based fill (no <random>): signed pseudo-random in
+  // [-1,1] so the silu/inner-product magnitudes span both signs.
+  for (size_t n = 0; n < x.size(); ++n) x[n] = 0.7f * ((int)(n % 13) - 6) / 6.f;
+  for (size_t n = 0; n < gate.size(); ++n) gate[n] = 0.1f * ((int)(n % 29) - 14) / 14.f;
+  for (size_t n = 0; n < up.size(); ++n) up[n] = 0.1f * ((int)(n % 31) - 15) / 15.f;
+  for (size_t n = 0; n < down.size(); ++n) down[n] = 0.05f * ((int)(n % 37) - 18) / 18.f;
+  for (int p = 0; p < P; ++p) exp[p] = (p * 7) % E;
+
+  std::vector<float> out((size_t)P * H, 0.f);
+  const int rc = vt_cuda_moe_shard_run_b(P, H, I, E, /*verify=*/1,
+                                         x.data(), exp.data(), gate.data(),
+                                         up.data(), down.data(), out.data());
+  if (rc != 0) {
+    for (size_t n = 0; n < (size_t)P * H; ++n)
+      if (std::isnan(out[n]) || std::isinf(out[n])) {
+        fprintf(stderr, "vt moe-shard: rank output non-finite at %zu\n", n);
+        return 1;
+      }
+  }
+  return rc;
+}
+
 // Assemble the engine-facing slice for a bf16-represented dense MLP and shard it:
 // split the [2I,H] merged gate+up (upper I rows = gate, lower I = up), the
 // [H( out),I] down, convert bf16 bit-exact to f32, run the shard. This is the
