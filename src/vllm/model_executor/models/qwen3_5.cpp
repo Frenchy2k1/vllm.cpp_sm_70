@@ -9172,7 +9172,11 @@ std::vector<float> Qwen3_5DenseModel::Forward(
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  (void)tp;  // threaded by step-2 per-rank sharding
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
+  (void)tp;
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
@@ -9712,7 +9716,11 @@ ForwardLogits Qwen3_5DenseModel::ForwardDevice(
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  (void)tp;  // threaded by step-2 per-rank sharding
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
+  (void)tp;
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
@@ -9728,7 +9736,11 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
     const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
     Qwen3_5MTPHiddenStates* hidden_out,
     const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  (void)tp;  // threaded by step-2 per-rank sharding
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
+  (void)tp;
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
@@ -9751,7 +9763,11 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceMultiTap(
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
     Qwen3_5AuxTaps* aux_out, const std::vector<int32_t>& logits_indices, const vllm::TensorParallel* tp) { (void)tp;
-  (void)tp;  // threaded by step-2 per-rank sharding
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");
+  (void)tp;
+  if (tp != nullptr && tp->tp_size() > 1)
+    throw std::runtime_error("qwen3_5 dense: tp>1 per-rank sharding not yet landed (tp-rollout step 2 in progress); refusing to silently run tp=1");  // threaded by step-2 per-rank sharding
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
