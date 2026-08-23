@@ -142,15 +142,15 @@ constexpr int kPFMaxQ = 64;
 template <int TD>
 __global__ void Sm70FaPrefillAttn(
     float* out, const __half* query, const __half* k_cache, const __half* v_cache,
-    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_lens,
-    const int32_t* q_start, int64_t num_reqs, int64_t hq, int64_t nkv, int64_t d,
+    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_start,
+    int64_t num_reqs, int64_t hq, int64_t nkv, int64_t d,
     int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
     int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale) {
   if (d != TD) return;
   const int64_t r = blockIdx.x;
   const int64_t h = blockIdx.y;
   if (r >= num_reqs || h >= hq) return;
-  const int qlen = (int)q_lens[r];
+  const int qlen = (int)(q_start[r + 1] - q_start[r]);
   const int seqlen = (int)seq_lens[r];
   if (qlen <= 0 || qlen > kPFMaxQ || seqlen <= 0 || h >= hq) return;
   const int ctxt = seqlen - qlen;
@@ -260,8 +260,8 @@ __global__ void Sm70FaPrefillAttn(
 
 extern "C" void vt_sm70_fa2_prefill(
     float* out, const void* query, const void* k, const void* v,
-    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_lens,
-    const int32_t* q_start, int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d,
+    const int32_t* block_table, const int32_t* seq_lens, const int32_t* q_start,
+    int64_t num_reqs, int64_t hq, int64_t num_kv, int64_t d,
     int64_t block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
     int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd, float scale,
     cudaStream_t stream) {
@@ -274,7 +274,7 @@ extern "C" void vt_sm70_fa2_prefill(
                      (16 * 16 + 16 * (TD) /*ss,acc*/ + 32) * 4;                        \
     Sm70FaPrefillAttn<(TD)><<<grid, kF2Threads, smem, stream>>>(                       \
         out, static_cast<const __half*>(query), static_cast<const __half*>(k),         \
-        static_cast<const __half*>(v), block_table, seq_lens, q_lens, q_start,         \
+        static_cast<const __half*>(v), block_table, seq_lens, q_start,               \
         num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,      \
         vc_blk, vc_pg, vc_hd, scale);                                                    \
   } while (0)
@@ -454,32 +454,29 @@ extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
     hk[i] = f2h(0.37f * (float)((i * 13 + 7) % 19) + 0.11f);
     hv[i] = f2h(-0.23f * (float)((i * 7 + 3) % 13) - 0.07f);
   }
-  std::vector<int32_t> hbt((size_t)num_reqs * maxblocks), hsl{56, 20}, hql{40, 12}, hqs{0, 40};
+  std::vector<int32_t> hbt((size_t)num_reqs * maxblocks), hsl{56, 20}, hqs{0, 40, 52};
   for (int64_t r = 0; r < num_reqs; ++r)
     for (int64_t b = 0; b < maxblocks; ++b) hbt[(size_t)r * maxblocks + b] = (int32_t)(r * maxblocks + b);
 
-  void* dq; void* dk; void* dv; void* dbt; void* dsl; void* dql; void* dqs; void* do_=nullptr;
+  void* dq; void* dk; void* dv; void* dbt; void* dsl; void* dqs; void* do_=nullptr;
   cudaMalloc(&dq, hq_.size() * sizeof(__half));
   cudaMalloc(&dk, kv * sizeof(__half));
   cudaMalloc(&dv, kv * sizeof(__half));
   cudaMalloc(&dbt, hbt.size() * sizeof(int32_t));
   cudaMalloc(&dsl, 2 * sizeof(int32_t));
-  cudaMalloc(&dql, 2 * sizeof(int32_t));
-  cudaMalloc(&dqs, 2 * sizeof(int32_t));
+  cudaMalloc(&dqs, 3 * sizeof(int32_t));
   if (cudaMalloc(&do_, qn * hq * d * sizeof(float)) != cudaSuccess) return 1;
   cudaMemcpy(dq, hq_.data(), hq_.size() * sizeof(__half), cudaMemcpyHostToDevice);
   cudaMemcpy(dk, hk.data(), kv * sizeof(__half), cudaMemcpyHostToDevice);
   cudaMemcpy(dv, hv.data(), kv * sizeof(__half), cudaMemcpyHostToDevice);
   cudaMemcpy(dbt, hbt.data(), hbt.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
   cudaMemcpy(dsl, hsl.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
-  cudaMemcpy(dql, hql.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
-  cudaMemcpy(dqs, hqs.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(dqs, hqs.data(), 3 * sizeof(int32_t), cudaMemcpyHostToDevice);
 
   cudaStream_t st = 0;
   vt_sm70_fa2_prefill(static_cast<float*>(do_), dq, dk, dv,
                       reinterpret_cast<const int32_t*>(dbt),
                       reinterpret_cast<const int32_t*>(dsl),
-                      reinterpret_cast<const int32_t*>(dql),
                       reinterpret_cast<const int32_t*>(dqs),
                       num_reqs, hq, nkv, d, bs, maxblocks, /*bt_col=*/1,
                       kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, 0.125f, st);
@@ -525,7 +522,7 @@ extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose) {
     }
   }
   if (verbose) fprintf(stdout, "  prefill self-check: %s\\n", bad ? "MISMATCH" : "parity OK");
-  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dbt); cudaFree(dsl); cudaFree(dql); cudaFree(dqs); cudaFree(do_);
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dbt); cudaFree(dsl); cudaFree(dqs); cudaFree(do_);
   return bad;
 }
 
