@@ -49,10 +49,21 @@ needs per-rank shard + per-boundary reduce.
    gate lands — do not claim tp>1 until it passes.
 
 ## Sequence
-1. Add `tp` params + null-default (regression-neutral, commits first).
+1. Add `tp` params + null-default (regression-neutral, commits first). DONE (`2779cf38`).
 2. Per-rank sharding in DenseForwardLayers (commit per layer-family, gate each).
 3. Head + runner attach.
 4. tp==tp1 token-equal gate.
+
+## Phase after Qwen3.5 lands (all Forwards threading)
+Once the Qwen3.5 dense (and MoE) TP is token-equal, thread the SAME `tp` through
+the other hand-rolled arch `::Forward` classes. This is MECHANICAL plumbing, not
+per-class reimplementation (the TpShard/TpAllReduceSum exact suiteet lives in
+`tensor_parallel.h` + the shared loaders):
+- ~58 `::Forward` implementation files carry `const vllm::TensorParallel* tp = nullptr`
+  (default) and pass it into their layer paths that already use the shared
+  GEMM/attention ops — the sharding math is already folded in by those ops.
+- Verify per arch: tp1 null-default stays byte-identical; tp==tp1 gate per arch
+  as it (opt-in) enables TP.
 
 ## Not in scope here
 - Multi-node (ncclCommInitAll is single-process/local); GQA KV-split deferral;
