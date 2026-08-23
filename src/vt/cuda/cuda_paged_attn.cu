@@ -2425,10 +2425,10 @@ extern "C" int vt_sm70_fa2_op_parity(float tol_rel, int verbose) {
   LaunchDecode<__half, __half, float>(st, out_f, squery, sk, sv, sbt, ssl, sqsl,
                                       args, nt, hq, d, nt, nkv, bs);
   err = cudaDeviceSynchronize();
-  setenv("VT_SM70_FA2_DECODE", "0", 1);
+setenv("VT_SM70_FA2_DECODE", "0", 1);
   LaunchDecode<__half, __half, float>(st, out_r, squery, sk, sv, sbt, ssl, sqsl,
                                       args, nt, hq, d, nt, nkv, bs);
-  cudaDeviceSynchronize();
+  err = cudaDeviceSynchronize();  // capture: a fallback fault must surface too
   if (err != cudaSuccess) { fprintf(stderr, "op-parity: launch: %s\n", cudaGetErrorString(err)); return 1; }
 
   std::vector<float> a((size_t)nt*hq*d), b((size_t)nt*hq*d);
