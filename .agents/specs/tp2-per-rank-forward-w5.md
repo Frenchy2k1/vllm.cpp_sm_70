@@ -111,6 +111,24 @@ the gate that drives per-rank queues. All probes (VT_TP_ALLOW,
 VT_ENGINE_STEP_LOG, the runner/dense markers above) were REVERTED after each
 measurement; production keeps the loud refusal until tp2==tp1 passes.
 
+**Resolved 2026-08-23:** the MLP-shard stall above is FIXED (08a2e5091): the
+O(I·H) host reference is now VT_TP_DIAG-gated; the nccl self-check keeps its
+own reference. Measured live: a tp2 request that previously hung there now
+passes the fp4 MLP shards and reaches the paged-attn `T != num_reqs`
+pure-decode-only refusal — the honest next seam.
+
+**The prefill seam is now an executable red (55c0fb613):** test_nccl_group's
+"paged KV shard: causal PREFILL" drives vt_cuda_attn_kv_shard_paged_run on one
+request, 6 tokens, per-token causal seq_lens (t+1), repeated block-table row,
+valid kv0. rc==0 (the primitive runs) but output does not match the full-KV
+tp1 softmax reference — the paged decode shard does NOT serve the multi-token
+(prefill) shape. Every other nccl test stays green, so this is the one real
+failure: the W1 forward must turn it green. Its mechanism (per-token
+block-table/seq causal indexing) is wired for pure decode; prefill needs
+per-request `query_start_loc` causal indexing. This test is the committed
+gate; tp2==tp1 serve tokens cannot exist until it passes, so no synthetic
+comparison.
+
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
 Served the real Qwen3.8-27B-NVFP4 (snapshot
