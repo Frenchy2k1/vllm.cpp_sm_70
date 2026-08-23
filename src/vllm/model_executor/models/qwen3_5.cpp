@@ -46,6 +46,9 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I, const float* x,
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I, const uint16_t* x16,
                                            const uint16_t* gu16, const uint16_t* dn16,
                                            float* out);
+extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int S, int Hkv, int D,
+                                          const float* q, const float* k,
+                                          const float* v, float* out);
 #endif  // VT_NCCL
 #include <cmath>
 #include <cstdint>
@@ -5195,7 +5198,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 // Qwen3NextAttention. h [T*H] bf16 -> [T*H] bf16.
 DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const std::vector<int32_t>& positions,
-                   int64_t T, const Tensor* h_fp8 = nullptr) {
+                   int64_t T, const Tensor* h_fp8 = nullptr,
+                   const vllm::TensorParallel* tp = nullptr) {
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
   const int64_t Dh = cfg.head_dim;
@@ -5293,6 +5297,36 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
+  // Multi-device (tp>1): KV-head-split attention (vt_cuda_attn_kv_shard_run —
+  // see nccl_communicator.cu). q is full on EVERY rank; each rank owns a slice
+  // of the Hkv kv-heads, and the num/den AllReduceSum yields the COMPLETE softmax
+  // output identically on every rank — so out [T,Hq,Dh] is full and the o_proj
+  // gate is the normal full GEMM below (no row/col sharding needed here). tp1
+  // (null) keeps the proven vt::Attention path byte-identical.
+  if (tp != nullptr && tp->tp_size() > 1) {
+#ifdef VT_NCCL
+    const int64_t qn = T * Hq * Dh, vn = T * Hkv * Dh;
+    const int64_t S = T;  // causal: kv positions == query positions (self-attn)
+    std::vector<float> qh((size_t)qn), kh((size_t)vn), vh((size_t)vn), oh((size_t)qn, 0.f);
+    d.b.Copy(d.q, qh.data(), qn3.data, qn * sizeof(float));
+    d.b.Copy(d.q, kh.data(), kn3.data, vn * sizeof(float));
+    d.b.Copy(d.q, vh.data(), v3.data, vn * sizeof(float));
+    d.b.Synchronize(d.q);
+    const int rc = vt_cuda_attn_kv_shard_run(
+        (int)T, (int)Hq, (int)S, (int)Hkv, (int)Dh, qh.data(), kh.data(), vh.data(), oh.data());
+    if (rc == 2)
+      throw std::runtime_error("qwen3_5 FullAttn: tp>1 requires >=2 GPUs (fault loudly)");
+    if (rc != 0)
+      throw std::runtime_error("qwen3_5 FullAttn: tp>1 KV-shard mismatched host reference");
+    DBuf attn_out(d, DType::kF32, {T, Hq, Dh});
+    d.b.Copy(d.q, attn_out.ptr(), oh.data(), qn * sizeof(float));
+    d.b.Synchronize(d.q);
+    return SigmoidGateOProjD(d, Reshape(attn_out.t(), {T, Hq * Dh}),
+                             Reshape(gatef.t(), {T, Hq * Dh}), w, fp4);  // [T,H]
+#else
+    throw std::runtime_error("qwen3_5 FullAttn: tp>1 requires an NCCL build (VLLM_CPP_NCCL)");
+#endif  // VT_NCCL
+  }
   // VT-ATTN-NAIVE: the REFERENCE (non-paged) dense arm, as the comment on the V
   // upcast above already says. Production decode runs `FullAttnBlockPaged`, which
   // replaces this call with vt::ReshapeAndCache + vt::PagedAttention; this arm is
@@ -7617,7 +7651,8 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
 // `res` (f32 [T,H]) the accumulator.
 void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
                    const HfConfig& cfg, DBuf& hidden, DBuf& res,
-                   const std::vector<int32_t>& positions, int64_t T) {
+                   const std::vector<int32_t>& positions, int64_t T,
+                   const vllm::TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7627,8 +7662,8 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
 
   DBuf attn = layer.is_linear_attention
                   ? GdnBlock(d, layer.gdn, cfg, dhn.t(), T)
-                  : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T);
-
+                  : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T,
+                                  nullptr, tp);
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
@@ -8804,8 +8839,6 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
     vt::Queue& queue, const vllm::TensorParallel* tp) { (void)tp;
-  if (tp != nullptr && tp->tp_size() > 1)
-    throw std::runtime_error("qwen3_5 dense: tp>1 sharded ForwardDense not yet wired (MLP shard primitive landed; attention/KV next)");
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -8831,7 +8864,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunDenseLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
-                  positions, T);
+                  positions, T, tp);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
