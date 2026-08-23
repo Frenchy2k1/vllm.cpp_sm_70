@@ -72,20 +72,30 @@ refusal (`runner.cpp:434`).
 With `VT_TP_ALLOW=1` (a scratch env-gated probe added to `attach_tp_group` +
 `FromModelDir`, default OFF, since REVERTED) a REAL `vllm-server --tp 2` on
 Qwen3.8-27B-NVFP4 (GPUs 1,2) BOOTS and LISTENS, stages 17 GiB on GPU1 and
-~0.5 GiB on GPU2, then the first generate never completes: curl times out with
-zero bytes, GPU 0% on BOTH ranks, no exception on the SYNC runner, no request
-log line, and `num_requests_running=0 / waiting=0` in `/metrics`. This is
-NOT the prefill throw (`qwen3_5.cpp` line ~5534, which a sync runner would
-propagate) and NOT a slow-but-running primitive: the request is accepted at
-the HTTP edge but NEVER reaches the scheduler/forward — `execute_model` is not
-observed to run. The guard's "a tp>1 step answers pure-decode only ... prefill
-throws" is real but INCOMPLETE: the observed block sits EARLIER, in the
-engine→runner handoff when a tp2 group is attached. The precise open seam is
-the per-lane forward dispatch from the runner for an attached tp>1 group,
-which this probe proves is NOT yet reached by any real request. This is the
-measured red; `VT_TP_ALLOW` stays a scratch scaffold (never a production
-knob); production defaults keep the loud refusal until the tp2==tp1 gate
-passes.
+~0.5 GiB on GPU2, then the first generate never completes. A live trace pins the block
+precisely (three progressive measurements, the last two correcting the
+earlier ones):
+
+1. `core-step begin unfinished=1` (VT_ENGINE_STEP_LOG heartbeat) — the request
+   IS admitted to the scheduler (num_requests_waiting=0/running=0 that read
+   earlier was a stale snapshot AFTER the client gave up).
+2. `runner execute_model tokens=5 reqs=0` (runner trace) — the scheduled
+   5-token PREFILL chunk REACHES `GPUModelRunner::execute_model`. The forward
+   is entered, not skipped.
+3. NO `core-step end`, NO fatal, NO exception, GPU 0% on all ranks, all other
+   threads parked on futex/pipe — the engine thread enters `execute_model`
+   once and NEVER returns.
+
+So the block is INSIDE the tp2 forward, and the request genuinely reaches it.
+This is exactly the refusal's "a tp>1 step would deadlock the collective"
+claim — and now the missing piece is specific: the runner drives lane 0's
+queue_ ONLY (`tp_queues_[0]`), so lane 1's per-rank forward never runs and the
+sharded collectives (TpAllReduceSum / TpPagedAttentionHost) have no second
+participant. The honest remaining work is the runner's PER-LANE FORWARD
+DISPATCH: drive `tp_queues_[r]`'s forward on every rank so each joins the
+group's collectives, which is the W5 body. `VT_TP_ALLOW` stays a scratch
+scaffold (never a production knob); production defaults keep the loud refusal
+until the tp2==tp1 token gate passes.
 
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
