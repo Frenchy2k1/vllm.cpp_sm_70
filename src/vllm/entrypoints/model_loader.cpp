@@ -1506,6 +1506,14 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
   const int64_t bytes_per_block = vllm::v1::KVBytesPerBlock(kv_cfg);
   const int64_t available =
       static_cast<int64_t>(kv_cfg.num_blocks) * bytes_per_block;
+  // 47272: the BlockPool pops one block as the null block and it can never be
+  // allocated (block_pool.cpp:53-57), so only num_blocks - 1 are usable. Plan
+  // the pinned check and the auto-fit against that usable memory, not the full
+  // pool; accepting a length that needs the last block would admit a request
+  // that can never allocate and wedge the engine. Allocation still uses the
+  // full memory (kv_cache_utils.py:892,2237).
+  const int64_t check_memory =
+      bytes_per_block > 0 ? available - bytes_per_block : available;
 
   if (params.max_model_len > 0) {
     // The caller pinned a length. Refuse if the pool cannot serve it — UNLESS
@@ -1518,8 +1526,8 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
       const int64_t needed = vllm::v1::kv_memory_needed_bytes(
           params.max_model_len, block_size, bytes_per_block);
       vllm::v1::check_enough_kv_cache_memory(
-          available, needed, params.max_model_len,
-          vllm::v1::estimate_max_model_len(available, bytes_per_block,
+          check_memory, needed, params.max_model_len,
+          vllm::v1::estimate_max_model_len(check_memory, bytes_per_block,
                                            block_size));
     }
     return params.max_model_len;
@@ -1533,7 +1541,7 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
     return static_cast<int>(derived);
   }
   const int64_t fitted = vllm::v1::auto_fit_max_model_len(
-      derived, available, bytes_per_block, block_size);
+      derived, check_memory, bytes_per_block, block_size);
   if (fitted < derived) {
     // kv_cache_utils.py:2021-2027 logs the reduction. Silence here would make a
     // shortened context look like a model-config surprise later.

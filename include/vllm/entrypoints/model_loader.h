@@ -401,6 +401,10 @@ class LoadedEngine {
   // check both rely on: a request of max_model_len tokens fits in KV. Without
   // it an over-long prompt is admitted, never allocates, and the engine spins
   // at model_executed=0 with an idle GPU (issue #83 M4; external PR #227).
+  // 47272: both halves plan against USABLE memory, not the full pool — the
+  // BlockPool holds back one block as the null block (block_pool.cpp:53-57),
+  // so a length that needs the last block would be admitted but can never
+  // allocate and would wedge the engine.
   // Exposed, like ResolveMaxNumBatchedTokens above, for testing the policy
   // without a disk load.
   static int ResolveMaxModelLen(const EngineParams& params,
