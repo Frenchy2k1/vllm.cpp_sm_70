@@ -175,6 +175,7 @@ SUITES=(
   test_tower_skip_rss_report
   test_ci_walk_base
   test_rc_stage_checkpoint
+  test_sglang_lease_identity
 )
 
 failed=()
