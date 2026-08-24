@@ -117,17 +117,28 @@ own reference. Measured live: a tp2 request that previously hung there now
 passes the fp4 MLP shards and reaches the paged-attn `T != num_reqs`
 pure-decode-only refusal — the honest next seam.
 
-**The prefill seam is now an executable red (55c0fb613):** test_nccl_group's
-"paged KV shard: causal PREFILL" drives vt_cuda_attn_kv_shard_paged_run on one
-request, 6 tokens, per-token causal seq_lens (t+1), repeated block-table row,
-valid kv0. rc==0 (the primitive runs) but output does not match the full-KV
-tp1 softmax reference — the paged decode shard does NOT serve the multi-token
-(prefill) shape. Every other nccl test stays green, so this is the one real
-failure: the W1 forward must turn it green. Its mechanism (per-token
-block-table/seq causal indexing) is wired for pure decode; prefill needs
-per-request `query_start_loc` causal indexing. This test is the committed
-gate; tp2==tp1 serve tokens cannot exist until it passes, so no synthetic
-comparison.
+**Prefill seam — status corrected 2026-08-24:** the "executable red" I first
+committed (55ccfb613) was a FALSE POSITIVE — a test bug, not a kernel
+deficiency. The test fed the paged shard an out-of-bounds kv buffer: size
+2*T*Hkv*D floats with V plane at T*Hkv*D, while the wrapper's host slice
+assembly (PagedKvShardStep, nccl_communicator.cu:1467-1476) reads V at
+kbase=T*2*Hkv*D + (t*2Hkv+h)*D over a buffer of 2*kbase = 2*T*2*Hkv*D floats
+(tp_shard_host.h:125-135, the real call site's kv_interp — the authoritative
+layout). The wrapper OOB-read and the all-garbage output were that artifact.
+**46127c7a0 corrects the test to the kernel contract verbatim** (kv(2*plane),
+V at vbase+(t*2Hkv+h)*D); it compiles clean. The corrected schedule is:
+if the corrected test PASSES (rc==0 and out==tp1 ref), the paged primitive
+ALREADY serves the multi-token prefill shape, and the real W5 gap is the
+runner-side guard (qwen3_5.cpp:5534 + tp_shard_host.h:111: `T != num_reqs` —
+a conservative refusal, not a structural limit, since the primitive and its
+write/attn kernels are per-token: seq_lens[t] causal window, block_table row
+per token t, and one write of ALL T tokens' KV). The deliverable is then
+relaxing both guards + the measured tp2==tp1 G5 gate — NOT a new kernel. If
+it still FAILS red in-bounds, a kernel defect is established and a real
+prefill kernel is owed. **Annotated timeline: the 2-GPU run is blocked** by a
+concurrent smoke-gates parity batch (test_op_parity qwen27/qwen36 paged logits
+tp==tp1) holding the shared `gpu.lock` mutex; it must finish before the
+decisive run (mutex rule; no bypass on the free pair).
 
 ## tp1 ground-truth baseline (measured 2026-08-22, committed binary)
 
