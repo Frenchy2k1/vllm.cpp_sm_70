@@ -72,6 +72,14 @@ per-rank forward dispatch (W4-pre remainder / W5) remain open and unfeigned.
 - [ ] **G5 forward equality** (W5): a TP2 forward of the 27B dense decoder over
       2 GPUs == tp1 token-exact on the same prompt (greedy). Covers dense +
       full-attn mating / KV — trust the existing SacredGate shape.
+      **Forward-MATH half measured 2026-08-24** (`test_op_parity -tc
+      'qwen27 dense logits tp==tp1 token gate'`, CUDA_VISIBLE_DEVICES=1,2):
+      the in-process `TpThunkComm` gate (single queue + single weight copy,
+      shard collectives self-NCCL world=2 in one process) PASSES —
+      **"2-GPU dense == tp1 (8 tokens identical)"**. This proves the per-layer
+      sharded traversal is token-exact at real 27B dims under a tp group, NOT
+      that a 2-rank serve works (residency is single-device). The G5 SERVE half
+      (per-rank execute_model dispatch) is still open.
       **tp1 baseline measured 2026-08-22** (committed binary, GPU1, real
       Qwen3.8-27B-NVFP4 snapshot 7d6f8d4d...): prompt `"The capital of France
       is"` → `" Paris.\nThe capital of Germany is Berlin.\nThe"` (10 tok,
