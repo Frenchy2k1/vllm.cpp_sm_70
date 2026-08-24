@@ -234,15 +234,16 @@ int rc=vt_cuda_attn_kv_shard_run(S,Hq,S,Hkv,D,q.data(),k.data(),v.data(),out.dat
 }
 
 // The W5 prefill question: does v3_cuda_attn_kv_shard_paged_run's per-token
-// causal window (seq_lens[t] + repeated block-table row) already serve the
-// MULTI-TOKEN prefill shape token-exact to full-KV tp1? Not, a real prefill
-// kernel is still owed. One request, T tokens, each attends to its causal
-// prefix; buffer is [2*T*Hkv*D] flattened: K plane first (K(t,h) at
-// (t*2Hkv+h)*D), then V plane at base = T*Hkv*D (V(t,h) at base+(t*2Hkv+h)*D).
+// causal window (seq_lens[t] + repeated block-table row) serve the MULTI-TOKEN
+// prefill shape token-exact to full-KV tp1, or is a real prefill kernel owed?
+// One request, T tokens, each attends its causal prefix. Buffer layout matches
+// the kernel's contract (PagedKvShardStep host slice assembly): K plane at
+// (t*2Hkv+h)*D, V plane at Vbase=T*2*Hkv*D + (t*2Hkv+h)*D, total 4*T*Hkv*D.
 TEST_CASE("paged KV shard: causal PREFILL (multi-token, single request) == tp1 ref") {
   constexpr int T=6,Hq=4,Hkv=4,D=16, block=4, bt_cols=2, num_blocks=2;
-  const size_t base=(size_t)T*Hkv*D, qz=(size_t)T*Hq*D;
-  std::vector<float> q(qz), kv(2*base);
+  const size_t plane=(size_t)T*2*Hkv*D, vbase=plane;  // V plane base == plane size
+  const size_t qz=(size_t)T*Hq*D;
+  std::vector<float> q(qz), kv(2*plane);  // K plane + V plane
   for (size_t i=0;i<qz;++i) q[i]=0.1f*((int)(i%13))-0.3f;
   for (size_t i=0;i<kv.size();++i) kv[i]=0.05f*((int)(i%9))-0.2f;
   // Per-token causal window = prefix length; seq_lens[t]=t+1. Contiguous slots.
@@ -277,7 +278,7 @@ TEST_CASE("paged KV shard: causal PREFILL (multi-token, single request) == tp1 r
     double dn=0.0; for(double z:sc) dn+=std::exp(z-maxv);
     for (int s=0;s<=t;++s) for(int kh=0;kh<Hkv;++kh){
       double e=std::exp(sc[(size_t)s*Hkv+kh]-maxv)/dn;
-      const float* vp=kv.data()+base+(size_t)(s*2*Hkv+kh)*D;
+      const float* vp=kv.data()+vbase+(size_t)(s*2*Hkv+kh)*D;
       for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*(double)vp[d]); }
   }
   for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
