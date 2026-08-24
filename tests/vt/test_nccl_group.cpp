@@ -264,21 +264,27 @@ TEST_CASE("paged KV shard: causal PREFILL (multi-token, single request) == tp1 r
   if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL missing); paged prefill skipped");return;}
   CHECK(rc==0);
   const float scale=1.0F/std::sqrt((float)D);
-  // Host tp1 reference: token t attends the causal prefix s in [0,t]; the
-  // softmax is over ALL (s, kh) score pairs (each with its own exp weight),
-  // and v weighted by that per-pair exp / den — mirroring the kernel's scatter.
+  // Host tp1 reference matching the PAGED kernel's semantics: this primitive
+  // is a HEAD-PARALLEL split (not the seq shard's slice-reduce). Each query
+  // head h is owned by the rank holding kv head g = h/(Hq/Hkv); that rank
+  // softmaxes over POSITIONS only, using the single kv head g. The max/num/den
+  // AllReduce just assembles each head's owning rank (others contribute the
+  // identity). So token t, query head h attends keys of kv-head g across its
+  // causal window [0,t] — NOT all Hkv heads.
+  constexpr int group = Hq / Hkv;  // GQA group size
   std::vector<float> ref(qz,0.f);
   for (int t=0;t<T;++t) for (int hq=0;hq<Hq;++hq){
+    const int g = hq / group;
     const float* qt=q.data()+(size_t)(t*Hq+hq)*D;
-    std::vector<double> sc((size_t)(t+1)*Hkv);
-    for (int s=0;s<=t;++s) for(int kh=0;kh<Hkv;++kh){
-      double a=0; const float* kp=kv.data()+(size_t)(s*2*Hkv+kh)*D;
-      for(int d=0;d<D;++d){ a+=(double)qt[d]*(double)kp[d]; } sc[(size_t)s*Hkv+kh]=a*scale;}
+    std::vector<double> sc((size_t)(t+1));
+    for (int s=0;s<=t;++s){
+      double a=0; const float* kp=kv.data()+(size_t)(s*2*Hkv+g)*D;
+      for(int d=0;d<D;++d){ a+=(double)qt[d]*(double)kp[d]; } sc[(size_t)s]=a*scale;}
     double maxv=-1e30; for(double z:sc) if(z>maxv)maxv=z;
     double dn=0.0; for(double z:sc) dn+=std::exp(z-maxv);
-    for (int s=0;s<=t;++s) for(int kh=0;kh<Hkv;++kh){
-      double e=std::exp(sc[(size_t)s*Hkv+kh]-maxv)/dn;
-      const float* vp=kv.data()+vbase+(size_t)(s*2*Hkv+kh)*D;
+    for (int s=0;s<=t;++s){
+      double e=std::exp(sc[(size_t)s]-maxv)/dn;
+      const float* vp=kv.data()+vbase+(size_t)(s*2*Hkv+g)*D;
       for(int d=0;d<D;++d) ref[(size_t)(t*Hq+hq)*D+d]+=(float)(e*(double)vp[d]); }
   }
   for (size_t i=0;i<ref.size();++i) CHECK(out[i]==doctest::Approx(ref[i]).epsilon(2e-3));
