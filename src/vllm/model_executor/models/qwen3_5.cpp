@@ -50,9 +50,6 @@ extern "C" int vt_cuda_mlp_shard_run_b(int T, int O, int H, int I, int verify,
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I, const uint16_t* x16,
                                            const uint16_t* gu16, const uint16_t* dn16,
                                            float* out);
-extern "C" int vt_cuda_attn_kv_shard_run(int T, int Hq, int S, int Hkv, int D,
-                                          const float* q, const float* k,
-                                          const float* v, float* out);
 extern "C" int vt_cuda_attn_gqa_shard_run(int T, int Hq, int Hkv, int S, int D,
                                           const int* key_end, const float* q,
                                           const float* k, const float* v,
@@ -5307,12 +5304,16 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
-  // Multi-device (tp>1): KV-head-split attention (vt_cuda_attn_kv_shard_run —
-  // see nccl_communicator.cu). q is full on EVERY rank; each rank owns a slice
-  // of the Hkv kv-heads, and the num/den AllReduceSum yields the COMPLETE softmax
-  // output identically on every rank — so out [T,Hq,Dh] is full and the o_proj
-  // gate is the normal full GEMM below (no row/col sharding needed here). tp1
-  // (null) keeps the proven vt::Attention path byte-identical.
+  // Multi-device (tp>1): GQA-EXACT KV-head-split attention
+  // (vt_cuda_attn_gqa_shard_run — see nccl_communicator.cu). Per query head hq
+  // the ONE owning kv head is g = hq/(Hq/Hkv); each rank owns a contiguous
+  // [hk0,hk0+per) kv-head slice and computes the full single-kv-head causal
+  // softmax (s <= t) for the heads it owns (0 elsewhere); the group
+  // AllReduceSum gathers the complete output with NO global num/den divide, so
+  // out [T,Hq,Dh] is the standard GQA attention (identical to the tp1
+  // vt::Attention math) on every rank and the o_proj gate stays the normal
+  // full GEMM below (no row/col sharding needed here). tp1 (null) keeps the
+  // proven vt::Attention path byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
 #ifdef VT_NCCL
     const int64_t qn = T * Hq * Dh, vn = T * Hkv * Dh;
@@ -5322,12 +5323,17 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     d.b.Copy(d.q, kh.data(), kn3.data, vn * sizeof(float));
     d.b.Copy(d.q, vh.data(), v3.data, vn * sizeof(float));
     d.b.Synchronize(d.q);
-    const int rc = vt_cuda_attn_kv_shard_run(
-        (int)T, (int)Hq, (int)S, (int)Hkv, (int)Dh, qh.data(), kh.data(), vh.data(), oh.data());
+    // Causal key count per query token: dense self-attention (S == T) so query
+    // t sees t+1 keys (the paged branch derives (S-T)+t+1; here S-T==0).
+    std::vector<int> key_end((size_t)T);
+    for (int64_t t = 0; t < T; ++t) key_end[(size_t)t] = (int)(t + 1);
+    const int rc = vt_cuda_attn_gqa_shard_run(
+        (int)T, (int)Hq, (int)Hkv, (int)S, (int)Dh, key_end.data(), qh.data(),
+        kh.data(), vh.data(), oh.data());
     if (rc == 2)
       throw std::runtime_error("qwen3_5 FullAttn: tp>1 requires >=2 GPUs (fault loudly)");
     if (rc != 0)
-      throw std::runtime_error("qwen3_5 FullAttn: tp>1 KV-shard mismatched host reference");
+      throw std::runtime_error("qwen3_5 FullAttn: tp>1 GQA KV-shard mismatched host reference");
     DBuf attn_out(d, DType::kF32, {T, Hq, Dh});
     d.b.Copy(d.q, attn_out.ptr(), oh.data(), qn * sizeof(float));
     d.b.Synchronize(d.q);

@@ -3,8 +3,8 @@
 
 Status: step 2 DONE + green (per-rank dense MLP shard, KV shard, lm_head shard,
 runner attach, 4-GPU dense tp==tp1 8-token gate reached). Step 3 "stretch"
-designed below (GQA-exact paged KV, MoE expert TP, Qwen3.8 loader/capture gate)
-and being implemented.
+DONE + green (GQA-exact paged KV, MoE expert TP, Qwen3.8 gate, and the dense
+tp>1 branch re-routed onto the GQA-exact primitive — see Outcome).
 Depends on (all shipped + green): per-device affinity, in-process NCCL
 collectives, `vt::CudaCommGroup` + `vllm::{TensorParallel,TpShard,TpAllReduceSum}`
 seam, loader-slice placement, runner-forward primitive, and the retained
@@ -349,11 +349,61 @@ Full no-regression sweep after the restore (GPUs 2,3): `test_sm70_fa2_decode`
 
 
 ## Owed
-- **Fix the dense tp>1 attention from gather to GQA-exact.** Real latent
-  correctness bug (see KNOWN DISCREPANCY). Cannot file a GitHub issue from this
-  box (no `gh`, no tokens) → recorded in `.agents/issue-index.md`; highest
-  existing issue is #1152.
-- Merge `origin/main` (63 ahead / 61 behind, 3 conflicts) + repair the branch's
-  record debt (11 empty-body `docs:` commits, 4 oldest sm70 commits missing
-  trailers, 8 doc-checkpoints) before landing — deferred to landing time; the
-  branch is local-only (never pushed), so the history rewrite is safe.
+- **File the GitHub issue for `dedbe1f05`** (in-flow build fix: `[[maybe_unused]]`
+  on `S`/`H` in qwen3_5.cpp so the tp>1 fallback compiles without NCCL). Cannot
+  file from this box (no `gh`, no token); the operator files it at merge time.
+- **File the GitHub issue for this change** (dense tp>1 gather→GQA-exact, the
+  fix that resolves the KNOWN DISCREPANCY and closes this row's Owed item).
+  Same constraint; the operator files it at merge time.
+
+## Outcome
+
+**Dense tp>1 gather→GQA-exact (2026-08-24).** Resolves the KNOWN DISCREPANCY
+above. The dense tp>1 branch (`FullAttnBlock`) now calls
+`vt_cuda_attn_gqa_shard_run` — the same GQA-exact primitive the paged path has
+used since step 3 — instead of the all-kv-heads gather. The gather kernel
+(`AttnKvShardPartial`/`AttnKvHostRef`/`vt_cuda_attn_kv_shard_run` in
+nccl_communicator.cu), the qwen3_5.cpp extern, and the gather selfcheck test
+that encoded the gather math are deleted — no parallel path is kept. The dense
+tp==tp1 token gate is now equality to the tp1 `vt::Attention` math by
+construction (identical GQA decomposition), not argmax robustness. Verified on
+2×V100 (GPUs 2,3, world=2, 2026-08-24): dense 8 tokens identical (~2 min);
+paged 27B 9 tokens `6511 314 9564 369 19241 13 271 248068 271` (38m15s);
+35B A3B 9 tokens `6511 314 9564 369 19241 13 198 760 6511` (35m2s);
+`test_nccl_group` 18/18 (1976 asserts; the removed gather case accounts for
+the −1 case/−193 asserts vs the pre-fix 19/2169); `test_sm70_fa2_decode` 5/5;
+`test_cuda_backend` 7/7.
+
+**Dense-gate generation speed (instrumented, same 2×V100, GPUs 2,3,
+clean-tree run after the mutation proof):**
+
+| arm | prefill (9 tok) | 7 decode forwards |
+|---|---|---|
+| tp1 | 4.80 s — **1.87 tok/s** | 10.63 s — **0.66 tok/s** |
+| tp=2 | 10.06 s — 0.89 tok/s | 69.86 s — 0.10 tok/s |
+
+The tp=2 decode arm is ~6.5× SLOWER than tp1: the dense shard does an
+AllReduceSum per attention layer per forward (16 full-attn layers) and the
+collective runs over the box's PCIe interconnect. This is a recorded
+throughput axis, not a ceiling: the next traceable hypothesis is the
+per-layer allreduce count and its PCIe bandwidth share, to be opened as an
+issue when the perf work is claimed. Correctness is unaffected — both arms
+produce identical tokens.
+
+**Mutation proof (2026-08-24).** Bound mutation on the dense causal key
+count, `key_end[t] = t+1 → t` (drops the final key at the last position the
+gate reads): dense tp==tp1 gate **FAILED** (0 passed / 1 failed, exit 1),
+restored byte-for-byte (sha256 `bfbc5265…`) and rebuilt green. Caveat found
+while choosing the mutation: a full non-causal bound (`key_end[t] = S`) does
+NOT flip the gate, because the gate only compares the last position's logits,
+where `t+1 == S`. The token gate therefore detects perturbations that change
+the final-token attention output; it cannot detect a shift that leaves that
+position's math unchanged.
+
+**Record debt + rebase (2026-08-23).** The 69-commit branch was rebased onto
+new main `1a1d17e53` as 59 commits (12 pure record-churn commits dropped,
+commit messages rewritten). `check-commit-trailers.py` and
+`check-commit-style.py` pass over the full `1a1d17e53..HEAD` range, closing the
+empty-body/trailer debt. The branch lives on the fork
+`Frenchy2k1/vllm.cpp_sm_70` at `dedbe1f05`; the pre-rebase tip is preserved at
+`backup/tp-3-stretch-pre-rebase-2026-08-23` = `87d593c34`.

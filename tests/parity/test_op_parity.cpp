@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2420,7 +2421,7 @@ TEST_CASE("qwen27 dense logits diagnostic (dgx-only, CUDA)") {
 // group covers all local GPUs; we run the real 27B dense ForwardDense greedy
 // twice — tp1 (null) and a tp thunk with world_size>1 (the shard primitives
 // create their OWN group internally, so the passed `tp` only enables the >1
-// branch; the collectives happen inside vt_cuda_attn_kv_shard_run /
+// branch; the collectives happen inside vt_cuda_attn_gqa_shard_run /
 // vt_cuda_mlp_shard_run) — and require DEVICE-identical greedy tokens.
 struct TpThunkComm : vt::Communicator {
   int w_ = 0;
@@ -2467,27 +2468,59 @@ TEST_CASE("qwen27 dense logits tp==tp1 token gate (dgx-only, CUDA, multi-GPU)") 
 
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   Queue q = b.CreateQueue();
+  auto now_s = [](double& out) {
+    out = std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
   const auto run_greedy = [&](const vllm::TensorParallel* tp) {
     std::vector<int32_t> ids = base, ps = pos;
+    double p0 = 0;
+    now_s(p0);
     std::vector<float> lg = vllm::Qwen3_5DenseModel::ForwardDense(ids, ps, weights, cfg, q, tp);
+    b.Synchronize(q);
+    double p1 = 0;
+    now_s(p1);
+    const double prefill_s = p1 - p0;
     std::vector<int32_t> gen;
     constexpr int kSteps = 8;
+    std::vector<double> dec_s(kSteps, 0.0);
     for (int s = 0; s < kSteps; ++s) {
       const int32_t nxt = ArgmaxRow(&lg[static_cast<size_t>(ids.size() - 1) * vocab], vocab);
       gen.push_back(nxt);
       ids.push_back(nxt); ps.push_back(static_cast<int32_t>(ps.size()));
-      if (s + 1 < kSteps) lg = vllm::Qwen3_5DenseModel::ForwardDense(ids, ps, weights, cfg, q, tp);
+      if (s + 1 < kSteps) {
+        double d0 = 0;
+        now_s(d0);
+        lg = vllm::Qwen3_5DenseModel::ForwardDense(ids, ps, weights, cfg, q, tp);
+        b.Synchronize(q);
+        double d1 = 0;
+        now_s(d1);
+        dec_s[s + 1] = d1 - d0;
+      }
     }
-    return gen;
+    return std::make_tuple(gen, prefill_s, dec_s);
   };
-  const std::vector<int32_t> t1 = run_greedy(nullptr);
+  auto [t1, pre_s, dec1] = run_greedy(nullptr);
   TpThunkComm th; th.w_ = ngpu;
   vllm::TensorParallel tpGroup{&th};
-  const std::vector<int32_t> tw = run_greedy(&tpGroup);
+  auto [tw, pre_t, dect] = run_greedy(&tpGroup);
   b.DestroyQueue(q);
   REQUIRE(t1 == tw);
+  const auto sum = [](const std::vector<double>& v) { double a = 0; for (double x : v) a += x; return a; };
+  // 8 tokens generated = 1 from the prefill forward + 7 from the decode
+  // forwards (the last forward's logits yield token 8; only 7 decode forwards
+  // execute). prefill_s covers the prefill forward; sum(dec) the 7 decodes.
+  const double n_dec = 7.0;
   MESSAGE("tp==tp1 token gate: " << ngpu << "-GPU dense == tp1 (" << t1.size()
           << " tokens identical)");
+  MESSAGE("dense gen speed tp1 : prefill " << static_cast<int>(base.size()) << " tok in "
+          << pre_s << " s (" << static_cast<double>(base.size()) / pre_s << " tok/s), "
+          << " " << n_dec << " decodes in " << sum(dec1) << " s (" << n_dec / sum(dec1)
+          << " tok/s)");
+  MESSAGE("dense gen speed tp=" << ngpu << ": prefill " << static_cast<int>(base.size()) << " tok in "
+          << pre_t << " s (" << static_cast<double>(base.size()) / pre_t << " tok/s), "
+          << " " << n_dec << " decodes in " << sum(dect) << " s (" << n_dec / sum(dect)
+          << " tok/s)");
 }
 // PAGED qwen3.6-27B tp==tp1 token gate. Drives Qwen3_5DenseModel::Forward (the
 // paged hybrid path: 16 full-attn + 48 GDN layers over device paged KV + GDN
