@@ -5531,11 +5531,55 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // the proven tp1 path below is byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
 #ifdef VT_NCCL
-    if (meta.num_actual_tokens != meta.num_reqs || T != meta.num_reqs)
+    // The paged primitive is PER-TOKEN: token t's causal window is seq_lens[t]
+    // (positions [0, t) within its request) and its KV is cowhosed by the
+    // request's block-table row, `block_table[t*cols + j/block]`. The runner's
+    // CommonAttentionMetadata is PER-REQUEST: R seq_lens (each = that request's
+    // full causal window) and R block-table rows. They coincide only for a pure
+    // decode (T == num_reqs, one query per request). For a PREFILL
+    // (multi-token-per-request, T > num_reqs) we expand per-request -> per-token:
+    //   seq_lens[tok]     = causal window of tok = (offset within request) + 1
+    //   block_table[tok]  = the request's block-table row, repeated for each token
+    // using meta.query_start_loc[r] to find each token's request. The unit test
+    // ("paged KV shard: causal PREFILL") proves this expansion serves the shape
+    // token-exact vs the tp1 reference. A mixed/divide-prefill step (a request
+    // split across steps, or prefill+decode in one step) still needs
+    // query_start_loc-indexed causal windows per request chunk and faults loudly;
+    // no service path emits it, so it stays a loud refusal rather than wrong math.
+    const bool pure_decode = (meta.num_actual_tokens == meta.num_reqs &&
+                              T == meta.num_reqs);
+    const bool pure_prefill = (!pure_decode && meta.query_start_loc.size() > 0 &&
+                               static_cast<int64_t>(meta.query_start_loc.size()) ==
+                                   meta.num_reqs + 1 &&
+                               meta.query_start_loc[0] == 0 &&
+                               meta.query_start_loc[(size_t)meta.num_reqs] == T &&
+                               static_cast<int64_t>(meta.seq_lens.size()) == meta.num_reqs);
+    if (!pure_decode && !pure_prefill)
       throw std::runtime_error(
-          "qwen3_5 paged full-attn: tp>1 per-rank paged-KV decode is landed for "
-          "pure-decode steps only (T == num_reqs); prefill+mixed with tp is a "
-          "pending wave — refusing to run tp1 math");
+          "qwen3_5 paged full-attn: tp>1 per-token paged KV serves pure-decode "
+          "(T == num_reqs) and pure-prefill (one request per prefill, tokens "
+          "contiguous from 0) only; a mixed/divide prefill with tp is a pending "
+          "wave — refusing to run tp1 math");
+    // Build the per-token arrays the primitive indexes. For pure decode they
+    // equal the runner's per-request arrays exactly (T == num_reqs, each token
+    // its own request, seq_lens per request). For pure prefill, expand.
+    std::vector<int32_t> per_tok_seq_lens(meta.seq_lens.begin(), meta.seq_lens.end());
+    std::vector<int32_t> per_tok_block(meta.block_table_tensor.begin(),
+                                       meta.block_table_tensor.end());
+    if (pure_prefill) {
+      per_tok_seq_lens.assign((size_t)T, 0);
+      per_tok_block.assign((size_t)T * meta.block_table_num_cols, 0);
+      for (int t = 0; t < T; ++t) {
+        // request containing token t
+        int r = 0;
+        while (r + 1 < meta.num_reqs && meta.query_start_loc[(size_t)(r + 1)] <= t) ++r;
+        per_tok_seq_lens[(size_t)t] =
+            (int32_t)((t - meta.query_start_loc[(size_t)r]) + 1);  // causal window
+        for (int c = 0; c < meta.block_table_num_cols; ++c)
+          per_tok_block[(size_t)t * meta.block_table_num_cols + (size_t)c] =
+              meta.block_table_tensor[(size_t)r * meta.block_table_num_cols + (size_t)c];
+      }
+    }
     const int64_t qn = T * Hq * Dh, vn = T * Hkv * Dh;
     std::vector<float> qh((size_t)qn), kh((size_t)vn), vh((size_t)vn),
         ohh((size_t)qn, 0.f);
@@ -5583,7 +5627,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
         (int)meta.block_table_num_cols, (int)kv.num_blocks,
         kv.dtype == DType::kBF16 ? 0 : 1,
         qh.data(), kv_interp.data(), meta.slot_mapping.data(),
-        meta.block_table_tensor.data(), meta.seq_lens.data(), kv.data, ohh.data());
+        per_tok_block.data(), per_tok_seq_lens.data(), kv.data, ohh.data());
     if (rc == 2)
       throw std::runtime_error("qwen3_5 paged full-attn: tp>1 requires >=2 GPUs");
     if (rc != 0)
