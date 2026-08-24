@@ -28,6 +28,7 @@ extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void);
 extern "C" int vt_cuda_bridge_rank_lanes_selfcheck(void);
 extern "C" int vt_cuda_mlp_shard_run(int O,int H,int I,const float* x,const float* gate,const float* up,const float* down,float* out);
 extern "C" int vt_cuda_attn_kv_shard_paged_run(int T,int Hq,int Hkv,int D,int block,int bt_cols,int num_blocks,int kv_dtype,const float* q,const float* kv_new,const int64_t* slot_mapping,const int32_t* block_table,const int32_t* seq_lens,void* kv0,float* out);
+extern "C" int vt_cuda_residency_selfcheck(void);
 extern "C" void* vt_cuda_tp_acquire(int tp_size);
 extern "C" void vt_cuda_tp_release(void* handle);
 
@@ -44,6 +45,15 @@ TEST_CASE("W2 TP seam over the NCCL group (TpShard/TensorParallel row-reduce per
   const int rc = vt_cuda_tp_seam_selfcheck();
   if (rc == 2) {
     MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); TP seam skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+TEST_CASE("M-B1b: one shared weight resident on BOTH GPUs (per-device caches)") {
+  const int rc = vt_cuda_residency_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 CUDA devices (or NCCL unbuilt); residency skipped");
     return;
   }
   CHECK(rc == 0);

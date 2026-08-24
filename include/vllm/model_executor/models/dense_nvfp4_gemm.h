@@ -291,7 +291,17 @@ struct Nvfp4Dev {
   Tensor scale;
 };
 
+// Forward-declared so the index>0 guard in ResidentNvfp4 (below) can call it;
+// the definition follows ResidentNvfp4.
+inline Nvfp4Dev ResidentNvfp4Pd(Dev d, const Nvfp4Weight& w, int dev_idx);
+
 inline Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
+  // Distributed tp>1 serve (M-B1b): lane device index>0 uploads into ITS device's
+  // cache (`d_packed_pd`/`d_scale_pd`); device 0 keeps the two single-slot upload
+  // blocks below byte-identical (the exact text the fp4-residency audit
+  // mutation-checks).
+  if (d.q.device.index > 0)
+    return ResidentNvfp4Pd(d, w, static_cast<int>(d.q.device.index));
   if (!w.d_packed) {
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
@@ -324,6 +334,33 @@ inline Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
   // Scale grid is [N, K/group_size]: K/16 for NVFP4, K/32 for MXFP4.
   r.scale = MakeTensor(w.d_scale.get(), DType::kI8, d.q.device, {w.n, w.k / w.group_size});
+  return r;
+}
+
+// Per-device lane variant of ResidentNvfp4 (M-B1b): uploads packed + scale into
+// the lane device's own cache slots (`d_packed_pd`/`d_scale_pd`).
+inline Nvfp4Dev ResidentNvfp4Pd(Dev d, const Nvfp4Weight& w, int dev_idx) {
+  std::shared_ptr<void>& packed_slot = w.d_packed_pd[dev_idx];
+  if (!packed_slot) {
+    const size_t pb = w.packed.bytes.size();
+    void* p = d.b.Alloc(pb);
+    vllm::load_stats::AddDeviceUpload(pb);
+    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
+    Backend* bk = &d.b;
+    packed_slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  std::shared_ptr<void>& scale_slot = w.d_scale_pd[dev_idx];
+  if (!scale_slot) {
+    const size_t sb = w.scale.bytes.size();
+    void* p = d.b.Alloc(sb);
+    vllm::load_stats::AddDeviceUpload(sb);
+    d.b.Copy(d.q, p, w.scale.bytes.data(), sb);
+    Backend* bk = &d.b;
+    scale_slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  Nvfp4Dev r;
+  r.packed = MakeTensor(packed_slot.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
+  r.scale = MakeTensor(scale_slot.get(), DType::kI8, d.q.device, {w.n, w.k / w.group_size});
   return r;
 }
 

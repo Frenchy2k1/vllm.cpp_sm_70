@@ -175,8 +175,19 @@ inline std::vector<float> WeightF32(const OwnedTensor& w) {
 
 // Device-resident raw-dtype view over an owned weight, uploaded ONCE (lazily) and
 // reused across every forward step (mirrors qwen3_5.cpp ResidentWeight).
+// M-B1b Pd twins (defined below) are forward-declared so the index>0 guards in
+// ResidentWeight/ResidentWeightF32 can call them without an
+// undeclared-identifier error at definition time.
+inline Tensor ResidentWeightPd(Dev d, const OwnedTensor& w, int dev_idx,
+                               std::vector<int64_t> shape);
+inline Tensor ResidentWeightF32Pd(Dev d, const OwnedTensor& w, int dev_idx,
+                                  const std::vector<int64_t>& shape);
 inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
+  // Distributed tp>1 serve (M-B1b): lane device index>0 uploads into ITS device's
+  // cache (`OwnedTensor::d_dev_pd`); device 0 keeps the single slot below.
+  if (d.q.device.index > 0)
+    return ResidentWeightPd(d, w, static_cast<int>(d.q.device.index), std::move(shape));
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY.
   // This read `!is_cuda()`, which is true for kMETAL, kVULKAN and kXPU as well
   // as kCPU — so any DEVICE backend other than CUDA aliased the host weight
@@ -206,9 +217,31 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
 
+// Per-device lane variant of ResidentWeight (M-B1b): uploads into the lane
+// device's own cache slot (`d_dev_pd[dev_idx]`). `inline` so the header's single
+// definition is shared across the model TUs that inherit ResidentWeight.
+inline Tensor ResidentWeightPd(Dev d, const OwnedTensor& w, int dev_idx,
+                               std::vector<int64_t> shape) {
+  if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
+  std::shared_ptr<void>& slot = w.d_dev_pd[dev_idx];
+  if (!slot) {
+    const size_t nb = w.bytes.size();
+    void* p = d.b.Alloc(nb);
+    vllm::load_stats::AddDeviceUpload(nb);
+    d.b.Copy(d.q, p, w.bytes.data(), nb);
+    Backend* bk = &d.b;
+    slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(slot.get(), w.dtype, d.q.device, shape);
+}
+
 // Device-resident f32 upcast of a bf16 owned weight (per-head q/k norm weights,
 // consumed by the f32 RMSNorm), uploaded ONCE.
 inline Tensor ResidentWeightF32(Dev d, const OwnedTensor& w, const std::vector<int64_t>& shape) {
+  // Distributed tp>1 serve (M-B1b): lane device index>0 uploads into ITS device's
+  // cache (`d_dev_f32_pd`); device 0 keeps the single slot below.
+  if (d.q.device.index > 0)
+    return ResidentWeightF32Pd(d, w, static_cast<int>(d.q.device.index), shape);
   if (!w.d_dev_f32) {
     std::vector<float> f = WeightF32(w);
     // Same defect, same fix as ResidentWeight above: `!is_cuda()` aliased a
@@ -225,6 +258,22 @@ inline Tensor ResidentWeightF32(Dev d, const OwnedTensor& w, const std::vector<i
     }
   }
   return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
+}
+
+// Per-device lane variant of ResidentWeightF32 (M-B1b): uploads the bf16->f32
+// upcast into `d_dev_f32_pd[dev_idx]` on the lane GPU (always CUDA).
+inline Tensor ResidentWeightF32Pd(Dev d, const OwnedTensor& w, int dev_idx,
+                                  const std::vector<int64_t>& shape) {
+  std::shared_ptr<void>& slot = w.d_dev_f32_pd[dev_idx];
+  if (!slot) {
+    std::vector<float> f = WeightF32(w);
+    const size_t nb = f.size() * sizeof(float);
+    void* p = d.b.Alloc(nb);
+    d.b.Copy(d.q, p, f.data(), nb);
+    Backend* bk = &d.b;
+    slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(slot.get(), DType::kF32, d.q.device, shape);
 }
 
 // The two dim-1 unbind slices of the flash KV cache (num_blocks, 2, block_size,

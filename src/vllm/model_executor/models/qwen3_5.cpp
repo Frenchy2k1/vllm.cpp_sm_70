@@ -27,6 +27,10 @@
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor residency seam
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime.h>  // vt_cuda_residency_selfcheck per-device queues (M-B1b)
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1141,8 +1145,24 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // model's lifetime. On CPU the bytes are already host-resident, so a direct view
 // avoids the copy. The weight is a read-only matmul-B / norm / embed operand, so
 // the const_cast is safe. `shape` defaults to the owned shape.
+// M-B1b Pd twins (defined below) are forward-declared here: the guards in
+// ResidentWeight/ResidentWeightF32/ResidentNvfp4 (device index > 0) call them,
+// and a definition-after-caller would be an undeclared-identifier error.
+Tensor ResidentWeightPd(Dev d, const OwnedTensor& w, int dev_idx,
+                        std::vector<int64_t> shape);
+Tensor ResidentWeightF32Pd(Dev d, const OwnedTensor& w, int dev_idx,
+                           const std::vector<int64_t>& shape);
+
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
+  // Distributed tp>1 serve (BACKEND-DISTRIBUTED-TP, M-B1b): a lane on DEVICE
+  // INDEX > 0 uploads THIS weight into ITS device's cache (`OwnedTensor::d_dev_pd`)
+  // so ONE weight is resident on several GPUs at once. Device 0 keeps the single
+  // `d_dev` slot below unchanged — tp1 and the single-GPU serve stay byte-identical.
+  // Lane devices are always CUDA (the NCCL multi-GPU transport), never the CPU
+  // alias branch.
+  if (d.q.device.index > 0)
+    return ResidentWeightPd(d, w, static_cast<int>(d.q.device.index), std::move(shape));
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY (issue
   // #125). This read `!needs_weight_staging()`, which is true ONLY on CUDA
   // (platforms/cuda.cpp; the base default is false and neither Vulkan, Metal nor
@@ -1225,12 +1245,47 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
 
-// Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
+// Per-device lane variant of `ResidentWeight` (BACKEND-DISTRIBUTED-TP, M-B1b):
+// uploads `w.bytes` into the lane device's own cache slot `d_dev_pd[dev_idx]`
+// (created lazily) and wraps THAT allocation in the tensor, so the lane runs
+// over its own GPU's resident copy of the shared weight instead of reusing the
+// device-0 slot. Same ENG-LOAD-DIRECT-UPLOAD accounting and the same
+// expert-streamed / elem-repack tripwires as the device-0 body. No adoption:
+// a lane device is a discrete CUDA GPU (never host-addressable), and adoption
+// keys on the single `d_dev`. Keeping the two limbs separate (rather than a
+// shared slot provider) preserves the device-0 body's byte-identical shape, which
+// the fp4-residency audit and every single-device test rely on.
+Tensor ResidentWeightPd(Dev d, const OwnedTensor& w, int dev_idx,
+                        std::vector<int64_t> shape) {
+  if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
+  VT_CHECK(!w.elem_kn_repacked,
+           "qwen3_5: an elem_kn_repacked ([K,N]) weight reached lane staging; "
+           "VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
+  VT_CHECK(!w.expert_streamed,
+           "qwen3_5: a STREAMED expert tower reached lane staging; "
+           "the expert-stream lane serves its slices from host slot storage and "
+           "the whole tower must never be uploaded (ENG-EXPERT-STREAM-DEVICE W0c, "
+           "issues #1123 and #1124)");
+  std::shared_ptr<void>& slot = w.d_dev_pd[dev_idx];
+  if (!slot) {
+    const size_t nbp = w.bytes.size();
+    void* p = d.b.Alloc(nbp);
+    vllm::load_stats::AddDeviceUpload(nbp);
+    d.b.Copy(d.q, p, w.bytes.data(), nbp);
+    Backend* bk = &d.b;
+    slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(slot.get(), w.dtype, d.q.device, shape);
+}
 // CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
 // activation dtype (GDN conv1d / gated-norm, attention qk-norm). `shape` is the
 // logical view (e.g. {conv_dim, Kw}).
 Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
+  // Distributed tp>1 serve (M-B1b): lane device>0 uploads the f32 upcast into
+  // ITS device's cache (`d_dev_f32_pd`); device 0 keeps the single slot below.
+  if (d.q.device.index > 0)
+    return ResidentWeightF32Pd(d, w, static_cast<int>(d.q.device.index), shape);
   if (!w.d_dev_f32) {
     std::vector<float> f = WeightF32(w);
     // Same defect and same fix as ResidentWeight above (issue #125): this handed
@@ -1249,6 +1304,23 @@ Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
     }
   }
   return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
+}
+
+// Per-device lane variant of `ResidentWeightF32` (M-B1b): uploads the bf16->f32
+// upcast into `d_dev_f32_pd[dev_idx]` on the lane GPU. Lane devices are CUDA, so
+// the host vector is never aliased (the CPU branch of the device-0 body).
+Tensor ResidentWeightF32Pd(Dev d, const OwnedTensor& w, int dev_idx,
+                           const std::vector<int64_t>& shape) {
+  std::shared_ptr<void>& slot = w.d_dev_f32_pd[dev_idx];
+  if (!slot) {
+    std::vector<float> f = WeightF32(w);
+    const size_t nb = f.size() * sizeof(float);
+    void* p = d.b.Alloc(nb);
+    d.b.Copy(d.q, p, f.data(), nb);
+    Backend* bk = &d.b;
+    slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(slot.get(), DType::kF32, d.q.device, shape);
 }
 
 // y[M,N] f32 = x[M,K] bf16 @ w[K,N] (w owns [K,N] bf16). f32 output keeps the
@@ -1295,11 +1367,23 @@ struct Nvfp4Dev {
   Tensor scale;
 };
 
+// Forward-declared so the index>0 guard in ResidentNvfp4 (below) can call it;
+// the definition follows ResidentNvfp4.
+Nvfp4Dev ResidentNvfp4Pd(Dev d, const Nvfp4Weight& w, int dev_idx);
+
 // Upload packed + scale to the device ONCE (lazily, on first use) and keep them
 // resident: the shared_ptr in the (const) weight owns the device buffer across
 // every forward step, so subsequent calls reuse the resident copy — no per-op
 // weight staging. CUDA path only; the deleter frees through the vt Backend.
 Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
+  // Distributed tp>1 serve (M-B1b): a lane on DEVICE INDEX > 0 uploads packed +
+  // scale into ITS device's cache slots (`d_packed_pd`/`d_scale_pd`) so ONE
+  // weight is resident on several GPUs at once. Device 0 keeps the two
+  // single-slot upload blocks below byte-identical (they are the exact text the
+  // fp4-residency audit, tests/scripts/test_check_fp4_resident_consistency.py,
+  // mutation-checks).
+  if (d.q.device.index > 0)
+    return ResidentNvfp4Pd(d, w, static_cast<int>(d.q.device.index));
   if (!w.d_packed) {
     const size_t pb = w.packed.bytes.size();
     void* p = d.b.Alloc(pb);
@@ -1331,6 +1415,90 @@ Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
   r.scale = MakeTensor(w.d_scale.get(), DType::kI8, d.q.device, {w.n, w.k / 16});
   return r;
+}
+Nvfp4Dev ResidentNvfp4Pd(Dev d, const Nvfp4Weight& w, int dev_idx) {
+  std::shared_ptr<void>& packed_slot = w.d_packed_pd[dev_idx];
+  if (!packed_slot) {
+    const size_t pkb = w.packed.bytes.size();
+    void* p = d.b.Alloc(pkb);
+    vllm::load_stats::AddDeviceUpload(pkb);
+    d.b.Copy(d.q, p, w.packed.bytes.data(), pkb);
+    Backend* bk = &d.b;
+    packed_slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  std::shared_ptr<void>& scale_slot = w.d_scale_pd[dev_idx];
+  if (!scale_slot) {
+    const size_t skb = w.scale.bytes.size();
+    void* p = d.b.Alloc(skb);
+    vllm::load_stats::AddDeviceUpload(skb);
+    d.b.Copy(d.q, p, w.scale.bytes.data(), skb);
+    Backend* bk = &d.b;
+    scale_slot = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  Nvfp4Dev r;
+  r.packed = MakeTensor(packed_slot.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
+  r.scale = MakeTensor(scale_slot.get(), DType::kI8, d.q.device, {w.n, w.k / 16});
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// M-B1b per-device residency selfcheck (mirrored by tests/vt/test_nccl_group.cpp:
+// `extern "C" int vt_cuda_residency_selfcheck(void)`). Proves that ONE shared
+// `OwnedTensor` weight is resident on BOTH devices at once: calling the per-lane
+// `ResidentWeight` on device 0 fills the single `d_dev` slot, calling it again on
+// device index 1 fills `d_dev_pd[1]` with a DISTINCT allocation, and each returned
+// tensor wraps its own device's queue with byte-correct data. Returns 0 PASS /
+// 2 FEWER-THAN-2-GPU (the tp<=1 host never reaches this).
+// ---------------------------------------------------------------------------
+extern "C" int vt_cuda_residency_selfcheck(void) {
+#if defined(VLLM_CPP_CUDA)
+  int devs = 0;
+  if (cudaGetDeviceCount(&devs) != cudaSuccess || devs < 2) return 2;
+  // Two per-device queues/backends (the M-B1a per-device resolve).
+  cudaStream_t s0 = nullptr, s1 = nullptr;
+  if (cudaSetDevice(0) != cudaSuccess || cudaStreamCreate(&s0) != cudaSuccess ||
+      cudaSetDevice(1) != cudaSuccess || cudaStreamCreate(&s1) != cudaSuccess) {
+    if (s0) cudaStreamDestroy(s0);
+    return 1;
+  }
+  const vt::Device dev0{vt::DeviceType::kCUDA, 0};
+  const vt::Device dev1{vt::DeviceType::kCUDA, 1};
+  vt::Queue q0{dev0, s0}, q1{dev1, s1};
+  Dev d0{vt::GetBackend(dev0), q0};
+  Dev d1{vt::GetBackend(dev1), q1};
+
+  OwnedTensor w;
+  w.rank = 2;
+  w.shape[0] = 2;
+  w.shape[1] = 4;
+  w.dtype = DType::kBF16;
+  w.bytes.resize(2 * 4 * 2, 0x00);  // bf16 [2,4]
+  for (size_t i = 0; i < w.bytes.size(); ++i) w.bytes.data()[i] = (uint8_t)(0x30 + i * 3);
+
+  Tensor t0 = ResidentWeight(d0, w, {2, 4});
+  Tensor t1 = ResidentWeight(d1, w, {2, 4});  // device index 1 -> d_dev_pd[1]
+
+  int rc = 0;
+  if (!w.d_dev || w.d_dev_pd.count(1) == 0) rc = 1;             // both uploads happened
+  else if (w.d_dev.get() == w.d_dev_pd[1].get()) rc = 1;        // DISTINCT allocations
+  else if (t0.device.index != 0 || t1.device.index != 1) rc = 1;  // each wraps its own device
+  if (rc == 0) {
+    // The lane-1 resident holds the SAME bytes as the host source: read the
+    // device-1 allocation back to host and diff byte-for-byte.
+    std::vector<uint8_t> back(w.bytes.size(), 0);
+    cudaMemcpy(back.data(), t1.data, back.size(), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < back.size(); ++i) {
+      if (back[i] != w.bytes.data()[i]) { rc = 1; break; }
+    }
+  }
+  w.d_dev.reset();
+  w.d_dev_pd.clear();
+  cudaStreamDestroy(s0);
+  cudaStreamDestroy(s1);
+  return rc;
+#else
+  return 2;
+#endif
 }
 
 std::vector<int64_t> CutlassFp4ScaleShape(int64_t rows, int64_t k) {

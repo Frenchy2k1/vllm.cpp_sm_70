@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -189,6 +190,18 @@ struct OwnedTensor {
   // activation is f32). The shared_ptr deleter frees through the vt Backend.
   mutable std::shared_ptr<void> d_dev;
   mutable std::shared_ptr<void> d_dev_f32;
+
+  // Distributed tp>1 serve (BACKEND-DISTRIBUTED-TP). Per-device residents for
+  // the LANE devices (index > 0): each lane's `ResidentWeight`/`ResidentWeightF32`
+  // on its own `vt::Queue` uploads THIS weight's bytes into its own device's
+  // slot, so ONE weight is resident on several GPUs at once. The lane-0 slot
+  // `d_dev`/`d_dev_f32` above is untouched and stays the tp1/device-0 default —
+  // every single-device test and the fp4-residency audit (`tests/scripts/
+  // test_check_fp4_resident_consistency.py`) read it unchanged. The map entries
+  // are `shared_ptr<void>` whose deleter frees through the owning vt Backend,
+  // exactly like the single slot. Never populated for device index 0 (tp1).
+  mutable std::map<int, std::shared_ptr<void>> d_dev_pd;
+  mutable std::map<int, std::shared_ptr<void>> d_dev_f32_pd;
 };
 
 // ADOPT the device-resident copy AS the host buffer, where the backend says its
@@ -325,6 +338,16 @@ struct Nvfp4Weight {
   // repack, held on the GATE weight of the pair (it is the pair's cache key).
   ResidentSlot resident_marlin;
   ResidentSlot resident_marlin_pair;
+
+  // Distributed tp>1 serve (BACKEND-DISTRIBUTED-TP). Per-device residents for
+  // the LANE devices (index > 0), the analogue of `OwnedTensor::d_dev_pd`: each
+  // lane uploads packed/scale/scale_sw/alpha into ITS device's slot so ONE
+  // weight is resident on several GPUs at once. The lane-0 slots above are
+  // untouched (tp1/device-0 default). Never populated for device index 0.
+  mutable std::map<int, std::shared_ptr<void>> d_packed_pd;
+  mutable std::map<int, std::shared_ptr<void>> d_scale_pd;
+  mutable std::map<int, std::shared_ptr<void>> d_scale_sw_pd;
+  mutable std::map<int, std::shared_ptr<void>> d_alpha_pd;
 };
 
 // Device-resident per-tensor FP8 (W8A8) weight — the 35B attn q/k/v/o + GDN
