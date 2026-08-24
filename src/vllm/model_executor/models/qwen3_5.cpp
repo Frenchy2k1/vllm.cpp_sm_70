@@ -9724,7 +9724,10 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   // [n_out,vocab], lm_head stays full-width, results token-identical to tp1).
   // tp==null (the tp1 runner) takes the identical op sequence as before; the
   // sharded blocks throw their own specific NCCL message without VT_NCCL.
-  Dev d{vt::GetBackend(queue.device.type), queue};
+  // BACKEND-DISTRIBUTED-TP W5 M-B1a: a per-lane forward's Dev resolves the
+  // PER-DEVICE backend (queue.device = Device{kCUDA,r}, index-0 slot identical
+  // to the type-level slot), so lane r's weight upload allocates on GPU r.
+  Dev d{vt::GetBackend(queue.device), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
                                   logits_indices, /*hidden_tap=*/nullptr,
@@ -10269,7 +10272,8 @@ ForwardLogits Qwen3_5DenseModel::ForwardDevice(
   // TP-W3: a tp>1 group routes into the proven per-layer sharded traversal (the
   // same `tp` DenseMlpBlock / FullAttnBlockPaged consume); tp==null is the
   // byte-identical tp1 op sequence. See Forward above.
-  Dev d{vt::GetBackend(queue.device.type), queue};
+  // M-B1a: per-device backend (index-0 slot == type slot, tp1 byte-identical).
+  Dev d{vt::GetBackend(queue.device), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
                                   logits_indices, /*hidden_tap=*/nullptr,
@@ -10289,7 +10293,8 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
   // TP-W3: a tp>1 group routes into the proven per-layer sharded traversal; the
   // hidden tap is the full-width exit-all-reduced stream, identical on every
   // rank. tp==null is the byte-identical tp1 op sequence. See Forward above.
-  Dev d{vt::GetBackend(queue.device.type), queue};
+  // M-B1a: per-device backend (index-0 slot == type slot, tp1 byte-identical).
+  Dev d{vt::GetBackend(queue.device), queue};
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf tap(d, DType::kBF16, {T, H});
@@ -10317,7 +10322,8 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceMultiTap(
   // TP-W3: a tp>1 group routes into the proven per-layer sharded traversal; the
   // aux taps are the full-width exit-all-reduced streams, identical on every
   // rank. tp==null is the byte-identical tp1 op sequence. See Forward above.
-  Dev d{vt::GetBackend(queue.device.type), queue};
+  // M-B1a: per-device backend (index-0 slot == type slot, tp1 byte-identical).
+  Dev d{vt::GetBackend(queue.device), queue};
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   if (aux_out == nullptr) {
