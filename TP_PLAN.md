@@ -78,8 +78,11 @@ per-rank forward dispatch (W4-pre remainder / W5) remain open and unfeigned.
       shard collectives self-NCCL world=2 in one process) PASSES —
       **"2-GPU dense == tp1 (8 tokens identical)"**. This proves the per-layer
       sharded traversal is token-exact at real 27B dims under a tp group, NOT
-      that a 2-rank serve works (residency is single-device). The G5 SERVE half
-      (per-rank execute_model dispatch) is still open.
+      that a 2-rank serve works. **M-B1b landed 2026-08-24** (`43f958fe1`):
+      per-device weight residency (`d_dev_pd`/`d_packed_pd`/… keyed by device
+      index) makes one weight resident on every lane at once, proven on GPUs
+      1+2 by `vt_cuda_residency_selfcheck`. The G5 SERVE half (per-rank
+      execute_model dispatch = M-B3) is still open.
       **tp1 baseline measured 2026-08-22** (committed binary, GPU1, real
       Qwen3.8-27B-NVFP4 snapshot 7d6f8d4d...): prompt `"The capital of France
       is"` → `" Paris.\nThe capital of Germany is Berlin.\nThe"` (10 tok,
