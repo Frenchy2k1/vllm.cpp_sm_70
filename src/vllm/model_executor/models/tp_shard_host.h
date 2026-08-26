@@ -49,6 +49,12 @@ inline void TpNcclAbsent(const char* family) {
 extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I, const float* x,
                                      const float* gate, const float* up,
                                      const float* down, float* out);
+// Batched (T-token) serving variant: one process-lifetime group + one slice
+// upload per call, then the T-token partial GEMM + AllReduceSum loop.
+extern "C" int vt_cuda_mlp_shard_runT(int O, int H, int I, int64_t T,
+                                      const float* x, const float* gate,
+                                      const float* up, const float* down,
+                                      float* out);
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I,
                                           const uint16_t* x16, const uint16_t* gu16,
                                           const uint16_t* dn16, float* out);

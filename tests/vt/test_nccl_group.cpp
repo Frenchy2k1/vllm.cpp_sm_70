@@ -152,6 +152,23 @@ TEST_CASE("mlp_shard_run holds at engine-scale intermediate width") {
   for (int o=0;o<O;o+=257){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x[k]*gate[i*H+k];u+=x[k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[o*I+i];} CHECK(out[(size_t)o]==doctest::Approx((float)a).epsilon(5e-4));}
 }
 
+extern "C" int vt_cuda_mlp_shard_runT(int O,int H,int I,int64_t T,const float* x,const float* gate,const float* up,const float* down,float* out);
+TEST_CASE("mlp_shard_runT (batched T-token) matches the host MLP reference for every token") {
+  constexpr int O=4,H=8,I=16,T=5;
+  std::vector<float> x((size_t)T*H), gate(I*H), up(I*H), down(O*I), out((size_t)T*O,0.f);
+  for (int t=0;t<T;++t)for(int k=0;k<H;++k) x[(size_t)t*H+k]=0.5f+(float)((k+t)%3);
+  for (int i=0;i<I;++i)for(int k=0;k<H;++k){gate[i*H+k]=0.1f*((i*3+k)%7)+0.05f;up[i*H+k]=0.05f*((i*5+k*2)%9)+0.2f;}
+  for (int o=0;o<O;++o)for(int i=0;i<I;++i) down[o*I+i]=0.02f*((o*7+i*3)%11)+0.4f;
+#ifdef VLLM_CPP_CUDA
+  int devs = -1; (void)cudaGetDeviceCount(&devs);
+  if (devs >= 2 && I % devs != 0) { MESSAGE("world does not divide I=16; runT skipped"); return; }
+#endif
+  int rc=vt_cuda_mlp_shard_runT(O,H,I,T,x.data(),gate.data(),up.data(),down.data(),out.data());
+  if (rc==2){MESSAGE("fewer than 2 GPUs (or NCCL unbuilt); mlp_shard_runT skipped");return;}
+  CHECK(rc==0);
+  for (int t=0;t<T;++t) for (int o=0;o<O;++o){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x[(size_t)t*H+k]*gate[i*H+k];u+=x[(size_t)t*H+k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[o*I+i];} CHECK(out[(size_t)t*O+o]==doctest::Approx((float)a).epsilon(5e-4));}
+}
+
 extern "C" int vt_host_decode_nvfp4_f32(int N,int K,const uint8_t* packed,const uint8_t* scale8,const float* scale2,float* out);
 TEST_CASE("host NVFP4 decode reproduces the fp4 layout (known nibbles + e4m3 scale)") {
   constexpr int N=1,K=16;

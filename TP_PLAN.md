@@ -87,6 +87,80 @@ per-rank forward dispatch (W4-pre remainder / W5) remain open and unfeigned.
       Qwen3.8-27B-NVFP4 snapshot 7d6f8d4d...): prompt `"The capital of France
       is"` → `" Paris.\nThe capital of Germany is Berlin.\nThe"` (10 tok,
       temp 0). TP2 must equal this byte-for-byte.
+      **Device-leak fix 2026-08-25** (real TP2 serve on GPUs 0+1, scratch
+      `VT_TP_ALLOW` probe, this branch): the o_proj `sigmoid_gate_bf16`
+      `invalid resource handle` was root-caused to `~CudaCommGroup`'s
+      `ncclCommDestroy` loop corrupting the caller's ambient CUDA device to the
+      last comm's device (2-GPU group → device 1; `Create()` restores, the
+      destructor never did); the destructor now save/restores the caller
+      device. With it the tp>1 forward runs cleanly at the device level —
+      held device 0 through paged→DBuf→Copy→gate-proj on the same thread —
+      and `test_nccl_group` 18/18 / `test_tp_forward` 3/3 / `test_runner` 20/20
+      stay green. **Single-lane host-roundtrip path measured UNVIABLE**: the
+      tp>1 paged+K/V host-roundtrip forward (per-layer Create/delete g =
+      ncclCommInitAll churn ×36/step) is host-bound, creeps host RSS
+      3.1→14.6 GiB + threads/FDs + GPU mem, and dies silently (SIGSEGV at
+      ~33 min; exit 1 at ~1415s) before a request returns a token — it never
+      produced a completion. This is the definitive evidence that M-B3
+      (persistent-group reuse + per-rank forward) is REQUIRED, not optional.
+      **Memoized paged-group re-measurement 2026-08-25** (scratch, reverted):
+      replacing the paged primitive's per-call `CudaCommGroup::Create()`+`delete g`
+      with a process-wide memoized singleton (created once, retained) confirms the
+      churn is the leak: threads/FDs hold at 58/132 in place of the monotonic
+      climb, the server stays alive 21m50s (vs SIGSEGV at ~33 min / exit 1 at
+      ~1415s) with no fatal memory death, and RSS moderates to ~7 GiB before
+      drifting to ~12 under sustained 100% compute. **It still returns no token
+      within 1200 s** (curl RC=28). The leak is only half the blocker: the
+      host-bound per-layer host roundtrip is the binding constraint even leak-free.
+      The memoized-group change is therefore a validated, re-usable component of
+      M-B3 (the paged primitive must reuse a retained group, never Create per
+      call), but a token-exact result still requires the per-rank forward dispatch.
+      **CORRECTION 2026-08-25 — the "tp==tp1 token gate" is a TAUTOLOGY, not a
+      compute proof.** Re-ran `test_op_parity.cpp:2433` with `VT_TP_TRACE=1`
+      (GPUs 0+1, flock): it completes in ~112 s, "8 tokens identical", with
+      ZERO `[TP-TRACE] mlp-shard` markers — the timers I added to
+      `DenseMlpBlock`'s tp>1 fp4 branch are unconditional and compiled into the
+      same `libvllm.a` the serve logs prove lit; their ABSENCE means the tp>1
+      branch never executes in the gate. So the gate runs tp1 for both
+      `run_greedy(nullptr)` and `run_greedy(&TpThunkComm{world=2})` — the
+      thunk's no-op `AllReduce` sets `tp_size()==2` yet the sharded forward
+      never engages — and "8 tokens identical" is trivially tp1==tp1. It proves
+      NOTHING about the sharded compute. **The REAL measured blocker** (live
+      G5 serve trace, VT_TP_TRACE, 2026-08-25): the paged attention shard is
+      fast + correct (`vt_cuda_attn_kv_shard_paged_run` rc=0 in ~0.52 s/layer),
+      but `DenseMlpBlock`'s tp>1 branch is a **host-intermediate per-token
+      scaffold** — per layer it host-decodes the full 27B fp4 gate/up/down
+      (~1.3 s) then for EACH token assembles + uploads the FULL merged
+      gate/up (~411 MB) + down (~205 MB) to every rank's device
+      (`vt_cuda_mlp_shard_run`, nccl_communicator.cu:756-766), ~4 s/token
+      (measured `per-token-loop 20.2 s` for T=5). 25 layers × T tokens ≈
+      ~100 s/layer → the T=5 prefill alone ≈ 2500 s ≫ the 1200 s curl timeout:
+      THIS is the no-token-in-1200 s blocker, and it is the dense MLP scaffold,
+      NOT the attention shard. M-B3's real fix: replace the host-intermediate
+      fp4 MLP shard with a device-resident per-rank fp4 GEMM (each rank holds
+      its `TpShard` slice on its own device via M-B1b residency; per-token
+      activation; per-rank partial; ONE `TpAllReduceSum`), making the tp>1 MLP
+      serve-viable the same way the attention shard already is.
+      **M-B3 progress 2026-08-25 — `vt_cuda_mlp_shard_runT` landed (batched,
+      process-lifetime group):** replaced the fp4 branch's per-token
+      `vt_cuda_mlp_shard_run` with a batched primitive that reuses a
+      process-lifetime `CudaCommGroup` and uploads each rank's gate/up/down
+      slice ONCE per layer, then runs the T-token partial-GEMM + AllReduceSum
+      loop (nccl_communicator.cu `vt_cuda_mlp_shard_runT`; fp4 branch rewired
+      in qwen3_5.cpp `DenseMlpBlock`; declared qwen3_5.cpp + tp_shard_host.h).
+      Validated model-free: **test_nccl_group 19/19 incl. a new T-token runT
+      selfcheck** vs the host reference (GPUs 0+1). Reachability: a real tp2
+      serve now GRINDS THROUGH the prefill (~870 s for the 5-token prompt)
+      where the per-token scaffold previously never left the first layers —
+      so runT removed the host-roundtrip wall. **Two walls remain, both
+      precise:** (a) `DenseMlpRankPartial` is a NAIVE kernel — ONE thread per
+      output row doing serial `per×H` MACs — so the tp>1 MLP is ~870 s per
+      5-token prefill (unusable; needs a tiled/efficient per-rank GEMM, the
+      real M-B3 kernel work); (b) the tp2 server silently `exit(1)` after the
+      ~870 s forward (no stderr; silent abort, exit 1 — post-forward
+      scheduler/sampling path or a CUDA async error), so the request returns
+      RC=52 connection-close, never a body. Both must land before G5 serves
+      tokens; runT is the validated transport fix, not yet a serving primitive.
 - [ ] **G6 prefill** (W6): the tp>1 full-attn **prefill** (batched, variS)
       completes and == tp1; tp>1 pure-decode from E4 already equals. Dense
       prefill heads the "pending wave" throw and is replaced.

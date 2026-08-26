@@ -47,6 +47,15 @@ extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
 extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I, const float* x,
                                        const float* gate, const float* up,
                                        const float* down, float* out);
+// Batched (T-token) serving variant: ONE process-lifetime NCCL group + ONE
+// per-rank slice upload per call, then the T per-token partial GEMM + group
+// AllReduceSum loop. The per-token singleton above re-creates the group and
+// re-uploads the FULL merged gate/up + down to every rank on every token
+// (~4 s/token measured), which is not a serving path.
+extern "C" int vt_cuda_mlp_shard_runT(int O, int H, int I, int64_t T,
+                                      const float* x, const float* gate,
+                                      const float* up, const float* down,
+                                      float* out);
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I, const uint16_t* x16,
                                            const uint16_t* gu16, const uint16_t* dn16,
                                            float* out);
@@ -80,6 +89,7 @@ extern "C" int vt_cuda_moe_expert_shard_run(int T, int H, int I, int top_k, int 
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <optional>
@@ -7823,8 +7833,15 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
+  // QWEN38-PER-CHANNEL-GDN W8A16 keep-quant MLP (27B layers 56+): the tail
+  // MLP layers of the 3.8-27B checkpoint are F8_E4M3 + per-output-column f32
+  // scale (kept RAW under keep_fp8w on the W8A16 device, so the bf16 fields
+  // stay empty). tp1 routes them through LaunchSm70Fp8W8a16; the tp>1 shard
+  // host-dequants the keep resident to f32 and runs the same batched runT as
+  // the fp4 arm.
+  const bool fp8w = !w.gate_proj_fp8w.Empty();
   // Multi-device (tp>1): the real per-rank shard. Host-decode the resident
-  // fp4/bf16 weights into the shard's [out,in] f32 layout, then run the group
+  // fp4/fp8w/bf16 weights into the shard's [out,in] f32 layout, then run the group
   // sharded dense-MLP per token (one token x [H] -> one reduced token the group
   // sums on rank 0), writing the reduced [T,H] bf16 back. tp1 (null) never enters
   // so the resident tensor-core path below stays byte-identical. Requires the
@@ -7832,10 +7849,11 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   if (tp != nullptr && tp->tp_size() > 1) {
 #ifdef VT_NCCL
     // Host-decode (or bf16->f32) the resident gate/up/down into the shard's
-    // gate/up [I,H] + down [O,I] layout (O = H = hidden width).
-    std::vector<float> gate_host((size_t)I * (size_t)H, 0.f);
-    std::vector<float> up_host((size_t)I * (size_t)H, 0.f);
-    std::vector<float> down_host((size_t)H * (size_t)I, 0.f);
+    // gate/up [I,H] + down [O,I] layout (O = H = hidden width). The decode is
+    // per-row independent and therefore row-parallel (see vt_host_decode).
+    std::vector<float> gate_host((size_t)I * (size_t)H);
+    std::vector<float> up_host((size_t)I * (size_t)H);
+    std::vector<float> down_host((size_t)H * (size_t)I);
     if (fp4) {
       // Decoder demands a per-row scale2 array (indexed by n); the resident
       // Nvfp4Weight holds a single per-tensor scalar, so broadcast it per row.
@@ -7853,6 +7871,47 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
           dec(w.up_proj_fp4, up_host, (int)I, (int)H) != 0 ||
           dec(w.down_proj_fp4, down_host, (int)H, (int)I) != 0)
         throw std::runtime_error("qwen3_5 dense MLP: tp>1 fp4 host-decode failed");
+    } else if (fp8w) {
+      // Per-channel FP8 W8A16 MLP: the keep-quant resident (raw fp8-e4m3fn
+      // bytes [n,k] + f32 [n] per-output-column scale) is on device (host
+      // pages released by StageAndReleaseKeepFp8w), so D2H it and dequant to
+      // the f32 [out,in] shard layout. Identical math to vt::MatmulFp8W8a16's
+      // out[m,n] = Σ_k bf16(act)·fp8(w)·scale[n] when act is f32-exact.
+      const auto fp8w_host = [&](const Fp8PerChannelWeight& wl, int n_rows,
+                                 int n_k) {
+        const Tensor pk = ResidentWeight(d, wl.packed);  // i8 [n,k]
+        const Tensor sc = ResidentWeight(d, wl.scale);   // f32 [n]
+        std::vector<uint8_t> pb((size_t)n_rows * (size_t)n_k);
+        std::vector<float> s32((size_t)n_rows);
+        d.b.Copy(d.q, pb.data(), pk.data, pb.size());
+        d.b.Copy(d.q, s32.data(), sc.data, (size_t)n_rows * sizeof(float));
+        d.b.Synchronize(d.q);
+        std::vector<float> out((size_t)n_rows * (size_t)n_k);
+        // Row-parallel decode (rows independent); D2H above already synced, so
+        // threads only touch host pb/s32/out. Mirrors the fp4 decoder's fan-out.
+        const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+        const size_t per = (size_t)n_rows / nt + 1u;
+        std::vector<std::thread> th;
+        th.reserve(nt);
+        for (unsigned t = 0; t < nt; ++t) {
+          const int n0 = (int)(t * per),
+                    n1 = (int)std::min<size_t>(n_rows, (t + 1) * per);
+          if (n0 >= n1) break;
+          th.emplace_back([&, n0, n1]() {
+            for (int n = n0; n < n1; ++n) {
+              const float s = s32[(size_t)n];
+              const uint8_t* wr = pb.data() + (size_t)n * (size_t)n_k;
+              float* orow = out.data() + (size_t)n * (size_t)n_k;
+              for (int k = 0; k < n_k; ++k) orow[k] = F8E4M3ToF32(wr[k]) * s;
+            }
+          });
+        }
+        for (auto& t : th) t.join();
+        return out;
+      };
+      gate_host = fp8w_host(w.gate_proj_fp8w, (int)I, (int)H);
+      up_host = fp8w_host(w.up_proj_fp8w, (int)I, (int)H);
+      down_host = fp8w_host(w.down_proj_fp8w, (int)H, (int)I);
     }
     // The reduced [O] is authoritative on group rank 0 (shard's AllReduce). Copy
     // the device hidden D2H, run the sharded MLP per token, write the reduced
@@ -7863,17 +7922,35 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
              (size_t)T * H * sizeof(uint16_t));
     d.b.Synchronize(d.q);
     std::vector<uint8_t> host((size_t)T * H * 2);
+    if (fp4 || fp8w) {
+      // Batched fp4/fp8w shard: ONE process-lifetime group + ONE per-rank slice
+      // upload for the WHOLE T. The per-token vt_cuda_mlp_shard_run would
+      // re-create the group and re-upload the full merged gate/up + down to
+      // every rank on each token (~4 s/token measured) — not a serving path.
+      std::vector<float> xf((size_t)(T * H));
+      for (int64_t t = 0; t < T; ++t)
+        for (int64_t h = 0; h < H; ++h)
+          xf[(size_t)(t * H + h)] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
+      std::vector<float> of((size_t)(T * H));
+      const int rct = vt_cuda_mlp_shard_runT((int)H, (int)H, (int)I, T,
+                                             xf.data(), gate_host.data(),
+                                             up_host.data(), down_host.data(),
+                                             of.data());
+      if (rct == 2)
+        throw std::runtime_error(
+            "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
+      if (rct != 0)
+        throw std::runtime_error("qwen3_5 dense MLP: tp>1 batched shard failed");
+      for (int64_t t = 0; t < T; ++t) {
+        auto* row16 = reinterpret_cast<uint16_t*>(host.data() + (size_t)(t * H * 2));
+        for (int64_t h = 0; h < H; ++h)
+          row16[(size_t)h] = vt::F32ToBF16(of[(size_t)(t * H + h)]);
+      }
+    } else {
     for (int64_t t = 0; t < T; ++t) {
       std::vector<float> o((size_t)H);
       int rc;
-      if (fp4) {
-        std::vector<float> x((size_t)H);
-        for (int64_t h = 0; h < H; ++h)
-          x[(size_t)h] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
-        rc = vt_cuda_mlp_shard_run((int)H, (int)H, (int)I, x.data(),
-                                   gate_host.data(), up_host.data(),
-                                   down_host.data(), o.data());
-} else if (!w.gate_up_proj.Empty()) {
+      if (!w.gate_up_proj.Empty()) {
         // BF16 RawNK merged gate_up + separate down (synthetic/plain path):
         // pass the resident bf16 bytes straight to the bf16 shard (it does its
         // own bf16->f32). The resident copy (if host bytes were released) is
@@ -7926,6 +8003,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
             "qwen3_5 dense MLP: tp>1 shard mismatched host reference");
       auto* row16 = reinterpret_cast<uint16_t*>(host.data() + (size_t)(t * H * 2));
       for (int64_t h = 0; h < H; ++h) row16[(size_t)h] = vt::F32ToBF16(o[(size_t)h]);
+    }
     }
     d.b.Copy(d.q, red.ptr(), (const void*)host.data(),
               (size_t)T * H * sizeof(uint16_t));
@@ -9789,6 +9867,19 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
+    if (tp != nullptr && tp->tp_size() > 1 &&
+        std::getenv("VT_TP_DIAG") != nullptr) {
+      std::fprintf(stderr,
+                   "[TP-DIAG] l=%lld type=%s T=%lld fp4=%d gu_empty=%d g_empty=%d "
+                   "u_empty=%d d_empty=%d\n",
+                   (long long)l, (layer.is_linear_attention ? "gdna" : "full"),
+                   (long long)T, (int)!layer.mlp.gate_proj_fp4.Empty(),
+                   (int)layer.mlp.gate_up_proj.Empty(),
+                   (int)layer.mlp.gate_proj.Empty(),
+                   (int)layer.mlp.up_proj.Empty(),
+                   (int)layer.mlp.down_proj.Empty());
+      std::fflush(stderr);
+    }
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
                        gdn_meta, kv, gs, T, tp);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert

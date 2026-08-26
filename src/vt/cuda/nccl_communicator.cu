@@ -234,7 +234,16 @@ Communicator* CudaCommGroup::Rank(int r) const {
 vt::CudaCommGroup::~CudaCommGroup() {
   auto* impl = static_cast<CudaCommGroupImpl*>(impl_);
   if (impl) {
+    // ncclCommInitAll sets the calling thread's current device and does not
+    // restore it (see Create()), and ncclCommDestroy does the same on teardown:
+    // the destroy loop below leaves the ambient device on the LAST comm's device
+    // (a 2-GPU group leaves it on 1), corrupting any stream/launch the caller
+    // makes right after (invalid-resource-handle). Save + restore so the
+    // destructor is likewise a no-op on the caller's device binding.
+    int caller_dev = 0;
+    const bool saved = cudaGetDevice(&caller_dev) == cudaSuccess;
     for (int i = 0; i < impl->world; ++i) ncclCommDestroy(impl->comm[i]);
+    if (saved) (void)cudaSetDevice(caller_dev);
     delete impl;
   }
 }
@@ -639,18 +648,96 @@ extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
                                         float* out) {
   if (N < 0 || K <= 0 || K == 1) return 1;
   const int halves = K / 2, groups = K / 16;
-  for (int n = 0; n < N; ++n)
-    for (int j = 0; j < halves; ++j) {
-      const uint8_t b = packed[n * halves + j];
-      const float gs = HostF8E4M3ToF32(scale8[n * groups + (2*j) / 16]) * scale2[n];
-      const int lo = b & 0xFu, hi = b >> 4;
-      out[n * K + 2 * j]     = HostRoundBf16(kHostE2M1[lo & 7] * ((lo & 8) ? -1.f : 1.f) * gs);
-      out[n * K + 2 * j + 1]  = HostRoundBf16(kHostE2M1[hi & 7] * ((hi & 8) ? -1.f : 1.f) * gs);
-    }
+  if (N == 0) return 0;
+  // Row-parallel (rows are independent) with std::thread: at 27B dense dims
+  // this decode is the dominant tp>1 per-step cost (single-threaded ~5 s/layer
+  // x 64 layers), so fan the outer n loop across the host's cores. Each thread
+  // writes disjoint rows; the gs term reads only its own row's scale entries.
+  const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+  const size_t per = (size_t)N / nt + 1u;
+  std::vector<std::thread> th;
+  th.reserve(nt);
+  for (unsigned t = 0; t < nt; ++t) {
+    const int n0 = (int)(t * per), n1 = (int)std::min<size_t>(N, (t + 1) * per);
+    if (n0 >= n1) break;
+    th.emplace_back([=]() {
+      for (int n = n0; n < n1; ++n) {
+        const uint8_t* p = packed + n * halves;
+        const float gs_row = scale2[n];
+        float* o = out + n * K;
+        for (int j = 0; j < halves; ++j) {
+          const uint8_t b = p[j];
+          const float gs =
+              HostF8E4M3ToF32(scale8[n * groups + (2 * j) / 16]) * gs_row;
+          const int lo = b & 0xFu, hi = b >> 4;
+          o[2 * j] = HostRoundBf16(kHostE2M1[lo & 7] * ((lo & 8) ? -1.f : 1.f) * gs);
+          o[2 * j + 1] = HostRoundBf16(kHostE2M1[hi & 7] * ((hi & 8) ? -1.f : 1.f) * gs);
+        }
+      }
+    });
+  }
+  for (auto& t : th) t.join();
   return 0;
 }
 // ---------------------------------------------------------------------------
-// merged gate/up, one thread per output row, row-parallel over the group reduce.
+// Efficient per-rank dense-MLP shard kernels (M-B3 kernel work). The OLD
+// DenseMlpRankPartial was one thread per output row doing serial per*H MACs —
+// each of the O threads streamed the ENTIRE rank weight slice, so DRAM traffic
+// was O/32x the weight (measured ~11 s/layer at 27B dims, T=5). Two coalesced
+// tiled kernels replace it: MlpGuAct (gate/up GEMV+silu, one block per
+// intermediate row, threads reduce over H coalesced) and MlpDown (down GEMV,
+// one block per output row, coalesced over the slice). Math is unchanged:
+//   out[o] = sum_i silu(gate_i^T x) * (up_i^T x) * down[o,i]
+// with rank r owning I/W of the I intermediate and a group AllReduceSum over
+// [O]. Reads the COMPACT rank slice [2per,H] merged gate/up + [O,per] down
+// (built once per call by the host) instead of the full padded [2I,H]/[O,I].
+__global__ void MlpGuAct(const float* gu, const float* x, float* act, int H,
+                         int per) {
+  __shared__ float smem[512];  // 2 * NT scratch (NT=256)
+  const int i = blockIdx.x;
+  if (i >= per) return;
+  const int tid = threadIdx.x;
+  const int NT = blockDim.x;
+  const float* g = gu + (size_t)i * H;
+  const float* u = gu + ((size_t)per + i) * H;
+  float gv = 0.f, uv = 0.f;
+  for (int k = tid; k < H; k += NT) { gv += x[k] * g[k]; uv += x[k] * u[k]; }
+  smem[tid] = gv; smem[NT + tid] = uv;
+  __syncthreads();
+  for (int s = NT / 2; s > 0; s >>= 1) {
+    if (tid < s) { smem[tid] += smem[tid + s]; smem[NT + tid] += smem[NT + tid + s]; }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const float s = 1.f / (1.f + __expf(-smem[0]));
+    act[i] = (smem[0] * s) * smem[NT];
+  }
+}
+
+__global__ void MlpDown(const float* down, const float* act, float* out,
+                        int per, int O) {
+  __shared__ float smem[256];
+  const int o = blockIdx.x;
+  if (o >= O) return;
+  const int tid = threadIdx.x;
+  const int NT = blockDim.x;
+  const float* d = down + (size_t)o * per;
+  float acc = 0.f;
+  for (int q = tid; q < per; q += NT) acc += d[q] * act[q];
+  smem[tid] = acc;
+  __syncthreads();
+  for (int s = NT / 2; s > 0; s >>= 1) {
+    if (tid < s) smem[tid] += smem[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) out[o] = smem[0];
+}
+
+// Legacy single-token kernel, kept for the two model-free in-process
+// selfcheck primitives (vt_cuda_mlp_shard_run / vt_cuda_dense_mlp_shard_selfcheck)
+// which build the FULL padded [2I,H]/[O,I] rank masks and call by this exact
+// signature. They are NOT the serving path (runT / DenseMlpBlock uses
+// MlpGuAct+MlpDown above), so their naive per-thread body costs nothing here.
 __global__ void DenseMlpRankPartial(const float* x, int H, const float* gate,
                                     const float* up, const float* downfull,
                                     float* out, int per_i, int i0, int I, int O) {
@@ -775,6 +862,130 @@ extern "C" int vt_cuda_mlp_shard_run(int O, int H, int I,
   }
   for (auto& t : threads) t.join();
   delete g;
+  return bad.load();
+}
+
+// ---------------------------------------------------------------------------
+// Batched dense-MLP shard for the serving path. Same math as
+// vt_cuda_mlp_shard_run (rank r owns I/W of the intermediate; per-token
+// AllReduceSum over [O]) but shaped for the G5 hot loop: the group is a
+// process-lifetime singleton (created once, never per token — that churn + the
+// per-token re-upload of the FULL merged gate/up 2I*H + down O*I to every rank
+// is the ~4 s/token measured in the serve trace), and each rank's gate/up/down
+// slice is host-built + uploaded ONCE per call before the T-token loop. Per
+// token only the [H] activation crosses (host->dev) and the reduced [O] comes
+// back. x [T,H], gate/up [I,H], down [O,I] are already-decoded f32; out [T,H]
+// is the reduced [O] on group rank 0. Returns 0, 1 (dim/alloc), 2 (<2 GPUs or
+// NCCL unbuilt). Host-reference validation runs ONLY under VT_TP_DIAG.
+extern "C" int vt_cuda_mlp_shard_runT(int O, int H, int I, int64_t T,
+                                      const float* x, const float* gate,
+                                      const float* up, const float* down,
+                                      float* out) {
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
+  if (O <= 0 || H <= 0 || I <= 0 || T <= 0) return 1;
+  // Process-lifetime group (magic-static, lazily created on first tp>1 call so
+  // a tp1-only process never touches NCCL). Intentional leak: retained for the
+  // process, matching the runner's retained acquire and the many-group reality
+  // of the transport seam. Multiple NCCL groups over the same ranks coexist.
+  static vt::CudaCommGroup* sgroup = vt::CudaCommGroup::Create();
+  if (!sgroup) return 2;
+  const int W = sgroup->world_size();
+  if (I % W != 0) return 1;
+  const int64_t per = I / W;
+
+  // Host reference validation, VT_TP_DIAG only (debug self-check, not
+  // production math): verify token 0 against the full [T0,H] x row by direct
+  // O*I*H sum, same tolerance as the singleton primitive.
+  const bool kVerify = std::getenv("VT_TP_DIAG") != nullptr;
+
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      cudaStream_t st = nullptr;
+      float *dx = nullptr, *dgu = nullptr, *dd = nullptr, *dact = nullptr,
+            *dout = nullptr;
+      if (cudaStreamCreate(&st) != cudaSuccess ||
+          cudaMalloc(&dx, (size_t)H * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dgu, (size_t)(2 * per * H) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dd, (size_t)(O * per) * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dact, (size_t)per * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(&dout, (size_t)O * sizeof(float)) != cudaSuccess) {
+        bad.store(1, std::memory_order_relaxed);
+        cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dact); cudaFree(dout);
+        if (st) cudaStreamDestroy(st);
+        return;
+      }
+      // Compact per-rank slice of merged gate/up [2per,H] (upper per = gate
+      // slice, lower per = up slice) + down [O,per], built + uploaded ONCE per
+      // call — not the full padded [2I,H]/[O,I] (whose re-upload every token
+      // was the ~4 s/token scaffold cost).
+      std::vector<float> gu((size_t)(2 * per * H), 0.f);
+      for (int64_t q = 0; q < per; ++q)
+        for (int k = 0; k < H; ++k) {
+          gu[(size_t)(q * H + k)] = gate[(size_t)(ib + q) * H + k];
+          gu[((size_t)per + q) * H + k] = up[(size_t)(ib + q) * H + k];
+        }
+      std::vector<float> downc((size_t)(O * per), 0.f);
+      for (int o = 0; o < O; ++o)
+        for (int64_t q = 0; q < per; ++q)
+          downc[(size_t)(o * per + q)] = down[(size_t)o * I + (ib + q)];
+      cudaMemcpyAsync(dgu, gu.data(), (size_t)(2 * per * H) * sizeof(float),
+                      cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(dd, downc.data(), (size_t)(O * per) * sizeof(float),
+                      cudaMemcpyHostToDevice, st);
+      cudaStreamSynchronize(st);
+      for (int64_t t = 0; t < T; ++t) {
+        if (bad.load(std::memory_order_relaxed)) return;
+        cudaMemcpyAsync(dx, x + (size_t)t * H, (size_t)H * sizeof(float),
+                        cudaMemcpyHostToDevice, st);
+        MlpGuAct<<<(unsigned)per, 256, 0, st>>>(dgu, dx, dact, (int)H,
+                                                (int)per);
+        MlpDown<<<(unsigned)O, 256, 0, st>>>(dd, dact, dout, (int)per, (int)O);
+        Queue q;
+        q.device = Device{DeviceType::kCUDA, r};
+        q.handle = st;
+        sgroup->Rank(r)->AllReduce(q, dout, (size_t)O, DType::kF32,
+                                   ReduceOp::kSum);
+        std::vector<float> back((size_t)O);
+        cudaMemcpyAsync(back.data(), dout, (size_t)O * sizeof(float),
+                        cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        if (r == 0)
+          for (int o = 0; o < O; ++o) out[(size_t)t * O + o] = back[(size_t)o];
+        if (kVerify && t == 0) {
+          for (int o = 0; o < O; ++o) {
+            double a = 0.0;
+            for (int i = 0; i < I; ++i) {
+              float gv = 0.f, uv = 0.f;
+              for (int k = 0; k < H; ++k) {
+                gv += x[k] * gate[i * (size_t)H + k];
+                uv += x[k] * up[i * (size_t)H + k];
+              }
+              const float sg = 1.f / (1.f + std::exp(-(double)gv));
+              a += (double)((gv * sg) * uv) * down[(size_t)o * I + i];
+            }
+            if (std::fabs(back[(size_t)o] - (float)a) >
+                5e-4f * std::max(1.0f, std::fabs((float)a)))
+              bad.store(1, std::memory_order_relaxed);
+          }
+        }
+      }
+      cudaFree(dx); cudaFree(dgu); cudaFree(dd); cudaFree(dact); cudaFree(dout);
+      cudaStreamDestroy(st);
+    });
+  }
+  for (auto& t : threads) t.join();
   return bad.load();
 }
 

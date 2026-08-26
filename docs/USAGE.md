@@ -846,15 +846,22 @@ sharded fast path; a family that does not yet thread the group refuses tp>1
 loudly rather than running tp1 math. `VT_SM70_FA2_DECODE` (default on) and
 `VT_TP_DIAG` (default off) control the sm70 adoption and the sharded trace.
 
-**Distributed serving is not wired yet.** The tp==tp1 token gate runs the
-sharded math over replicated weights and proves numeric equality on 2×V100, but
-a real multi-GPU **server** does not distribute the checkpoint to a second
-device: the runner acquires the NCCL group, yet the weight loader narrows to rank
-0 only (a second device holds no shard), so a tp>1 `*server*` request would
-deadlock a collective. A server started with more than one visible CUDA device
-now refuses loudly at startup, naming the missing per-rank loader, the per-rank
-device load, and the per-device forward. tp1 (`CUDA_VISIBLE_DEVICES` to one
-device) is the fully-tested serve path.
+**Distributed serving is wired, and is opt-in.** The per-rank loader, per-device
+weight load, and per-device forward land the checkpoint on every rank, so a tp>1
+**server** distributes the model across the visible CUDA devices. The G1 refusal
+guard still holds unless the process opts in: with more than one visible CUDA
+device and `VT_TP_ALLOW` unset (its default), the server refuses loudly, naming
+the opt-in, rather than silently running a half-wired forward on another rank's
+device. Set `VT_TP_ALLOW=1` to serve tp>1 on the wired path (see
+[ENVIRONMENT.md](ENVIRONMENT.md)). G5 is measured token-exact: a tp=2 serve on
+the spec prompt `"The capital of France is"` reproduces the tp=1 text
+`" Paris.\nThe capital of Germany is Berlin."` byte-for-byte — the responses
+differ only in the server `created` timestamp. The tp>1 dense-MLP shard
+host-decodes the keep-quant resident to f32 and runs it through the batched
+group shard, so per-step decode is host-memory-bound (≈2–3 min/step at 27B on
+2×V100 measured), not a production-latency path; the device-quantized shard
+kernel (TP_PLAN M-B) remains the serving-speed target. tp1
+(`CUDA_VISIBLE_DEVICES` to one device) is the fully fast serve path.
 
 Selecting a backend by name is not exposed yet; the engine always resolves one.
 

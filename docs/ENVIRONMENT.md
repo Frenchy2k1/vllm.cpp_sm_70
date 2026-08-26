@@ -82,6 +82,7 @@ These change how the engine runs and have no CLI flag (or complement one).
 | `VT_ENABLE_JUMP_FORWARD` | off | Opt-in to jump-forward constrained decoding (SGLang parity SW3): when a grammar/structured-output request reaches a state with exactly one valid next token, that token is emitted without a model step. Currently drives only the standalone driver (`DrainForcedTokens`); output-identical by construction (it fires only where the constrained sampler already has a single valid token), so it changes speed, never tokens. Off by default until the production scheduler splice (jumped-token KV recompute) lands. Set `1`/`true`/`on` to enable |
 | `VT_SERVER_MAX_PROMPT_CHARS` | `200000` | Rejects larger `/v1/chat/completions` prompts before scheduling. `0` disables the guard. This is a character count after chat-template rendering, not a token limit |
 | `VT_SERVER_MAX_NEW_TOKENS` | `4096` | Caps the request's `max_tokens` value for `/v1/chat/completions`. `0` disables the cap |
+| `VT_TP_ALLOW` | unset (tp>1 refused) | Opt-in to tensor-parallel serving (`--tp N>1`) on the per-rank wiring path. With more than one rank and this unset, the runner and loader REFUSE to attach the TP group rather than silently run a half-wired forward on another rank's device (the G1 guard). Set `1` only when the per-rank `tp>1` dense/attention path is the intended route — the tp2==tp1 G5 serve opts past the refusal this way |
 
 ## GGUF loading
 

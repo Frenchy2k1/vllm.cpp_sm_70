@@ -1799,7 +1799,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // TP_PLAN W7: tp>1 distributed serve is REFUSED at construction (G1), naming
   // the open seam, rather than silently running tp1 math on a multi-GPU host.
   // tp=1 (the default) is byte-identical and never reaches this branch.
-  if (params.tensor_parallel_size > 1) {
+  if (params.tensor_parallel_size > 1 && std::getenv("VT_TP_ALLOW") == nullptr) {
     throw std::runtime_error(
         "vllm.cpp: --tensor-parallel-size " +
         std::to_string(params.tensor_parallel_size) +

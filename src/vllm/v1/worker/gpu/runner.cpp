@@ -431,7 +431,7 @@ void GPUModelRunner::attach_tp_group() {
   // dying mid-request. tp1 (and the null group) never reach this branch.
   vt::CudaCommGroup* cg = static_cast<vt::CudaCommGroup*>(group);
   const int world = cg->world_size();
-  if (world > 1) {
+  if (world > 1 && std::getenv("VT_TP_ALLOW") == nullptr) {
     // Read `world` (a local) before releasing the group — cg must not be
     // touched after vt_cuda_tp_release frees it.
     vt_cuda_tp_release(group);
