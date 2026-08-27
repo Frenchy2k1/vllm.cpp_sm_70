@@ -56,6 +56,23 @@ extern "C" int vt_cuda_mlp_shard_runT(int O, int H, int I, int64_t T,
                                       const float* x, const float* gate,
                                       const float* up, const float* down,
                                       float* out);
+// M-B3: device-resident per-rank fp4 GEMM (reads each rank's resident fp4
+// packed/scale slice in-kernel; no host decode, no f32 slice upload).
+extern "C" int vt_cuda_mlp_shard_runT_fp4(
+    int O, int H, int I, int64_t T, const float* x,
+    const void* const* d_gate_packed, const void* const* d_gate_scale,
+    const void* const* d_up_packed, const void* const* d_up_scale,
+    const void* const* d_down_packed, const void* const* d_down_scale,
+    float gate_s2, float up_s2, float down_s2, float* out);
+// FP8 W8A16 device-resident per-rank GEMM (mirror of runT_fp4): each rank's
+// resident per-channel fp8 packed + f32 per-output-column scale read in-kernel;
+// no host decode, no f32 slice upload.
+extern "C" int vt_cuda_mlp_shard_runT_fp8w(
+    int O, int H, int I, int64_t T, const float* x,
+    const void* const* d_gate_packed, const float* const* d_gate_scale,
+    const void* const* d_up_packed, const float* const* d_up_scale,
+    const void* const* d_down_packed, const float* const* d_down_scale,
+    float* out);
 extern "C" int vt_cuda_mlp_shard_run_bf16(int O, int H, int I, const uint16_t* x16,
                                            const uint16_t* gu16, const uint16_t* dn16,
                                            float* out);
@@ -7851,32 +7868,173 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     // Host-decode (or bf16->f32) the resident gate/up/down into the shard's
     // gate/up [I,H] + down [O,I] layout (O = H = hidden width). The decode is
     // per-row independent and therefore row-parallel (see vt_host_decode).
-    std::vector<float> gate_host((size_t)I * (size_t)H);
-    std::vector<float> up_host((size_t)I * (size_t)H);
-    std::vector<float> down_host((size_t)H * (size_t)I);
-    if (fp4) {
-      // Decoder demands a per-row scale2 array (indexed by n); the resident
-      // Nvfp4Weight holds a single per-tensor scalar, so broadcast it per row.
-      const auto row_scales = [](const Nvfp4Weight& wn) {
-        std::vector<float> s(static_cast<size_t>(wn.n), wn.scale2);
-        return s;
-      };
-      const auto dec = [&](const Nvfp4Weight& wn, std::vector<float>& dst,
-                           int n_rows, int n_k) {
-        std::vector<float> s2 = row_scales(wn);
-        return vt_host_decode_nvfp4_f32(n_rows, n_k, wn.packed.bytes.data(),
-                                         wn.scale.bytes.data(), s2.data(), dst.data());
-      };
-      if (dec(w.gate_proj_fp4, gate_host, (int)I, (int)H) != 0 ||
-          dec(w.up_proj_fp4, up_host, (int)I, (int)H) != 0 ||
-          dec(w.down_proj_fp4, down_host, (int)H, (int)I) != 0)
-        throw std::runtime_error("qwen3_5 dense MLP: tp>1 fp4 host-decode failed");
-    } else if (fp8w) {
+    // LAZY (empty here): the full gate/up/down f32 slices total ~1.2 GB at 27B
+    // dims (I*H + I*H + H*I floats) and allocating + zeroing them EVERY layer —
+    // even on the M-B3 fp4_device fast path where they are unused — measured
+    // ~340 ms/layer (the tp>1 per-step wall once the NCCL and attention churn
+    // were removed). Sized only where actually consumed below (the host-decode
+    // fallback); the fp8w arm overwrites them with its own fresh vectors.
+    std::vector<float> gate_host, up_host, down_host;
+    // M-B3 device-resident fp4 fast path state (used by the batched compute
+    // below): true + resident pointers => runT_fp4 (in-kernel dequant GEMM);
+    // else the host-decode runT path. See the fp4 arm for the build.
+    bool fp4_device = false;
+    std::vector<const void*> gpkp_, gscp_, upkp_, uscp_, dpkp_, dscp_;
+    // fp8w device-resident state (mirror of fp4): per-rank resident fp8 packed
+    // + f32 per-output-column scale device pointers; fp8w_device => the batch
+    // routes through vt_cuda_mlp_shard_runT_fp8w (in-kernel W8A16 GEMM).
+    bool fp8w_device = false;
+    std::vector<const void*> g8p_, u8p_, d8p_;
+    std::vector<const float*> g8s_, u8s_, d8s_;
+    if (fp4 || fp8w) {
+      const int W = tp->tp_size();
+      // M-B3: device-resident per-rank fp4 GEMM. Each rank's resident fp4
+      // slice (M-B1b d_packed_pd) is read IN the GEMM kernel (in-kernel
+      // E2M1 x fp8-e4m3 group-scale x per-tensor scale2 dequant), removing the
+      // host decode + f32 slice upload — the ~5 s/layer host decode is the
+      // tp>1 per-step wall at 27B dims. Token-exact to the host-decode runT
+      // path (proven model-free by vt_cuda_mlp_shard_runT_fp4_selfcheck). If
+      // lane residency cannot be established, fall back to the host decode
+      // below; a built kernel failure is a real bug and faults loudly.
+      if (fp4) {
+        auto fp4_resident_missing = [&](const Nvfp4Weight& wn) {
+          if (!wn.d_packed || !wn.d_scale) return true;
+          return wn.d_packed_pd.size() < (size_t)(W - 1);
+        };
+        std::atomic<int> build_bad{0};
+        fp4_device = !fp4_resident_missing(w.gate_proj_fp4) &&
+                     !fp4_resident_missing(w.up_proj_fp4) &&
+                     !fp4_resident_missing(w.down_proj_fp4);
+        if (!fp4_device) {
+          // One-time lazy per-lane fp4 residency build (thread-per-lane, each
+          // on its own device). The gate/up/down slots persist (M-B1b maps), so
+          // later steps skip the build entirely.
+          {
+            std::vector<std::thread> th;
+            for (int r = 0; r < W; ++r)
+              th.emplace_back([&, r]() {
+                cudaStream_t s = nullptr;
+                if (cudaSetDevice(r) != cudaSuccess ||
+                    cudaStreamCreate(&s) != cudaSuccess) {
+                  build_bad.store(1, std::memory_order_relaxed);
+                  return;
+                }
+                const vt::Device vdev{vt::DeviceType::kCUDA, r};
+                vt::Queue q{vdev, s};
+                Dev dr{vt::GetBackend(vdev), q};
+                (void)ResidentNvfp4(dr, w.gate_proj_fp4);
+                (void)ResidentNvfp4(dr, w.up_proj_fp4);
+                (void)ResidentNvfp4(dr, w.down_proj_fp4);
+                cudaStreamDestroy(s);
+              });
+            for (auto& t : th) t.join();
+          }
+          fp4_device = !build_bad.load() &&
+                       !fp4_resident_missing(w.gate_proj_fp4) &&
+                       !fp4_resident_missing(w.up_proj_fp4) &&
+                       !fp4_resident_missing(w.down_proj_fp4);
+        }
+        if (fp4_device) {
+          const auto resid_ptr = [](const Nvfp4Weight& wn, int r, bool scale) {
+            if (r == 0)
+              return scale ? wn.d_scale.get() : wn.d_packed.get();
+            const auto& m = scale ? wn.d_scale_pd : wn.d_packed_pd;
+            const auto it = m.find(r);
+            return it == m.end() ? nullptr : it->second.get();
+          };
+          gpkp_.resize((size_t)W); gscp_.resize((size_t)W);
+          upkp_.resize((size_t)W); uscp_.resize((size_t)W);
+          dpkp_.resize((size_t)W); dscp_.resize((size_t)W);
+          for (int r = 0; r < W; ++r) {
+            gpkp_[(size_t)r] = resid_ptr(w.gate_proj_fp4, r, false);
+            gscp_[(size_t)r] = resid_ptr(w.gate_proj_fp4, r, true);
+            upkp_[(size_t)r] = resid_ptr(w.up_proj_fp4, r, false);
+            uscp_[(size_t)r] = resid_ptr(w.up_proj_fp4, r, true);
+            dpkp_[(size_t)r] = resid_ptr(w.down_proj_fp4, r, false);
+            dscp_[(size_t)r] = resid_ptr(w.down_proj_fp4, r, true);
+            if (!gpkp_[(size_t)r] || !gscp_[(size_t)r] || !upkp_[(size_t)r] ||
+                !uscp_[(size_t)r] || !dpkp_[(size_t)r] || !dscp_[(size_t)r])
+              fp4_device = false;
+          }
+        }
+      }
+      if (fp4 && !fp4_device) {
+        // Host-decode fallback (the pre-M-B3 tp>1 path). Decoder demands a
+        // per-row scale2 array (indexed by n); the resident Nvfp4Weight holds a
+        // single per-tensor scalar, so broadcast it per row.
+        gate_host.resize((size_t)I * (size_t)H);
+        up_host.resize((size_t)I * (size_t)H);
+        down_host.resize((size_t)H * (size_t)I);
+        const auto row_scales = [](const Nvfp4Weight& wn) {
+          std::vector<float> s(static_cast<size_t>(wn.n), wn.scale2);
+          return s;
+        };
+        const auto dec = [&](const Nvfp4Weight& wn, std::vector<float>& dst,
+                             int n_rows, int n_k) {
+          std::vector<float> s2 = row_scales(wn);
+          return vt_host_decode_nvfp4_f32(n_rows, n_k, wn.packed.bytes.data(),
+                                           wn.scale.bytes.data(), s2.data(), dst.data());
+        };
+        if (dec(w.gate_proj_fp4, gate_host, (int)I, (int)H) != 0 ||
+            dec(w.up_proj_fp4, up_host, (int)I, (int)H) != 0 ||
+            dec(w.down_proj_fp4, down_host, (int)H, (int)I) != 0)
+          throw std::runtime_error("qwen3_5 dense MLP: tp>1 fp4 host-decode failed");
+      } else if (fp8w) {
       // Per-channel FP8 W8A16 MLP: the keep-quant resident (raw fp8-e4m3fn
       // bytes [n,k] + f32 [n] per-output-column scale) is on device (host
-      // pages released by StageAndReleaseKeepFp8w), so D2H it and dequant to
-      // the f32 [out,in] shard layout. Identical math to vt::MatmulFp8W8a16's
-      // out[m,n] = Σ_k bf16(act)·fp8(w)·scale[n] when act is f32-exact.
+      // pages stay resident for the lane build below, mirroring fp4). Device-resident per-rank
+      // fast path (mirror of M-B3 fp4): upload each lane's FULL resident fp8
+      // packed + f32 scales on ITS device once (lazy; ResidentWeight caches per
+      // device slot), then the batch routes through runT_fp8w (in-kernel
+      // W8A16 GEMM, no bf16 rounding — byte-identical to the host decode
+      // below). Missing lane residency falls back to the host decode.
+      const auto fp8w_resident_missing = [&](const Fp8PerChannelWeight& wl) {
+        return wl.packed.Empty() || wl.scale.Empty();
+      };
+      if (!fp8w_resident_missing(w.gate_proj_fp8w) &&
+          !fp8w_resident_missing(w.up_proj_fp8w) &&
+          !fp8w_resident_missing(w.down_proj_fp8w)) {
+        std::atomic<int> build_bad{0};
+        std::vector<const void*> gp((size_t)W), up((size_t)W), dp((size_t)W);
+        std::vector<const float*> gs((size_t)W), us((size_t)W), ds((size_t)W);
+        {
+          std::vector<std::thread> th;
+          for (int r = 0; r < W; ++r)
+            th.emplace_back([&, r]() {
+              cudaStream_t s = nullptr;
+              if (cudaSetDevice(r) != cudaSuccess ||
+                  cudaStreamCreate(&s) != cudaSuccess) {
+                build_bad.store(1, std::memory_order_relaxed);
+                return;
+              }
+              const vt::Device vdev{vt::DeviceType::kCUDA, r};
+              vt::Queue q{vdev, s};
+              Dev dr{vt::GetBackend(vdev), q};
+              gp[(size_t)r] = ResidentWeight(dr, w.gate_proj_fp8w.packed).data;
+              gs[(size_t)r] =
+                  (const float*)ResidentWeight(dr, w.gate_proj_fp8w.scale).data;
+              up[(size_t)r] = ResidentWeight(dr, w.up_proj_fp8w.packed).data;
+              us[(size_t)r] =
+                  (const float*)ResidentWeight(dr, w.up_proj_fp8w.scale).data;
+              dp[(size_t)r] = ResidentWeight(dr, w.down_proj_fp8w.packed).data;
+              ds[(size_t)r] =
+                  (const float*)ResidentWeight(dr, w.down_proj_fp8w.scale).data;
+              cudaStreamDestroy(s);
+            });
+          for (auto& t : th) t.join();
+        }
+        fp8w_device = !build_bad.load();
+        for (int r = 0; r < W; ++r)
+          if (!gp[(size_t)r] || !gs[(size_t)r] || !up[(size_t)r] ||
+              !us[(size_t)r] || !dp[(size_t)r] || !ds[(size_t)r])
+            fp8w_device = false;
+        if (fp8w_device) {
+          g8p_ = std::move(gp); g8s_ = std::move(gs);
+          u8p_ = std::move(up); u8s_ = std::move(us);
+          d8p_ = std::move(dp); d8s_ = std::move(ds);
+        }
+      }
+      if (!fp8w_device) {
       const auto fp8w_host = [&](const Fp8PerChannelWeight& wl, int n_rows,
                                  int n_k) {
         const Tensor pk = ResidentWeight(d, wl.packed);  // i8 [n,k]
@@ -7912,6 +8070,8 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
       gate_host = fp8w_host(w.gate_proj_fp8w, (int)I, (int)H);
       up_host = fp8w_host(w.up_proj_fp8w, (int)I, (int)H);
       down_host = fp8w_host(w.down_proj_fp8w, (int)H, (int)I);
+      }
+    }
     }
     // The reduced [O] is authoritative on group rank 0 (shard's AllReduce). Copy
     // the device hidden D2H, run the sharded MLP per token, write the reduced
@@ -7932,15 +8092,50 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
         for (int64_t h = 0; h < H; ++h)
           xf[(size_t)(t * H + h)] = vt::BF16ToF32(hid[(size_t)(t * H + h)]);
       std::vector<float> of((size_t)(T * H));
-      const int rct = vt_cuda_mlp_shard_runT((int)H, (int)H, (int)I, T,
-                                             xf.data(), gate_host.data(),
-                                             up_host.data(), down_host.data(),
-                                             of.data());
-      if (rct == 2)
-        throw std::runtime_error(
-            "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
-      if (rct != 0)
-        throw std::runtime_error("qwen3_5 dense MLP: tp>1 batched shard failed");
+      if (fp4_device) {
+        // M-B3: device-resident per-rank fp4 GEMM — no host decode, no f32
+        // slice upload; each rank reads its resident fp4 slice in-kernel.
+        const int rcf = vt_cuda_mlp_shard_runT_fp4(
+            (int)H, (int)H, (int)I, T, xf.data(), gpkp_.data(), gscp_.data(),
+            upkp_.data(), uscp_.data(), dpkp_.data(), dscp_.data(),
+            w.gate_proj_fp4.scale2, w.up_proj_fp4.scale2,
+            w.down_proj_fp4.scale2, of.data());
+        if (rcf == 2)
+          throw std::runtime_error(
+              "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
+        if (rcf != 0)
+          throw std::runtime_error(
+              "qwen3_5 dense MLP: tp>1 fp4 device shard failed");
+      } else if (fp8w_device) {
+        // FP8 W8A16 device-resident per-rank GEMM — no host decode, no f32
+        // slice upload; each rank reads its resident fp8 packed + f32 scales
+        // in-kernel (byte-identical to the host decode: out[n,k] = F8(w[n,k]) *
+        // scale[n], no bf16 rounding).
+        if (std::getenv("VT_TP_DIAG") != nullptr) {
+          fprintf(stderr, "[tp] dense MLP fp8w DEVICE path T=%lld layer\n",
+                  (long long)T);
+          fflush(stderr);
+        }
+        const int rcf8 = vt_cuda_mlp_shard_runT_fp8w(
+            (int)H, (int)H, (int)I, T, xf.data(), g8p_.data(), g8s_.data(),
+            u8p_.data(), u8s_.data(), d8p_.data(), d8s_.data(), of.data());
+        if (rcf8 == 2)
+          throw std::runtime_error(
+              "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
+        if (rcf8 != 0)
+          throw std::runtime_error(
+              "qwen3_5 dense MLP: tp>1 fp8w device shard failed");
+      } else {
+        const int rct = vt_cuda_mlp_shard_runT((int)H, (int)H, (int)I, T,
+                                               xf.data(), gate_host.data(),
+                                               up_host.data(), down_host.data(),
+                                               of.data());
+        if (rct == 2)
+          throw std::runtime_error(
+              "qwen3_5 dense MLP: tp>1 requires >=2 GPUs (fault loudly)");
+        if (rct != 0)
+          throw std::runtime_error("qwen3_5 dense MLP: tp>1 batched shard failed");
+      }
       for (int64_t t = 0; t < T; ++t) {
         auto* row16 = reinterpret_cast<uint16_t*>(host.data() + (size_t)(t * H * 2));
         for (int64_t h = 0; h < H; ++h)

@@ -169,6 +169,26 @@ TEST_CASE("mlp_shard_runT (batched T-token) matches the host MLP reference for e
   for (int t=0;t<T;++t) for (int o=0;o<O;++o){ double a=0.0;for(int i=0;i<I;++i){float g=0,u=0;for(int k=0;k<H;++k){g+=x[(size_t)t*H+k]*gate[i*H+k];u+=x[(size_t)t*H+k]*up[i*H+k];}float sg=1.f/(1.f+std::exp(-(double)g));a+=(double)((g*sg)*u)*down[o*I+i];} CHECK(out[(size_t)t*O+o]==doctest::Approx((float)a).epsilon(5e-4));}
 }
 
+extern "C" int vt_cuda_mlp_shard_runT_fp4_selfcheck(void);
+TEST_CASE("M-B3: device-resident per-rank fp4 GEMM == host-decode runT (token-exact)") {
+  const int rc = vt_cuda_mlp_shard_runT_fp4_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 GPUs (or NCCL unbuilt); fp4 device shard skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
+extern "C" int vt_cuda_mlp_shard_runT_fp8w_selfcheck(void);
+TEST_CASE("W5-fp8w: device-resident per-rank fp8 W8A16 GEMM == host-decode runT (token-exact)") {
+  const int rc = vt_cuda_mlp_shard_runT_fp8w_selfcheck();
+  if (rc == 2) {
+    MESSAGE("fewer than 2 GPUs (or NCCL unbuilt); fp8w device shard skipped");
+    return;
+  }
+  CHECK(rc == 0);
+}
+
 extern "C" int vt_host_decode_nvfp4_f32(int N,int K,const uint8_t* packed,const uint8_t* scale8,const float* scale2,float* out);
 TEST_CASE("host NVFP4 decode reproduces the fp4 layout (known nibbles + e4m3 scale)") {
   constexpr int N=1,K=16;

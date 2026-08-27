@@ -165,6 +165,111 @@ tp2 decode is host-memory-bound at this arity: ~1727 s for the 10-token/11-step
 generation after ~55 s boot (parallelized host decode; device-quantized shard
 kernel remains the serving-speed path, TP_PLAN M-B).
 
+## M-B3 outcome (measured 2026-08-26, device-resident per-rank fp4 GEMM)
+
+M-B3 replaced the tp>1 fp4 host-decode MLP shard with per-rank device-resident
+fp4 GEMM. Verified end-to-end on 2× V100 (CARDS 0,1, `VT_TP_ALLOW=1`,
+`--tensor-parallel-size 2`, snapshot `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`):
+
+- **What changed**: `DenseMlpBlock` tp>1 fp4 branch lazily builds per-lane
+  fp4 residency (`ResidentNvfp4` on each lane device, thread-per-lane) and, when
+  every lane slot is resident, routes the batch through
+  `vt_cuda_mlp_shard_runT_fp4` — in-kernel E2M1 × fp8-e4m3 group-scale ×
+  per-tensor scale2 dequant, same `MlpGuAct`/`MlpDown` block-per-row scheduling
+  and reduction order as the host `runT`, one AllReduceSum over [O]. Missing
+  lane residency falls back to the host-decode `runT`; a built-kernel failure
+  (rc!=0/2) faults loudly. The wrapper keeps one stream + dx/dact/dout buffer
+  per rank across the 64 per-layer calls (process-lifetime `static` cache) —
+  the per-call `cudaMalloc`/`cudaStreamCreate` churn alone hid the MLP cost.
+- **Correctness**: model-free selfcheck `vt_cuda_mlp_shard_runT_fp4_selfcheck`
+  (synthetic fp4 bytes, both nibbles + sign, device kernel vs host-decode +
+  `runT` reference, tolerance 1e-3) passes on 2 GPU; full `test_nccl_group`
+  20/20 green (197,529 assertions). Real serve G5: tp2 output
+  `" Paris.\nThe capital of Germany is Berlin."`, `completion_tokens:10`,
+  `prompt_tokens:5`, `finish:length` — **byte-identical** to the runT G5 green
+  body above (the certified tp2==tp1 baseline). The M-B3 device path is
+  token-exact at real 27B dims.
+- **Wall**: host fp4 decode was ~5 s/layer; the M-B3 fused MLP is ~1.7 ms/layer
+  decode (64 layers ≈ 0.11 s/step). Step wall dropped from ~130–170 s to
+  ~43 s/step.
+- **Residual (still open, next M-B follow-ups)**: the ~43 s/step wall is now
+  bound by the tp>1 attention shard and per-layer host syncs, not the MLP —
+  GPU idles at ~0% during decode, and per-layer MLP measures 1.7 ms. This
+  matches the known deferred attention work; it is outside M-B3's scope and
+  remains a tracked gap. The fp8w tail-MLP host shard (layers 56–63) is a
+  separate deferred device-fp8w-GEMM follow-up; in this serve run every fp4 arm
+  engaged (no fp8w layer executed).
+- **Decisions kept**: token-exactness preserved by mirroring the host
+  `runT` reduction order and using the exact host decoder math in kernel
+  (`ldexpf` E2M1, `__float2bfloat16` RNE, per-tensor scalar `scale2`); a simple
+  global-x-reload per block is accepted (weight bytes dominate, proven by the
+  1.7 ms/layer result); `scale2` stays one scalar per weight, matching the host
+  per-row broadcast.
+
+## Attention-wall outcome (measured 2026-08-26, TP>1 step wall)
+
+After M-B3 the ~43 s/step wall was eliminated in three ordered fixes, each
+isolated by exhaustive per-stage timing before a change. Token-exact.
+
+- **Fix 1 — attention NCCL per-call churn (nccl_communicator.cu).** The
+  tp>1 attention shard created and destroyed an NCCL comm group per layer
+  (`ncclCommInitAll` + `ncclCommDestroy`), measuring ~520–550 ms/layer in
+  `vt_cuda_attn_kv_shard_paged_run`. Moving to a process-lifetime retained
+  `static CudaCommGroup` (mirroring the M-B3 runT_fp4 wrapper) dropped it to
+  ~2.6–3.4 ms/layer. Measured by ATTIN-DIAG (`pre_ms=0.0 q_ms=1.3 kv_ms=0.0
+  prim_ms=1.4 copy_ms=0.0 total_ms=2.6`).
+- **Fix 2 — MLP fp4 lazy host vectors (qwen3_5.cpp DenseMlpBlock).** An
+  earlier "MLP = 1.7 ms/layer" figure was wrong: it measured only the wrapper
+  internals, missing `DenseMlpBlock`'s host round-trip. The remaining wall was
+  three unconditional `std::vector<float> gate_host/up_host/down_host`
+  declarations at the block top, sized `I*H + I*H + H*I` (~1.2 GB at 27B dims)
+  and zero-allocated every layer even on the fp4_device path where unused
+  (~340 ms/layer); the fp8w arm wasted the same (it overwrote them with its own
+  fresh vectors). The vectors are now empty at declaration and `resize`d only
+  inside the host-decode fallback. MLP fp4 fast path: ~340 ms → ~3 ms/layer, and
+  the fp8w arm shed the same ~340 ms/layer of idle zeroing.
+- **Correctness**: after both fixes the clean binary passes full
+  `test_nccl_group` 20/20 (197,529 assertions, unchanged from baseline) on
+  GPUs 2,3, and the real TP2 serve output is byte-identical to the certified
+  tp2==tp1 baseline (`" Paris.\nThe capital of Germany is Berlin."`, finish
+  `length`).
+- **Residual (open gap)**: the remaining per-step time is dominated by the
+  8 fp8w tail layers (56–63), which measured ~1600–1780 ms/layer during the
+  diagnosis (pre-lazy-fix); the lazy-alloc fix removes ~340 ms/layer of that,
+  giving ~1.35–1.45 s/layer × 8 ≈ 10.8–11.6 s — consistent with the observed
+  whole-request wall (~105 s incl. server startup for a 5-token prompt + 10
+  tokens). This is the fp8w host-dequantize shard, a separate deferred
+  device-fp8w-GEMM follow-up (mirrors M-B3), and is outside this wave. The
+  56 fp4 layers now run ~0.02 s/step combined.
+
+## fp8w outcome (measured 2026-08-27, device-resident per-rank fp8w W8A16 GEMM)
+
+The deferred fp8w tail layers (56–63) now run device-resident per-rank, mirroring
+M-B3. Verified end-to-end on 2× V100 (CARDS 0,1, `VT_TP_ALLOW=1`,
+`--tensor-parallel-size 2`, snapshot
+`7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`):
+
+- **What changed**: `StageAndReleaseKeepFp8w` is renamed `StageKeepFp8wResident`
+  and no longer releases the fp8w tail host pages. The eager `d_dev` is set at
+  load, which the release would free; the tp>1 lane build reads `w.bytes`
+  (host) to upload each lane's copy at FIRST forward in `DenseMlpBlock`, so
+  freeing those pages made lane>0 copy freed bytes and spin (the G5 hang this
+  wave caught: two `R`-state thread-per-lane build threads, GPU at 0%). Keeping
+  fp8w host resident matches the fp4 arm's memory posture (fp4 host is never
+  released because its `d_dev` is set only at first forward). A `runT_fp8w`
+  extern plus `MlpGuActFp8w`/`MlpDownFp8w` dispatch stages the raw fp8 packed +
+  per-column f32 scale and runs the W8A16 GEMM on the device.
+- **Correctness**: model-free selfcheck `vt_cuda_mlp_shard_runT_fp8w_selfcheck`
+  passes on 2 GPU (G1); full `test_nccl_group` 21/21 green (197,530
+  assertions). Real serve G5: tp2 output byte-identical to the certified
+  tp2==tp1 baseline (`" Paris.\nThe capital of Germany is Berlin."`,
+  `completion_tokens:10`), with `fp8w DEVICE` markers printed for layers
+  56–63 at both T=5 (prefill) and T=1 (decode) — proving `runT_fp8w` executes.
+- **Decisions kept**: fp8w host pages stay resident (only 8 layers, small;
+  needed by the host-decode fallback too) rather than pre-staging all lane
+  `d_dev_pd` slots, preserving the first-latency design intent and the
+  selfcheck (which exercises the pre-staged upload, not the lane build).
+
 ## Design confirmed 2026-08-25 (reconnaissance completed; architecture verified)
 
 The per-lane wiring shape is now code-anchored, not speculative:

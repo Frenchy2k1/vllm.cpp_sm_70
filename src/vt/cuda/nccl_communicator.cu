@@ -989,6 +989,621 @@ extern "C" int vt_cuda_mlp_shard_runT(int O, int H, int I, int64_t T,
   return bad.load();
 }
 
+// ---------------------------------------------------------------------------
+// M-B3 device-resident per-rank fp4 GEMM (TP_PLAN M-B3). Kills the tp>1 MLP
+// per-step wall: the OLD host path (vt_host_decode_nvfp4_f32 + compact-slice
+// upload into runT) decoded gate/up/down to f32 on the HOST every step
+// (~5 s/layer x 64 layers ~= 130-170 s/step at 27B dims), then re-uploaded the
+// f32. This path reads each rank's OWN resident fp4 slice (M-B1b per-device
+// residency: packed i8 [N,K/2] + fp8 scale i8 [N,K/16] + per-tensor scale2)
+// directly IN the GEMM kernel, dequantizing to f32 on the fly — no f32
+// materialization (which is 4x the fp4 bytes, so an intermediate f32 decode,
+// host or device, cannot beat bandwidth). Math is byte-identical to runT /
+// the host decoder: the same E2M1 nibble x fp8-e4m3 group scale x per-tensor
+// scale2, RNE-rounded to bf16 then back, accumulated f32 in the exact same
+// MlpGuAct/MlpDown loop order, one group AllReduceSum over [O].
+__device__ __forceinline__ float DevF8E4M3ToF32(uint8_t byte) {
+  const int sign = (byte >> 7) & 1, exp = (byte >> 3) & 0xFu, mant = byte & 0x7u;
+  const float s = sign ? -1.0f : 1.0f;
+  if (exp == 0xFu && mant == 0x7u) return nanf("");
+  if (exp == 0u) return s * (static_cast<float>(mant) / 512.0f);
+  return s * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
+}
+// Mirrors HostRoundBf16 == __bfloat162float(__float2bfloat16(v)).
+__device__ __forceinline__ float DevRoundBf16(float v) {
+  return __bfloat162float(__float2bfloat16(v));
+}
+__device__ constexpr float kDevE2M1[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                                          2.0f, 3.0f, 4.0f, 6.0f};
+__device__ __forceinline__ float DevDecodeFp4Nibble(int nib, float gs) {
+  return DevRoundBf16(kDevE2M1[nib & 7] * ((nib & 8) ? -1.0f : 1.0f) * gs);
+}
+
+// gate/up fused fp4 GEMM (M-B3). Same shape/scheduling as MlpGuAct: one block
+// per intermediate row, threads reduce over H coalesced, gv/uv smem tree —
+// but gate/up are read from the RESIDENT fp4 packed/scale bytes (rows
+// [i0, i0+per)) and dequantized in-kernel. Decode byte-index matches the host
+// decoder: element k is the LOW nibble of packed[k>>1] when k is even, the
+// HIGH nibble when k is odd; scale byte k>>4, group 16.
+__global__ void MlpGuActFp4(const uint8_t* g_packed, const uint8_t* g_scale,
+                            const uint8_t* u_packed, const uint8_t* u_scale,
+                            float g_s2, float u_s2, const float* x, float* act,
+                            int H, int per, int i0, int halves, int groups) {
+  __shared__ float smem[512];  // 2 * NT scratch (NT=256)
+  const int i = blockIdx.x;
+  if (i >= per) return;
+  const int row = i0 + i;
+  const int tid = threadIdx.x;
+  const int NT = blockDim.x;
+  const uint8_t* gp = g_packed + (size_t)row * halves;
+  const uint8_t* gs = g_scale + (size_t)row * groups;
+  const uint8_t* up = u_packed + (size_t)row * halves;
+  const uint8_t* us = u_scale + (size_t)row * groups;
+  float gv = 0.f, uv = 0.f;
+  for (int k = tid; k < H; k += NT) {
+    const uint8_t gb = gp[k >> 1];
+    const uint8_t ub = up[k >> 1];
+    const float gg = g_s2 * DevF8E4M3ToF32(gs[k >> 4]);
+    const float ug = u_s2 * DevF8E4M3ToF32(us[k >> 4]);
+    const float gval = (k & 1) ? DevDecodeFp4Nibble(gb >> 4, gg)
+                               : DevDecodeFp4Nibble(gb & 0xFu, gg);
+    const float uval = (k & 1) ? DevDecodeFp4Nibble(ub >> 4, ug)
+                               : DevDecodeFp4Nibble(ub & 0xFu, ug);
+    gv += x[k] * gval;
+    uv += x[k] * uval;
+  }
+  smem[tid] = gv; smem[NT + tid] = uv;
+  __syncthreads();
+  for (int s = NT / 2; s > 0; s >>= 1) {
+    if (tid < s) { smem[tid] += smem[tid + s]; smem[NT + tid] += smem[NT + tid + s]; }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const float s = 1.f / (1.f + __expf(-smem[0]));
+    act[i] = (smem[0] * s) * smem[NT];
+  }
+}
+
+// down fp4 GEMM (M-B3). Same shape/scheduling as MlpDown (one block per output
+// row, threads reduce coalesced over the per-rank intermediate slice) but the
+// down slice is read from the RESIDENT fp4 [O,I] packed/scale COLUMN slice
+// [i0, i0+per): out[o] = sum_{q<per} decode(down[o, i0+q]) * act[q].
+__global__ void MlpDownFp4(const uint8_t* d_packed, const uint8_t* d_scale,
+                           float d_s2, const float* act, float* out, int per,
+                           int O, int i0, int di_halves, int di_groups) {
+  __shared__ float smem[256];
+  const int o = blockIdx.x;
+  if (o >= O) return;
+  const int tid = threadIdx.x;
+  const int NT = blockDim.x;
+  const uint8_t* p = d_packed + (size_t)o * di_halves;
+  const uint8_t* s = d_scale + (size_t)o * di_groups;
+  float acc = 0.f;
+  for (int q = tid; q < per; q += NT) {
+    const int col = i0 + q;
+    const uint8_t b = p[col >> 1];
+    const float gs = d_s2 * DevF8E4M3ToF32(s[col >> 4]);
+    const int nib = (col & 1) ? (b >> 4) : (b & 0xFu);
+    acc += DevDecodeFp4Nibble(nib, gs) * act[q];
+  }
+  smem[tid] = acc;
+  __syncthreads();
+  for (int s = NT / 2; s > 0; s >>= 1) {
+    if (tid < s) smem[tid] += smem[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) out[o] = smem[0];
+}
+
+// FP8 W8A16 (keep-quant) MLP GEMMs — the tp>1 fp8w analogue of MlpGuActFp4 /
+// MlpDownFp4. Same shape/scheduling as MlpGuAct/MlpDown, but the resident
+// fp8 e4m3fn bytes [n,k] dequantize by the per-output-column f32 scale only
+// (Fp8PerChannelWeight: no group scale, no scale2 — the host fp8w arm computes
+// `out[n,k] = F8E4M3ToF32(w[n,k]) * scale[n]` exactly, NO bf16 rounding). Each
+// rank holds the full resident gate/up [I,H] + down [O,I] + scales on ITS
+// device and reads only its intermediate-column slice [i0, i0+per).
+__global__ void MlpGuActFp8w(const uint8_t* g_packed, const float* g_scale,
+                             const uint8_t* u_packed, const float* u_scale,
+                             const float* x, float* act, int H, int per, int i0) {
+  __shared__ float smem[512];  // 2 * NT scratch (NT=256)
+  const int i = blockIdx.x;
+  if (i >= per) return;
+  const int row = i0 + i;
+  const int tid = threadIdx.x;
+  const int NT = blockDim.x;
+  const uint8_t* gp = g_packed + (size_t)row * H;
+  const uint8_t* up = u_packed + (size_t)row * H;
+  const float gs = g_scale[row], us = u_scale[row];
+  float gv = 0.f, uv = 0.f;
+  for (int k = tid; k < H; k += NT) {
+    gv += x[k] * (DevF8E4M3ToF32(gp[k]) * gs);
+    uv += x[k] * (DevF8E4M3ToF32(up[k]) * us);
+  }
+  smem[tid] = gv; smem[NT + tid] = uv;
+  __syncthreads();
+  for (int s = NT / 2; s > 0; s >>= 1) {
+    if (tid < s) { smem[tid] += smem[tid + s]; smem[NT + tid] += smem[NT + tid + s]; }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const float s = 1.f / (1.f + __expf(-smem[0]));
+    act[i] = (smem[0] * s) * smem[NT];
+  }
+}
+__global__ void MlpDownFp8w(const uint8_t* d_packed, const float* d_scale,
+                            const float* act, float* out, int I, int per,
+                            int O, int i0) {
+  __shared__ float smem[256];
+  const int o = blockIdx.x;
+  if (o >= O) return;
+  const int tid = threadIdx.x;
+  const int NT = blockDim.x;
+  const uint8_t* p = d_packed + (size_t)o * I;
+  const float s = d_scale[o];
+  float acc = 0.f;
+  for (int q = tid; q < per; q += NT) {
+    const int col = i0 + q;
+    acc += (DevF8E4M3ToF32(p[col]) * s) * act[q];
+  }
+  smem[tid] = acc;
+  __syncthreads();
+  for (int st = NT / 2; st > 0; st >>= 1) {
+    if (tid < st) smem[tid] += smem[tid + st];
+    __syncthreads();
+  }
+  if (tid == 0) out[o] = smem[0];
+}
+// Mirrors runT's structure (process-lifetime group, per-rank threads,
+// AllReduce [O], reduced result on rank 0) but reads each rank's RESIDENT
+// fp4 slice in-kernel — no host decode, no f32 slice build/upload. The caller
+// passes per-rank DEVICE pointers (indexed by rank r, allocated on device r)
+// to the resident gate/up/down packed+scale plus the three per-tensor scale2
+// scalars (Nvfp4Weight::scale2 is a scalar broadcast per row by the host
+// decoder, so the kernel folds the same single value). x [T,H] and out [T,O]
+// are host f32 arrays as in runT. Returns 0 parity, 1 (dims/alloc), 2 (<2
+// GPUs or NCCL unbuilt).
+extern "C" int vt_cuda_mlp_shard_runT_fp4(
+    int O, int H, int I, int64_t T, const float* x,
+    const void* const* d_gate_packed, const void* const* d_gate_scale,
+    const void* const* d_up_packed, const void* const* d_up_scale,
+    const void* const* d_down_packed, const void* const* d_down_scale,
+    float gate_s2, float up_s2, float down_s2, float* out) {
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
+  if (O <= 0 || H <= 0 || I <= 0 || T <= 0 || H % 16 != 0 || I % 16 != 0)
+    return 1;
+  static vt::CudaCommGroup* sgroup = vt::CudaCommGroup::Create();
+  if (!sgroup) return 2;
+  const int W = sgroup->world_size();
+  if (I % W != 0) return 1;
+  const int64_t per = I / W;
+  const int halves = H / 2, groups = H / 16;
+  const int di_halves = I / 2, di_groups = I / 16;
+
+  std::atomic<int> bad{0};
+  // Process-lifetime per-rank stream + device buffers, reused across the 64
+  // per-layer calls in a step (DenseMlpBlock calls the wrapper once per layer,
+  // serially, so no two calls overlap). Eliminates the per-call cudaMalloc /
+  // cudaStreamCreate / cudaFree churn that dominated the tp>1 step wall.
+  struct RankBuf {
+    cudaStream_t st = nullptr;
+    float *dx = nullptr, *dact = nullptr, *dout = nullptr;
+    size_t H = 0, per = 0, O = 0;
+  };
+  static std::vector<RankBuf> rbuf;
+  static std::once_flag rbuf_once;
+  std::call_once(rbuf_once, [&] { rbuf.resize((size_t)W); });
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      RankBuf& b = rbuf[(size_t)r];
+      if (b.H != (size_t)H || b.per != (size_t)per || b.O != (size_t)O) {
+        if (b.st) cudaStreamDestroy(b.st);
+        if (b.dx) cudaFree(b.dx);
+        if (b.dact) cudaFree(b.dact);
+        if (b.dout) cudaFree(b.dout);
+        b = RankBuf{};
+        if (cudaStreamCreate(&b.st) != cudaSuccess ||
+            cudaMalloc(&b.dx, (size_t)H * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.dact, (size_t)per * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.dout, (size_t)O * sizeof(float)) != cudaSuccess) {
+          bad.store(1, std::memory_order_relaxed);
+          if (b.dx) cudaFree(b.dx);
+          if (b.dact) cudaFree(b.dact);
+          if (b.dout) cudaFree(b.dout);
+          if (b.st) { cudaStreamDestroy(b.st); b.st = nullptr; }
+          b.dx = b.dact = b.dout = nullptr;
+          return;
+        }
+        b.H = (size_t)H; b.per = (size_t)per; b.O = (size_t)O;
+      }
+      cudaStream_t st = b.st;
+      float* dx = b.dx; float* dact = b.dact; float* dout = b.dout;
+      for (int64_t t = 0; t < T; ++t) {
+        if (bad.load(std::memory_order_relaxed)) return;
+        cudaMemcpyAsync(dx, x + (size_t)t * H, (size_t)H * sizeof(float),
+                        cudaMemcpyHostToDevice, st);
+        MlpGuActFp4<<<(unsigned)per, 256, 0, st>>>(
+            (const uint8_t*)d_gate_packed[r], (const uint8_t*)d_gate_scale[r],
+            (const uint8_t*)d_up_packed[r], (const uint8_t*)d_up_scale[r],
+            gate_s2, up_s2, dx, dact, (int)H, (int)per, (int)ib, halves,
+            groups);
+        MlpDownFp4<<<(unsigned)O, 256, 0, st>>>(
+            (const uint8_t*)d_down_packed[r], (const uint8_t*)d_down_scale[r],
+            down_s2, dact, dout, (int)per, (int)O, (int)ib, di_halves,
+            di_groups);
+        Queue q;
+        q.device = Device{DeviceType::kCUDA, r};
+        q.handle = st;
+        sgroup->Rank(r)->AllReduce(q, dout, (size_t)O, DType::kF32,
+                                   ReduceOp::kSum);
+        std::vector<float> back((size_t)O);
+        cudaMemcpyAsync(back.data(), dout, (size_t)O * sizeof(float),
+                        cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        if (r == 0)
+          for (int o = 0; o < O; ++o) out[(size_t)t * O + o] = back[(size_t)o];
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+  return bad.load();
+}
+
+// FP8 W8A16 serving wrapper: per-rank resident fp8 GEMM + ONE group
+// AllReduceSum. Mirrors vt_cuda_mlp_shard_runT_fp4's structure (process-lifetime
+// group, per-rank threads, AllReduce [O], reduced result on rank 0) but reads
+// each rank's RESIDENT per-channel fp8 bytes in-kernel — no host decode, no f32
+// slice build/upload. Each rank holds the full gate/up [I,H] + down [O,I] fp8
+// packed + f32 per-output-column scales (Fp8PerChannelWeight) on ITS device and
+// reads only its intermediate-column slice [i0, i0+per): row-slice for gate/up,
+// column-slice for down. Decode is byte-identical to the host fp8w arm
+// (`out[n,k] = F8(w[n,k]) * scale[n]`, NO bf16 rounding). x [T,H] and out [T,O]
+// are host f32 arrays as in runT. Returns 0 parity, 1 (dims/alloc), 2 (<2 GPUs
+// or NCCL unbuilt).
+extern "C" int vt_cuda_mlp_shard_runT_fp8w(
+    int O, int H, int I, int64_t T, const float* x,
+    const void* const* d_gate_packed, const float* const* d_gate_scale,
+    const void* const* d_up_packed, const float* const* d_up_scale,
+    const void* const* d_down_packed, const float* const* d_down_scale,
+    float* out) {
+  struct CallerDevGuard {
+    int dev_;
+    bool set_;
+    ~CallerDevGuard() { if (set_) (void)cudaSetDevice(dev_); }
+  } guard{0, false};
+  guard.dev_ = 0;
+  guard.set_ = cudaGetDevice(&guard.dev_) == cudaSuccess;
+  if (O <= 0 || H <= 0 || I <= 0 || T <= 0 || H % 16 != 0 || I % 16 != 0)
+    return 1;
+  static vt::CudaCommGroup* sgroup = vt::CudaCommGroup::Create();
+  if (!sgroup) return 2;
+  const int W = sgroup->world_size();
+  if (I % W != 0) return 1;
+  const int64_t per = I / W;
+
+  std::atomic<int> bad{0};
+  struct RankBuf {
+    cudaStream_t st = nullptr;
+    float *dx = nullptr, *dact = nullptr, *dout = nullptr;
+    size_t H = 0, per = 0, O = 0;
+  };
+  static std::vector<RankBuf> rbuf;
+  static std::once_flag rbuf_once;
+  std::call_once(rbuf_once, [&] { rbuf.resize((size_t)W); });
+  std::vector<std::thread> threads;
+  threads.reserve((size_t)W);
+  for (int r = 0; r < W; ++r) {
+    threads.emplace_back([&, r]() {
+      if (bad.load(std::memory_order_relaxed)) return;
+      NcclDevScope scope(r);
+      const int64_t ib = per * r;
+      RankBuf& b = rbuf[(size_t)r];
+      if (b.H != (size_t)H || b.per != (size_t)per || b.O != (size_t)O) {
+        if (b.st) cudaStreamDestroy(b.st);
+        if (b.dx) cudaFree(b.dx);
+        if (b.dact) cudaFree(b.dact);
+        if (b.dout) cudaFree(b.dout);
+        b = RankBuf{};
+        if (cudaStreamCreate(&b.st) != cudaSuccess ||
+            cudaMalloc(&b.dx, (size_t)H * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.dact, (size_t)per * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.dout, (size_t)O * sizeof(float)) != cudaSuccess) {
+          bad.store(1, std::memory_order_relaxed);
+          if (b.dx) cudaFree(b.dx);
+          if (b.dact) cudaFree(b.dact);
+          if (b.dout) cudaFree(b.dout);
+          if (b.st) { cudaStreamDestroy(b.st); b.st = nullptr; }
+          b.dx = b.dact = b.dout = nullptr;
+          return;
+        }
+        b.H = (size_t)H; b.per = (size_t)per; b.O = (size_t)O;
+      }
+      cudaStream_t st = b.st;
+      float* dx = b.dx; float* dact = b.dact; float* dout = b.dout;
+      for (int64_t t = 0; t < T; ++t) {
+        if (bad.load(std::memory_order_relaxed)) return;
+        cudaMemcpyAsync(dx, x + (size_t)t * H, (size_t)H * sizeof(float),
+                        cudaMemcpyHostToDevice, st);
+        MlpGuActFp8w<<<(unsigned)per, 256, 0, st>>>(
+            (const uint8_t*)d_gate_packed[r], (const float*)d_gate_scale[r],
+            (const uint8_t*)d_up_packed[r], (const float*)d_up_scale[r],
+            dx, dact, (int)H, (int)per, (int)ib);
+        MlpDownFp8w<<<(unsigned)O, 256, 0, st>>>(
+            (const uint8_t*)d_down_packed[r], (const float*)d_down_scale[r],
+            dact, dout, (int)I, (int)per, (int)O, (int)ib);
+        Queue q;
+        q.device = Device{DeviceType::kCUDA, r};
+        q.handle = st;
+        sgroup->Rank(r)->AllReduce(q, dout, (size_t)O, DType::kF32,
+                                   ReduceOp::kSum);
+        std::vector<float> back((size_t)O);
+        cudaMemcpyAsync(back.data(), dout, (size_t)O * sizeof(float),
+                        cudaMemcpyDeviceToHost, st);
+        cudaStreamSynchronize(st);
+        if (r == 0)
+          for (int o = 0; o < O; ++o) out[(size_t)t * O + o] = back[(size_t)o];
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+  return bad.load();
+}
+
+// M-B3 model-free 2-GPU selfcheck: build synthetic fp4 packed/scale/scale2 for
+// gate/up/down at fp4-aligned dims, upload each rank's resident slice onto ITS
+// device (the M-B1b residency contract), run the DEVICE fp4 kernel, and assert
+// it reproduces the host-decoder + runT reference (the path today's tp>1 serve
+// gates on) token-exact. Fails the whole selfcheck on any output mismatch.
+extern "C" int vt_cuda_mlp_shard_runT_fp4_selfcheck(void) {
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  constexpr int O = 16, H = 32, I = 32, T = 3;  // fp4: H,I % 16 == 0, I%W==0
+  if (I % W != 0 || H % 16 != 0) { delete g; return 2; }
+  const int64_t per = I / W;
+  (void)per;
+
+  // Host fp4 representation: gate/up [I,H], down [O,I]; each an E2M1 packed
+  // nibble grid + fp8-e4m3 group scale (group 16) + per-tensor scale2 scalar.
+  const int gh = H / 2, gg = H / 16, dh = I / 2, dg = I / 16;
+  std::vector<uint8_t> gpk((size_t)I * gh), gsc((size_t)I * gg);
+  std::vector<uint8_t> upk((size_t)I * gh), usc((size_t)I * gg);
+  std::vector<uint8_t> dpk((size_t)O * dh), dsc((size_t)O * dg);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < H; ++k) {
+      const int nib = (i * 5 + k * 7) & 0xF;  // both nibble values + sign bit
+      uint8_t& gb = gpk[(size_t)i * gh + (k >> 1)];
+      uint8_t& ub = upk[(size_t)i * gh + (k >> 1)];
+      if (k & 1) { gb |= (uint8_t)(nib << 4); ub |= (uint8_t)((nib ^ 0x8) << 4); }
+      else { gb = (uint8_t)nib; ub = (uint8_t)(nib ^ 0x8); }
+    }
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < H; k += 16) {
+      gsc[(size_t)i * gg + (k >> 4)] = (uint8_t)(0x30 + (i + (k >> 4)) % 8);
+      usc[(size_t)i * gg + (k >> 4)] = (uint8_t)(0x38 + (i * 3 + (k >> 4)) % 8);
+    }
+  for (int o = 0; o < O; ++o)
+    for (int i = 0; i < I; ++i) {
+      const int nib = (o * 3 + i) & 0xF;
+      uint8_t& b = dpk[(size_t)o * dh + (i >> 1)];
+      if (i & 1) b |= (uint8_t)(nib << 4); else b = (uint8_t)nib;
+    }
+  for (int o = 0; o < O; ++o)
+    for (int i = 0; i < I; i += 16)
+      dsc[(size_t)o * dg + (i >> 4)] = (uint8_t)(0x34 + (o + (i >> 4)) % 8);
+  const float gate_s2 = 0.5f, up_s2 = 1.25f, down_s2 = 0.8f;
+
+  std::vector<float> x((size_t)T * H);
+  for (int t = 0; t < T; ++t) for (int k = 0; k < H; ++k)
+    x[(size_t)t * H + k] = 0.3f + 0.1f * (float)(((k + t) % 7) - 3);
+
+  // Host-decoder + runT reference (the path today's tp>1 serve gates on).
+  std::vector<float> gate((size_t)I * H), up((size_t)I * H),
+      down((size_t)O * I), ref((size_t)T * O, 0.f);
+  std::vector<float> s2(I), s2u(I), s2d(O);
+  for (int i = 0; i < I; ++i) { s2[i] = gate_s2; s2u[i] = up_s2; }
+  for (int o = 0; o < O; ++o) s2d[o] = down_s2;
+  if (vt_host_decode_nvfp4_f32(I, H, gpk.data(), gsc.data(), s2.data(),
+                               gate.data()) != 0 ||
+      vt_host_decode_nvfp4_f32(I, H, upk.data(), usc.data(), s2u.data(),
+                               up.data()) != 0 ||
+      vt_host_decode_nvfp4_f32(O, I, dpk.data(), dsc.data(), s2d.data(),
+                               down.data()) != 0) {
+    delete g;
+    return 1;
+  }
+  const int rc_ref = vt_cuda_mlp_shard_runT(O, H, I, T, x.data(), gate.data(),
+                                            up.data(), down.data(), ref.data());
+  if (rc_ref != 0) { delete g; return rc_ref == 2 ? 2 : 1; }
+
+  // Upload each rank's fp4 slice onto ITS device; collect per-rank device ptrs.
+  std::vector<const void*> gpkp((size_t)W), gscp((size_t)W), upkp((size_t)W),
+      uscp((size_t)W), dpkp((size_t)W), dscp((size_t)W);
+  std::atomic<int> bad{0};
+  {
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+      th.emplace_back([&, r]() {
+        NcclDevScope scope(r);
+        void* g0 = nullptr; void* g1 = nullptr; void* u0 = nullptr;
+        void* u1 = nullptr; void* d0 = nullptr; void* d1 = nullptr;
+        const bool ok =
+            cudaMalloc(&g0, (size_t)I * gh) == cudaSuccess &&
+            cudaMalloc(&g1, (size_t)I * gg) == cudaSuccess &&
+            cudaMalloc(&u0, (size_t)I * gh) == cudaSuccess &&
+            cudaMalloc(&u1, (size_t)I * gg) == cudaSuccess &&
+            cudaMalloc(&d0, (size_t)O * dh) == cudaSuccess &&
+            cudaMalloc(&d1, (size_t)O * dg) == cudaSuccess &&
+            cudaMemcpy(g0, gpk.data(), (size_t)I * gh, cudaMemcpyHostToDevice) ==
+                cudaSuccess &&
+            cudaMemcpy(g1, gsc.data(), (size_t)I * gg, cudaMemcpyHostToDevice) ==
+                cudaSuccess &&
+            cudaMemcpy(u0, upk.data(), (size_t)I * gh, cudaMemcpyHostToDevice) ==
+                cudaSuccess &&
+            cudaMemcpy(u1, usc.data(), (size_t)I * gg, cudaMemcpyHostToDevice) ==
+                cudaSuccess &&
+            cudaMemcpy(d0, dpk.data(), (size_t)O * dh, cudaMemcpyHostToDevice) ==
+                cudaSuccess &&
+            cudaMemcpy(d1, dsc.data(), (size_t)O * dg, cudaMemcpyHostToDevice) ==
+                cudaSuccess;
+        if (!ok) { bad.store(1, std::memory_order_relaxed); }
+        gpkp[(size_t)r] = g0; gscp[(size_t)r] = g1;
+        upkp[(size_t)r] = u0; uscp[(size_t)r] = u1;
+        dpkp[(size_t)r] = d0; dscp[(size_t)r] = d1;
+      });
+    }
+    for (auto& t : th) t.join();
+  }
+  if (bad.load()) { delete g; return 1; }
+
+  std::vector<float> got((size_t)T * O, 0.f);
+  const int rcf = vt_cuda_mlp_shard_runT_fp4(
+      O, H, I, T, x.data(), gpkp.data(), gscp.data(), upkp.data(), uscp.data(),
+      dpkp.data(), dscp.data(), gate_s2, up_s2, down_s2, got.data());
+  if (rcf != 0) { delete g; return rcf; }
+  int badv = 0;
+  for (int t = 0; t < T; ++t)
+    for (int o = 0; o < O; ++o)
+      if (std::fabs(got[(size_t)t * O + o] - ref[(size_t)t * O + o]) >
+          1e-3f * std::max(1.0f, std::fabs(ref[(size_t)t * O + o]))) {
+        if (badv < 5)
+          fprintf(stderr,
+                  "vt mlp-shard-runT-fp4: t=%d o=%d got=%.6f ref=%.6f\n", t, o,
+                  (double)got[(size_t)t * O + o],
+                  (double)ref[(size_t)t * O + o]);
+        ++badv;
+      }
+  for (int r = 0; r < W; ++r) {
+    NcclDevScope scope(r);
+    cudaFree((void*)gpkp[(size_t)r]); cudaFree((void*)gscp[(size_t)r]);
+    cudaFree((void*)upkp[(size_t)r]); cudaFree((void*)uscp[(size_t)r]);
+    cudaFree((void*)dpkp[(size_t)r]); cudaFree((void*)dscp[(size_t)r]);
+  }
+  delete g;
+  return badv ? 1 : 0;
+}
+
+// FP8 W8A16 model-free 2-GPU selfcheck: build synthetic per-channel fp8
+// packed bytes (gate/up [I,H], down [O,I]) + f32 per-output-column scales,
+// upload each rank's full resident copy onto ITS device, run the DEVICE fp8w
+// GEMM, and assert it reproduces the host-decode + runT reference (the host
+// fp8w arm) token-exact. Fails the whole selfcheck on any output mismatch.
+extern "C" int vt_cuda_mlp_shard_runT_fp8w_selfcheck(void) {
+  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
+  if (!g) return 2;
+  const int W = g->world_size();
+  constexpr int O = 16, H = 32, I = 32, T = 3;  // H,I % 16 == 0; I % W == 0
+  if (I % W != 0 || H % 16 != 0) { delete g; return 2; }
+  const int64_t per = I / W;
+  (void)per;
+
+  // Synthetic fp8 e4m3fn bytes [n,k] + f32 [n] per-column scale.
+  std::vector<uint8_t> gpk((size_t)I * H), upk((size_t)I * H), dpk((size_t)O * I);
+  std::vector<float> gsc((size_t)I), usc((size_t)I), dsc((size_t)O);
+  for (int n = 0; n < I; ++n) {
+    gsc[(size_t)n] = 0.5f + 0.05f * (float)(n % 5);
+    usc[(size_t)n] = 1.1f - 0.04f * (float)(n % 7);
+    for (int k = 0; k < H; ++k) {
+      gpk[(size_t)n * H + k] = (uint8_t)((unsigned)(n * 3 + k * 5) & 0xFEu);  // even bit = sign-0
+      upk[(size_t)n * H + k] = (uint8_t)(0x80u | ((unsigned)(n * 7 + k) & 0x7Eu));  // sign-1 + varied exp/mant
+    }
+  }
+  for (int o = 0; o < O; ++o) {
+    dsc[(size_t)o] = 0.8f - 0.03f * (float)(o % 4);
+    for (int i = 0; i < I; ++i)
+      dpk[(size_t)o * I + i] = (uint8_t)(((unsigned)(o * 5 + i * 2) & 0x7Fu) |
+                                         ((o & 1) ? 0x80u : 0u));
+  }
+
+  std::vector<float> x((size_t)T * H);
+  for (int t = 0; t < T; ++t) for (int k = 0; k < H; ++k)
+    x[(size_t)t * H + k] = 0.25f + 0.12f * (float)(((k + t * 2) % 7) - 3);
+
+  // Host-decode + runT reference (the path today's tp>1 serve gates on).
+  std::vector<float> gate((size_t)I * H), up((size_t)I * H),
+      down((size_t)O * I), ref((size_t)T * O, 0.f);
+  for (int n = 0; n < I; ++n)
+    for (int k = 0; k < H; ++k) {
+      gate[(size_t)n * H + k] = HostF8E4M3ToF32(gpk[(size_t)n * H + k]) * gsc[(size_t)n];
+      up[(size_t)n * H + k] = HostF8E4M3ToF32(upk[(size_t)n * H + k]) * usc[(size_t)n];
+    }
+  for (int o = 0; o < O; ++o)
+    for (int i = 0; i < I; ++i)
+      down[(size_t)o * I + i] = HostF8E4M3ToF32(dpk[(size_t)o * I + i]) * dsc[(size_t)o];
+  const int rc_ref = vt_cuda_mlp_shard_runT(O, H, I, T, x.data(), gate.data(),
+                                            up.data(), down.data(), ref.data());
+  if (rc_ref != 0) { delete g; return rc_ref == 2 ? 2 : 1; }
+
+  // Upload each rank's FULL resident copy onto ITS device.
+  std::vector<const void*> gpkp((size_t)W), upkp((size_t)W), dpkp((size_t)W);
+  std::vector<const float*> gscp((size_t)W), uscp((size_t)W), dscp((size_t)W);
+  std::atomic<int> bad{0};
+  {
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+      th.emplace_back([&, r]() {
+        NcclDevScope scope(r);
+        void *g0 = nullptr, *u0 = nullptr, *d0 = nullptr;
+        float *gs = nullptr, *us = nullptr, *ds = nullptr;
+        const bool ok =
+            cudaMalloc(&g0, (size_t)I * H) == cudaSuccess &&
+            cudaMalloc(&u0, (size_t)I * H) == cudaSuccess &&
+            cudaMalloc(&d0, (size_t)O * I) == cudaSuccess &&
+            cudaMalloc(&gs, (size_t)I * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&us, (size_t)I * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&ds, (size_t)O * sizeof(float)) == cudaSuccess &&
+            cudaMemcpy(g0, gpk.data(), (size_t)I * H, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(u0, upk.data(), (size_t)I * H, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(d0, dpk.data(), (size_t)O * I, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(gs, gsc.data(), (size_t)I * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(us, usc.data(), (size_t)I * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(ds, dsc.data(), (size_t)O * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (!ok) { bad.store(1, std::memory_order_relaxed); }
+        gpkp[(size_t)r] = g0; upkp[(size_t)r] = u0; dpkp[(size_t)r] = d0;
+        gscp[(size_t)r] = gs; uscp[(size_t)r] = us; dscp[(size_t)r] = ds;
+      });
+    }
+    for (auto& t : th) t.join();
+  }
+  if (bad.load()) { delete g; return 1; }
+
+  std::vector<float> got((size_t)T * O, 0.f);
+  const int rcf = vt_cuda_mlp_shard_runT_fp8w(
+      O, H, I, T, x.data(), gpkp.data(), gscp.data(), upkp.data(), uscp.data(),
+      dpkp.data(), dscp.data(), got.data());
+  if (rcf != 0) { delete g; return rcf; }
+  int badv = 0;
+  for (int t = 0; t < T; ++t)
+    for (int o = 0; o < O; ++o)
+      if (std::fabs(got[(size_t)t * O + o] - ref[(size_t)t * O + o]) >
+          1e-3f * std::max(1.0f, std::fabs(ref[(size_t)t * O + o]))) {
+        if (badv < 5)
+          fprintf(stderr,
+                  "vt mlp-shard-runT-fp8w: t=%d o=%d got=%.6f ref=%.6f\n", t, o,
+                  (double)got[(size_t)t * O + o],
+                  (double)ref[(size_t)t * O + o]);
+        ++badv;
+      }
+  for (int r = 0; r < W; ++r) {
+    NcclDevScope scope(r);
+    cudaFree((void*)gpkp[(size_t)r]); cudaFree((void*)upkp[(size_t)r]);
+    cudaFree((void*)dpkp[(size_t)r]); cudaFree((void*)gscp[(size_t)r]);
+    cudaFree((void*)uscp[(size_t)r]); cudaFree((void*)dscp[(size_t)r]);
+  }
+  delete g;
+  return badv ? 1 : 0;
+}
+
 extern "C" int vt_cuda_dense_mlp_shard_selfcheck(void) {
   vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
   if (!g) return 2;
@@ -1733,8 +2348,13 @@ extern "C" int vt_cuda_attn_kv_shard_paged_run(
   if (kv_dtype != 0 && kv_dtype != 1) return 1;
   if (Hq % Hkv != 0) return 1;  // GQA group split h / (Hq / Hkv)
   if (kv_new != nullptr && slot_mapping == nullptr) return 1;
-  vt::CudaCommGroup* g = vt::CudaCommGroup::Create();
-  if (!g) return 2;
+  // Retained process-lifetime group (never per-call Create/Destroy): the
+  // per-layer ncclCommInitAll + ncclCommDestroy churn measured ~0.5 s/layer
+  // (~520 ms of the tp>1 attention wall) — the exact anti-pattern the spec
+  // warns about. Mirrors the M-B3 MLP runT_fp4 wrapper (static retained).
+  static vt::CudaCommGroup* sgroup = vt::CudaCommGroup::Create();
+  if (!sgroup) return 2;
+  vt::CudaCommGroup* g = sgroup;
   const int W = g->world_size();
   const int per = (Hkv + W - 1) / W;
   const size_t esize = kv_dtype == 0 ? 2u : 4u;
@@ -1769,8 +2389,7 @@ extern "C" int vt_cuda_attn_kv_shard_paged_run(
       }
       if (fail) {
         for (void* p : ne.dev) cudaFree(p);  // cudaFree(nullptr) is a no-op
-        delete g;
-        return 1;
+        return 1;  // group is retained; do not destroy
       }
       reg.entries.push_back(std::move(ne));
       entry = &reg.entries.back();
@@ -1797,8 +2416,7 @@ extern "C" int vt_cuda_attn_kv_shard_paged_run(
     });
   }
   for (auto& t : threads) t.join();
-  delete g;
-  return bad.load();
+  return bad.load();  // sgroup retained for the process lifetime
 }
 // ---------------------------------------------------------------------------
 // lm_head/shard primitive (TP step-2, the logits head). The head is a

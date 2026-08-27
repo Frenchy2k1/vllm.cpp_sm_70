@@ -145,14 +145,24 @@ void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
 
 // QWEN38-PER-CHANNEL-GDN keep-quant W8A16 eager stage: upload the raw fp8
 // packed bytes + per-column f32 scale of every keep owner to the device at
-// load, then free their host pages. The quantized load never satisfies
-// IsPlainBf16Qwen3_5Dense, so the bf16 path above never runs for it; this runs
-// instead so the FIRST forward doesn't upload each tower in one step and blow
-// the card. No-op (all Empty) on devices without the W8A16 op and on CPU.
-void StageAndReleaseKeepFp8w(Qwen3_5DenseWeights& weights, vt::Queue& queue) {
+// load. The quantized load never satisfies IsPlainBf16Qwen3_5Dense, so the
+// bf16 path above never runs for it; this runs instead so the FIRST forward
+// doesn't upload each tower in one step and blow the card. No-op (all Empty)
+// on devices without the W8A16 op and on CPU.
+//
+// The fp8w HOST pages are NOT released here, deliberately (unlike
+// StageAndReleaseLoadedDense above). The tp>1 serve builds its per-rank lane
+// residency at FIRST forward in `DenseMlpBlock` (qwen3_5.cpp, fp8w arm,
+// "thread-per-lane, one-time lazy, mirrors the fp4 residency"), and that build
+// reads `w.bytes` (host) to upload each lane's copy — the fp4 lane build reads
+// the fp4 host pages the same way, because fp4's `d_dev` is set only at first
+// forward so the release below never frees it. Releasing the fp8w host here
+// (the eager `d_dev` is set at load, so the release WOULD free it) makes
+// lane>0 copy freed bytes and spin. Keep fp8w host resident until the lane
+// build, matching the fp4 arm's memory posture (fp4 keeps its whole host).
+void StageKeepFp8wResident(Qwen3_5DenseWeights& weights, vt::Queue& queue) {
   Qwen3_5DenseModel::PrepareFp8wResident(weights, queue);
   vt::GetBackend(queue.device.type).Synchronize(queue);
-  (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
 }
 
 // VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
@@ -983,9 +993,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // entered), yet the keep owners must be staged to device up front or the
   // FIRST forward uploads every tower in one step and blows the card. Stage
   // the raw keep bytes + per-column scales eagerly when the W8A16 op is
-  // present, and free their host pages on the same path.
+  // present. Host pages stay resident (the tp>1 lane build reads them).
   const bool load_is_direct = DirectDeviceLoadEligible(load_queue);
-  if (keep_fp8w && load_is_direct) StageAndReleaseKeepFp8w(w, *load_queue);
+  if (keep_fp8w && load_is_direct) StageKeepFp8wResident(w, *load_queue);
   return w;
 }
 
