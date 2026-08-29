@@ -2935,11 +2935,11 @@ const auto project = [&](const Nvfp4Weight& fp4_weight,
       VT_CHECK(fp8w_weight.k == h.shape[1],
                "qwen3_5 fp8 W8A16 full-attn: invalid keep container [n,k] "
                "(K must match act input dim)");
-Fp8W8a16Dev fw = ResidentFp8W8a16(d, fp8w_weight);
-      DBuf out(d, DType::kBF16,
-               std::vector<int64_t>{h.shape[0], fp8w_weight.n});
-      vt::MatmulFp8W8a16(d.q, out.t(), h, fw.packed, fw.scale);
-      return out;
+      Fp8W8a16Dev fw = ResidentFp8W8a16(d, fp8w_weight);
+      DBuf out_w8a16(d, DType::kBF16,
+                     std::vector<int64_t>{h.shape[0], fp8w_weight.n});
+      vt::MatmulFp8W8a16(d.q, out_w8a16.t(), h, fw.packed, fw.scale);
+      return out_w8a16;
     }
     // MODEL-FP8-BLOCK-LINEAR (#1189 M4). FIRST, and exclusive: M3's loader
     // fills the block field and leaves the bf16, per-tensor fp8 and fp4 ones

@@ -253,6 +253,7 @@ TEST_CASE("CUDA backend: per-device index allocates/initializes on the addressed
     b->DestroyQueue(q);
   }
 #endif
+}
 // ISSUE #1635, the empirical half. This case asserts NOTHING on any CI lane: no
 // job in this repository's CI has a GPU, so `HasCuda()` is false everywhere CI
 // runs and the case reports a skip. It is here because a leased GPU box can run

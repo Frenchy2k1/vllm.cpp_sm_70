@@ -46,17 +46,24 @@ function(vllm_cpp_set_warnings target)
   # this as a warning to silence rather than a bug to fix in user code. Upstream
   # is GCC PR tree-optimization/122197; Eigen, assimp and CMSSW all disable the
   # check the same way on the affected releases.
-  set(_vllm_cpp_array_bounds "")
+  # GCC 15/16's optimizer, after inlining, attributes one shared_ptr
+  # instantiation's destructor to another one's allocation size and reports
+  # -Wfree-nonheap-object against correct code (the DBuf/Tensor keep-alive
+  # pattern) -- the same `_M_release` false-positive class as array-bounds
+  # above, and the same state libstdc++ silences in bits/shared_ptr_base.h.
+  # Demote it globally for the affected compilers; the warning stays visible
+  # and -Werror holds for every other diagnostic and every other compiler.
+  set(_vllm_cpp_free_nonheap "")
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
      CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
-    set(_vllm_cpp_array_bounds -Wno-error=array-bounds)
+    set(_vllm_cpp_free_nonheap -Wno-error=free-nonheap-object)
   endif()
   if(MSVC)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:/W4 /WX>)
   else()
     target_compile_options(${target} PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra ${_vllm_cpp_werror} ${_vllm_cpp_array_bounds}>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra ${_vllm_cpp_werror} ${_vllm_cpp_array_bounds} ${_vllm_cpp_free_nonheap}>
     # OBJCXX (.mm — the Metal backend) is a SEPARATE COMPILE_LANGUAGE from CXX,
     # so the CXX genex above does not reach it. Without this line the Metal TUs
     # would be the only unwarned code in the tree (BACKEND-METAL-MLX W0).
