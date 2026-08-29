@@ -1451,6 +1451,16 @@ vllm_cpp_set_warnings(vllm)
 set_source_files_properties(src/vllm/entrypoints/chat_template.cpp PROPERTIES
   COMPILE_OPTIONS
     "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-error=free-nonheap-object>")
+# deepseek_v2.cpp's layer forward keeps a DBuf alive past its scope with a
+# `shared_ptr<void>` + custom `delete` deleter (valid `new`/`delete`). GCC 15/16
+# after inlining attributes one shared_ptr instantiation's destructor to another
+# one's allocation size and reports -Wfree-nonheap-object against this correct
+# code — the same class cmake/CompilerWarnings.cmake documents for _M_release
+# and the newest-gcc (gcc:16) lane hits; the warning stays visible, -Werror
+# holds for every other diagnostic and every other TU.
+set_source_files_properties(src/vllm/model_executor/models/deepseek_v2.cpp PROPERTIES
+  COMPILE_OPTIONS
+    "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-error=free-nonheap-object>")
 # --- Vendored BLAKE3 (LMCache MODE-1 lm:// token hash, KV-EXTERNAL-CACHE W1) --
 # The official BLAKE3 C implementation (third_party/blake3, upstream tag 1.5.5
 # / commit 81f772a; dual CC0-1.0 / Apache-2.0), the same algorithm the `blake3`

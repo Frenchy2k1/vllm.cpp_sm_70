@@ -34,3 +34,6 @@ a.out
 *.log
 *.mp4
 generated/
+
+# Local remote-pi agent-mesh config (never track machine-specific relay settings).
+.pi/

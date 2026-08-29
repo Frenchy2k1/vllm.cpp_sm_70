@@ -49,6 +49,7 @@
 // device-count helper and the per-rank communicator accessor. Only reachable
 // under VT_NCCL (which implies a CUDA+NCCL build); everything else keeps the
 // whole attach path compiled out so a CPU-only / non-NCCL build is identical.
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #if defined(VT_NCCL)
 #include "vt/cuda/cuda_comm_group.h"  // vt::CudaCommGroup::Rank (per-rank Communicator)
 #include "vt/cuda/cuda_dropin.h"      // vt::cuda::DeviceCount
@@ -58,6 +59,7 @@
 // nccl_communicator.cu under VT_NCCL (extern "C"). vt_cuda_tp_acquire returns
 // the opaque retained vt::CudaCommGroup* (nullptr for tp_size<=1 or NCCL init
 // failure — keeping the tp1 path byte-identical), vt_cuda_tp_release frees it.
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #if defined(VT_NCCL)
 extern "C" void* vt_cuda_tp_acquire(int tp_size);
 extern "C" void vt_cuda_tp_release(void* handle);
@@ -405,6 +407,7 @@ std::optional<std::vector<bool>> GroupLayerMask(const KVCacheGroupSpec& group,
 // (LoadedModel::tensor_parallel) is set only when a group was attached — tp1
 // never touches it.
 void GPUModelRunner::attach_tp_group() {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #if defined(VT_NCCL)
   if (tp_group_ != nullptr) return;  // already attached (delegating ctor)
   // The group spans the per-rank lanes when this runner was given them (a
@@ -3452,6 +3455,7 @@ GPUModelRunner::~GPUModelRunner() {
   // BACKEND-DISTRIBUTED-TP TP-W2: release the retained NCCL group acquired in
   // attach_tp_group (null on the tp1 path; compiled out without NCCL). The
   // model holds only a BORROWED pointer, invalidated right after this.
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #if defined(VT_NCCL)
   if (tp_group_ != nullptr) {
     vt_cuda_tp_release(tp_group_);

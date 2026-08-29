@@ -99,6 +99,10 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/kernel-matrix.md",
         ".agents/backend-matrix.md",
         ".agents/sglang-matrix.md",
+        ".agents/issue-port-mapping.md",
+        # The row's root-level working plan (BACKEND-DISTRIBUTED-TP); a project
+        # planning artifact like the specs under .agents/specs.
+        "TP_PLAN.md",
     }
 )
 PROCEDURE_FILES = frozenset(

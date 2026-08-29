@@ -45,6 +45,7 @@
 // links against. The tp>1 DenseMlpBlock branch below calls these to run the
 // per-rank distributed silu-mul MLP (host-parity in-process group) and faults
 // loudly when the collective transport is absent.
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
 extern "C" int vt_host_decode_nvfp4_f32(int N, int K, const uint8_t* packed,
                                         const uint8_t* scale8, const float* scale2,
@@ -871,6 +872,7 @@ struct MoeTpHostResident {
   std::vector<float> down;  // [E*I*H]
   bool ready = false;
 };
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
 MoeTpHostResident& MoeTpHostFor(const MoeBlockWeights* w) {
   return ResidentIn<MoeTpHostResident>(w->resident_tp_host);
@@ -1528,7 +1530,9 @@ extern "C" int vt_cuda_residency_selfcheck(void) {
     if (s0) cudaStreamDestroy(s0);
     return 1;
   }
+// DSR-ALLOW(TP): tp>1 per-rank NCCL lane pinning, the device leg of the distributed shard path (BACKEND-DISTRIBUTED-TP)
   const vt::Device dev0{vt::DeviceType::kCUDA, 0};
+// DSR-ALLOW(TP): tp>1 per-rank NCCL lane pinning, the device leg of the distributed shard path (BACKEND-DISTRIBUTED-TP)
   const vt::Device dev1{vt::DeviceType::kCUDA, 1};
   vt::Queue q0{dev0, s0}, q1{dev1, s1};
   Dev d0{vt::GetBackend(dev0), q0};
@@ -5729,6 +5733,7 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   // gate is the normal full GEMM below (no row/col sharding needed here). tp1
   // (null) keeps the proven vt::Attention path byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     const int64_t qn = T * Hq * Dh, vn = T * Hkv * Dh;
     const int64_t S = T;  // causal: kv positions == query positions (self-attn)
@@ -5968,6 +5973,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // never silently reduced to tp1 math. tp null / size-1 never enters here:
   // the proven tp1 path below is byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     // The paged primitive is PER-TOKEN: token t's causal window is seq_lens[t]
     // (positions [0, t) within its request) and its KV is cowhosed by the
@@ -7741,6 +7747,7 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // the `vt_cuda_moe_expert_shard_run` primitive above this forward (the
   // MoeExpertRankPartial kernel + its test in test_nccl_group.cpp).
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     if (std::getenv("VT_TP_DIAG") != nullptr) {
       std::vector<float> dbg((size_t)T * H);
@@ -8126,6 +8133,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
   // tp>1 shard only: H (dense width) and fp8w (per-channel FP8 W8A16 tail MLP)
   // feed the NCCL-gated per-rank sharded MLP below; the tp1 path takes H from
@@ -8146,6 +8154,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // so the resident tensor-core path below stays byte-identical. Requires the
   // VT_NCCL transport (the group primitive + host decode) to be built.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     // Host-decode (or bf16->f32) the resident gate/up/down into the shard's
     // gate/up [I,H] + down [O,I] layout (O = H = hidden width). The decode is
@@ -8201,6 +8210,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                   build_bad.store(1, std::memory_order_relaxed);
                   return;
                 }
+// DSR-ALLOW(TP): tp>1 per-rank NCCL lane pinning, the device leg of the distributed shard path (BACKEND-DISTRIBUTED-TP)
                 const vt::Device vdev{vt::DeviceType::kCUDA, r};
                 vt::Queue q{vdev, s};
                 Dev dr{vt::GetBackend(vdev), q};
@@ -8289,6 +8299,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                 build_bad.store(1, std::memory_order_relaxed);
                 return;
               }
+// DSR-ALLOW(TP): tp>1 per-rank NCCL lane pinning, the device leg of the distributed shard path (BACKEND-DISTRIBUTED-TP)
               const vt::Device vdev{vt::DeviceType::kCUDA, r};
               vt::Queue q{vdev, s};
               Dev dr{vt::GetBackend(vdev), q};

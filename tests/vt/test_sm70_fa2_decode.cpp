@@ -11,6 +11,8 @@
 
 #include <doctest/doctest.h>
 
+#ifdef VLLM_CPP_CUDA
+
 extern "C" int vt_sm70_fa2_self_check(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_op_parity(float tol_rel, int verbose);
 extern "C" int vt_sm70_fa2_prefill_self_check(float tol_rel, int verbose);
@@ -65,3 +67,9 @@ TEST_CASE("sm70 fa2 decode is CUDA-graph-capture safe (y-dg-sync replay parity)"
   }
   CHECK(rc == 0);
 }
+#else
+TEST_CASE("sm70 fa2 decode/prefill kernels (CUDA not built)") {
+  MESSAGE("CUDA support not built; sm70 FA2 tests skipped");
+  CHECK(true);
+}
+#endif

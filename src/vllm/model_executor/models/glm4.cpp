@@ -61,6 +61,7 @@ DBuf Glm4MlpBlock(Dev d, const Glm4MlpWeights& w, const HfConfig& cfg,
   // exit group-reduced [T,H] — token-identical to tp1). tp1 (null) never
   // enters, so the resident tensor-core path below stays byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     return shard_host::TpSwiGluHost(d, "glm4", w.gate_up_proj, w.down_proj,
                                     dh2, T, H, I);
@@ -150,6 +151,7 @@ Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
   // below stays the full-weight GEMM. tp1 (null) never enters here, so the
   // proven paged path below is byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     DBuf attn_tp = shard_host::TpPagedAttentionHost(
         d, "glm4", q3, kw, vw, kv, meta, T, Hq, Hkv, Dh);

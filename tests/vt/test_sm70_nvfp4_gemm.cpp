@@ -11,6 +11,8 @@
 
 #include <doctest/doctest.h>
 
+#ifdef VLLM_CPP_CUDA
+
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
 
@@ -72,3 +74,9 @@ TEST_CASE("sm70 fp8-w8a16 kernel throughput microbench (effective GB/s, informat
   // return is a run error.
   CHECK(rc == 0);
 }
+#else
+TEST_CASE("sm70 nvfp4-w4a16 / fp8-w8a16 kernels (CUDA not built)") {
+  MESSAGE("CUDA support not built; sm70 kernel tests skipped");
+  CHECK(true);
+}
+#endif

@@ -140,6 +140,10 @@ class PathClassification(unittest.TestCase):
             # is: it IS the table roadmap_v1.md used to hold.
             ".agents/roadmap_v1.md": "project_record",
             ".agents/issue-index.md": "project_record",
+            # Classified with the other records when the tp row landed them: the
+            # root-level row plan and the fork's append-only issue-port record.
+            "TP_PLAN.md": "project_record",
+            ".agents/issue-port-mapping.md": "project_record",
             ".agents/style/commits.md": "procedure",
             ".agents/style/prose.md": "procedure",
             ".claude/skills/writing-commits-and-prs/SKILL.md": "procedure",
@@ -148,6 +152,16 @@ class PathClassification(unittest.TestCase):
         for path, path_class in expected.items():
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), path_class)
+
+    def test_tp_row_records_are_classified_project_records(self) -> None:
+        # The tp row's root plan and the fork's issue-port record are project
+        # records; without the classification this checker FAILS CLOSED on any
+        # PR carrying them, so a PR that adds either must also classify both.
+        self.assertEqual(checker.classify_path("TP_PLAN.md"), "project_record")
+        self.assertEqual(
+            checker.classify_path(".agents/issue-port-mapping.md"),
+            "project_record",
+        )
 
     def test_release_version_classification_is_exact_and_fail_closed(self) -> None:
         """Only the authoritative immutable declaration earns this class.

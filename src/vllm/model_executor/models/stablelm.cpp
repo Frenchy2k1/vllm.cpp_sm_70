@@ -62,6 +62,7 @@ DBuf StablelmMlpBlock(Dev d, const StablelmMlpWeights& w, const HfConfig& cfg,
   // to tp1). tp1 (null) never enters, so the resident tensor-core path below
   // stays byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     return shard_host::TpSwiGluHost(d, "stablelm", w.gate_up_proj, w.down_proj,
                                     dh2, T, H, I);
@@ -142,6 +143,7 @@ DBuf StablelmAttnBlock(Dev d, const StablelmAttnWeights& w, const Tensor& rope_c
   // full [T,Hq,Dh] attention; the o_proj below stays the full-weight GEMM.
   // tp1 (null) never enters, so the proven paged path below is byte-identical.
   if (tp != nullptr && tp->tp_size() > 1) {
+// DSR-ALLOW(TP): tp>1 NCCL transport / per-rank lane build gate; device-leg (BACKEND-DISTRIBUTED-TP)
 #ifdef VT_NCCL
     DBuf attn_tp = shard_host::TpPagedAttentionHost(
         d, "stablelm", q3, kw, vw, kv, meta, T, Hq, Hkv, Dh);
