@@ -46,6 +46,15 @@ function(vllm_cpp_set_warnings target)
   # this as a warning to silence rather than a bug to fix in user code. Upstream
   # is GCC PR tree-optimization/122197; Eigen, assimp and CMSSW all disable the
   # check the same way on the affected releases.
+  # GCC >= 15 reports -Warray-bounds inside libstdc++ and the vendored
+  # nlohmann json for correct code (see the comment at the top of the GCC
+  # block); the diagnostic stays VISIBLE but stops being fatal on those
+  # compilers only.
+  set(_vllm_cpp_array_bounds "")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+    set(_vllm_cpp_array_bounds -Wno-error=array-bounds)
+  endif()
   # GCC 15/16's optimizer, after inlining, attributes one shared_ptr
   # instantiation's destructor to another one's allocation size and reports
   # -Wfree-nonheap-object against correct code (the DBuf/Tensor keep-alive
