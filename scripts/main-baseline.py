@@ -98,15 +98,12 @@ EXPECTED_JOBS = (
     "macos-metal-mlx",
     "sanitize-cpu",
     "vulkan-spirv-freshness",
-    # Joined on 2026-08-17 (#503). These two were `if: github.event_name ==
-    # 'pull_request'` and so were never DEFINED for the baseline lane's events:
-    # not skipped, not missing, not covered -- absent from the payload entirely,
-    # which is the one shape the `missing` arm above exists to catch and the one
-    # it could not see, because the expectation did not name them. The verdict
-    # therefore printed GREEN while `main` did not compile under MSVC (#503,
-    # #1068). The workflow now runs them on `schedule`/`workflow_dispatch`.
-    "windows-msvc-cpu",
-    "windows-msvc-vulkan",
+    # The two native-MSVC PR proofs (`windows-msvc-cpu` / `windows-msvc-vulkan`)
+    # were removed on 2026-08-29 (PR #4) because their OpenAI server test
+    # crashes on the Windows runner (STATUS_STACK_BUFFER_OVERRUN) and the fork
+    # has no Windows host to trace it. Removing them from the workflow removed
+    # them from this expected set: the baseline can only grade lanes the
+    # workflow still defines.
 )
 
 

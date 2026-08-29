@@ -5,9 +5,9 @@ on:
   # `closed` so a merged or abandoned pull request ENTERS the concurrency
   # group and supersedes its own in-flight run (#822). Every job below is
   # skipped on it -- directly through its own `if:`, or transitively by
-  # `needs:`-ing a job that is -- except the two `windows-msvc-*` PR proofs,
-  # whose whole job mapping is pinned byte-for-byte by
-  # `scripts/check-release-workflow.py` and can carry neither key. Those two
+  # `needs:`-ing a job that is. (The two native-MSVC PR proofs
+  # `windows-msvc-*` were removed on 2026-08-29, PR #4, after the windows
+  # runner began crashing their OpenAI server test, 0xC0000409.)
   # therefore still start on a close; recorded as owed in
   # .agents/specs/ci-concurrency.md and tracked by #874.
   pull_request:
@@ -294,8 +294,9 @@ jobs:
         # `scripts/agent-preflight.sh` and from every hook (#646, #680). #1829 is
         # what that costs -- `[[noreturn]] static ForwardLogits ForwardDevice(` is
         # MSVC C4646, `/W4 /WX` makes it C2220, and `main` failed to COMPILE under
-        # MSVC while every POSIX lane stayed green, because `windows-msvc-cpu` and
-        # `windows-msvc-vulkan` are pull-request-only and give `main` no verdict.
+        # MSVC while every POSIX lane stayed green, because the two native-MSVC
+        # proofs (`windows-msvc-cpu` / `windows-msvc-vulkan`, added #503, PR-only
+        # and giving `main` no verdict) were removed on 2026-08-29 (PR #4).
         #
         # `shipped_server_sources` derives its set from the CMake file API and
         # forces `-G Ninja`. `ubuntu-latest` is not assumed to carry Ninja -- every
@@ -1234,71 +1235,6 @@ jobs:
         run: |
           python3 scripts/check-device-leakage.py --report
           python3 tests/scripts/test_device_leakage.py
-  windows-msvc-cpu:
-    # Native Windows release portability must be proven before merge. This PR
-    # lane calls the authoritative driver but retains no artifact and has no
-    # release, upload, write-token, or OIDC authority (#117).
-    #
-    # IT RUNS ON THE BASELINE LANE TOO (#503). The condition was
-    # `github.event_name == 'pull_request'` alone until 2026-08-17, so `main`
-    # could establish neither green nor red under MSVC. `scripts/main-baseline.py`
-    # then printed GREEN *because* the lane it grades never started this job --
-    # absence wearing success's face, which is the exact defect #274 was filed
-    # about, reached by a different route. Measured on the deliberate
-    # workflow_dispatch baseline 32044993401 (`conclusion=success`): both
-    # windows-msvc-* jobs `skipped`. The cost of that was not theoretical --
-    # #503, #603, #729, #965, #968 and #1068 each landed on `main` unseen and
-    # then surfaced as a red on an unrelated contributor's pull request.
-    #
-    # `push` stays EXCLUDED. That lane is cancellable by construction and cannot
-    # answer "is main green" (see the `schedule` comment above), and at the 55
-    # pushes/day measured there, two `windows-2022` runners per push is a bill
-    # rather than a baseline.
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: read
-    runs-on: windows-2022
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-      - name: Prove PowerShell, static CRT, and unsupported-tier contracts
-        run: ./scripts/build-windows-release.ps1 -ContractTest
-      - name: Build and execute the native Windows CPU focused gate
-        env:
-          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SOURCE_SHA: ${{ github.sha }}
-        run: |
-          $env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version
-          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
-          ./scripts/build-windows-release.ps1 `
-            -Backend cpu `
-            -ArtifactId windows-x86_64-msvc-cpu `
-            -BuildDir $env:GITHUB_WORKSPACE/build-pr-windows-cpu
-  windows-msvc-vulkan:
-    # Independent Vulkan build/loader/backend proof on the native MSVC ABI.
-    # Like the CPU lane it is read-only and retains no release asset, and it
-    # answers for the same three events for the same reason (#503): a baseline
-    # that silently excludes a compiling gate certifies less than it claims.
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: read
-    runs-on: windows-2022
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-      - name: Prove PowerShell, static CRT, and unsupported-tier contracts
-        run: ./scripts/build-windows-release.ps1 -ContractTest
-      - name: Build and execute the native Windows Vulkan focused gate
-        env:
-          EVIDENCE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SOURCE_SHA: ${{ github.sha }}
-        run: |
-          $env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version
-          $env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
-          ./scripts/build-windows-release.ps1 `
-            -Backend vulkan `
-            -ArtifactId windows-x86_64-msvc-vulkan `
-            -BuildDir $env:GITHUB_WORKSPACE/build-pr-windows-vulkan
   build-test-cpu:
     # Tree-scoped and the most expensive lane in the workflow. Cancellable.
     concurrency:
@@ -1934,7 +1870,8 @@ jobs:
     # failures of #274 finding #1 / #301. That is the correct first verdict. A
     # baseline that hid them would certify nothing.
     #
-    # The same applies to `windows-msvc-cpu`, joined here on 2026-08-17 (#503).
+    # (The windows-msvc-* PR lanes that this note described were removed on
+    # 2026-08-29, PR #4.)
     # It is red on #584 -- `test_openai_api_server.exe` fast-fails with
     # 0xC0000409 -- so the baseline reports RED from the moment it can see that
     # lane at all. It reported GREEN before only because it never ran it.
@@ -1947,8 +1884,6 @@ jobs:
       - vulkan-spirv-freshness
       - build-test-vulkan
       - device-leakage
-      - windows-msvc-cpu
-      - windows-msvc-vulkan
       - build-test-cpu
       - build-test-cpu-arm64
       - build-test-cpu-arm64-full

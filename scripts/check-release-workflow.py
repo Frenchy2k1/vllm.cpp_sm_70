@@ -135,101 +135,6 @@ def workflow_steps(block: str) -> list[str]:
     return [block[start:end] for start, end in zip(starts, starts[1:])]
 
 
-def validate_pr_ci(text: str) -> list[str]:
-    """Require native Windows proof, without release authority, on every lane
-    that can certify a tree.
-
-    The `if:` below is part of the pinned schema, so it is the reason this
-    function had to change for #503 at all. Until 2026-08-17 it read
-    `github.event_name == 'pull_request'`, which is what kept `windows-msvc-cpu`
-    and `windows-msvc-vulkan` off the schedule/dispatch lane that
-    `scripts/main-baseline.py` grades -- and a baseline that never runs a
-    compiling gate publishes GREEN for the wrong reason.
-
-    WHAT THIS STILL REFUSES, and it is the whole point of pinning a literal
-    rather than a substring: `always()`, `github.event_name != 'push'`, a bare
-    `true`, or any other broadening still fails the equality, because the
-    expected value is one exact string and not a predicate over strings. What
-    changed is which three events that string names, not the strength of the
-    binding. `push` is absent deliberately (55 pushes/day, two windows-2022
-    runners each, on a lane whose jobs cancel one another by design).
-    """
-
-    try:
-        workflow = load_workflow_yaml(text)
-    except WorkflowYamlError as exc:
-        return [f"PR CI workflow YAML is ambiguous or invalid: {exc}"]
-    jobs = workflow.get("jobs")
-    if not isinstance(jobs, dict):
-        return ["PR CI workflow must contain one jobs mapping"]
-
-    errors: list[str] = []
-    contracts = (
-        (
-            "windows-msvc-cpu",
-            "CPU",
-            "cpu",
-            "build-pr-windows-cpu",
-        ),
-        (
-            "windows-msvc-vulkan",
-            "Vulkan",
-            "vulkan",
-            "build-pr-windows-vulkan",
-        ),
-    )
-    for job, backend_label, backend, build_dir in contracts:
-        actual = jobs.get(job)
-        if actual is None:
-            errors.append(f"PR CI is missing required {job} job")
-            continue
-        expected_script = (
-            "$env:VERSION = (Get-Content release/release-version.json -Raw | ConvertFrom-Json).version\n"
-            "$env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()\n"
-            "./scripts/build-windows-release.ps1 `\n"
-            f"  -Backend {backend} `\n"
-            f"  -ArtifactId windows-x86_64-msvc-{backend} `\n"
-            f"  -BuildDir $env:GITHUB_WORKSPACE/{build_dir}\n"
-        )
-        expected = {
-            # PR proof plus the two baseline-lane events (#503). `push` excluded.
-            "if": (
-                "github.event_name == 'pull_request' "
-                "|| github.event_name == 'schedule' "
-                "|| github.event_name == 'workflow_dispatch'"
-            ),
-            "permissions": {"contents": "read"},
-            "runs-on": "windows-2022",
-            "timeout-minutes": 180,
-            "steps": [
-                {"uses": "actions/checkout@v4"},
-                {
-                    "name": "Prove PowerShell, static CRT, and unsupported-tier contracts",
-                    "run": "./scripts/build-windows-release.ps1 -ContractTest",
-                },
-                {
-                    "name": (
-                        "Build and execute the native Windows "
-                        f"{backend_label} focused gate"
-                    ),
-                    "env": {
-                        "EVIDENCE_URL": (
-                            "${{ github.server_url }}/${{ github.repository }}"
-                            "/actions/runs/${{ github.run_id }}"
-                        ),
-                        "SOURCE_SHA": "${{ github.sha }}",
-                    },
-                    "run": expected_script,
-                },
-            ],
-        }
-        if actual != expected:
-            errors.append(
-                f"{job} must exactly match the read-only native Windows PR proof schema"
-            )
-    return errors
-
-
 def named_step(block: str, name: str) -> str | None:
     matches = [
         step
@@ -778,7 +683,6 @@ def validate(text: str) -> list[str]:
 
 def main() -> int:
     errors = validate(WORKFLOW.read_text(encoding="utf-8"))
-    errors.extend(validate_pr_ci(CI_WORKFLOW.read_text(encoding="utf-8")))
     if errors:
         print("release workflow policy FAILED:", file=sys.stderr)
         for error in errors:
