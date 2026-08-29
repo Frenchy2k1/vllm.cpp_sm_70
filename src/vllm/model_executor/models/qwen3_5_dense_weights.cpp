@@ -14,7 +14,9 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
+#include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/platforms/interface.h"
@@ -132,8 +134,30 @@ bool DirectDeviceLoadEligible(vt::Queue* queue) {
   const char* direct = std::getenv("VT_DIRECT_DEVICE_LOAD");
   if (direct != nullptr && direct[0] == '0') return false;
   const auto& platform = platforms::GetPlatform(queue->device.type);
-  return !platform.is_unified_memory() &&
-         platform.residency_policy().release_host_weights_after_upload;
+  // LOAD-MODELOPT-NVFP4-BORROW (issue #1647). This used to also require
+  // `!platform.is_unified_memory()`, which is TRUE on GB10, so
+  // `StageAndReleaseLoadedDense` -- the only caller of
+  // `ReleaseResidentQwen3_5DenseHostWeights` -- never ran on the one device in
+  // this fleet whose host and device memory come out of the same 119 GiB.
+  //
+  // TWO PREDICATES DISAGREED ABOUT ONE DEVICE, and the staging one is right.
+  // `needs_weight_staging()` is asked at the top of this function and is
+  // unconditionally true on CUDA; `src/vllm/platforms/cuda.cpp` says why in its
+  // own words -- the CUDA path binds distinct device-resident buffers
+  // "regardless of GB10 being physically unified". `interface.h` says the same
+  // from the other side: `is_unified_memory()` "answers the OPPOSITE question",
+  // because a `cudaMalloc` pointer there is still not host-dereferenceable.
+  // `ResidentNvfp4` settles it by construction: it allocates and copies with no
+  // aliasing branch, so on GB10 there really are two buffers.
+  //
+  // THIS DOES NOT ARM THE ALIASING USE-AFTER-FREE the release site's comment
+  // records. That site asks the invariant `HostMirrorIsRedundant(tensor)` --
+  // `d_dev != nullptr` -- rather than the `d_dev || d_dev_f32` proxy, and
+  // `ResidentWeight`'s alias branch leaves `d_dev` null, so an aliased weight is
+  // never released. Its own conclusion is that the disjunct is redundant on the
+  // staging arm; what changes here is that the invariant now does the work
+  // instead of an accident of platform naming.
+  return platform.residency_policy().release_host_weights_after_upload;
 }
 
 void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
@@ -416,16 +440,48 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
       r.alpha = r.scale2 * (1.0F / is);
     }
   }
-  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
-  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
-           "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
-  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
-  MaybeReleaseSourcePages(packed.data, packed.nbytes);
-  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
-  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
-           "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
-  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
-  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  // ENG-LOAD-DIRECT-UPLOAD (issue #150), widened to the ModelOpt SPELLING by
+  // LOAD-MODELOPT-NVFP4-BORROW (issue #1647). Both payloads are verbatim, byte
+  // for byte identical to what `LoadCtNvfp4Raw` borrows twenty lines up: the
+  // same E2M1 nibbles and the same fp8-e4m3 group-16 scale, differing only in
+  // the tensor NAMES and in a scalar global-scale convention. Nothing about the
+  // ranges made this arm ineligible; it was simply never given the attempt.
+  //
+  // WHAT IT COST. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` declares
+  // `quant_method: "modelopt"`, so all 193 of its NVFP4 modules take this
+  // branch. Copying put ~21 GiB into ANONYMOUS heap where upstream holds
+  // reclaimable page cache (`weight_utils.py:969-974,1247` at the pin
+  // `5559679229bc961848b121ccdeaa8fa5d79bec98` streams a file-backed mmap into a
+  // device parameter allocated before any file is opened,
+  // `base_loader.py:52-58`). The expensive half is downstream:
+  // `AdoptDeviceBytesAsHost` is gated on
+  // `w.mmap_src != nullptr && w.bytes.borrowed()`, so `ResidentNvfp4`'s
+  // post-upload adoption -- which releases the consumed source pages and, on a
+  // host-addressable device, re-points `bytes` at the device allocation -- was a
+  // SILENT NO-OP for every weight loaded here. On GB10, where a device
+  // allocation IS host RAM, that is a packed host copy plus a packed device copy
+  // out of one 119 GiB pool, and the box reboots.
+  //
+  // The fallback below is unchanged and still runs whenever the borrow declines,
+  // which `BorrowStTensorBytes` does for a synthetic tensor, a size that does not
+  // line up, or `VT_LOAD_DIRECT_UPLOAD=0`. The lever can only cost residency,
+  // never correctness.
+  if (!BorrowStTensorBytes(r.packed, packed, vt::DType::kI8,
+                           {out_dim, in_dim / 2})) {
+    r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+    VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+             "qwen3_5 dense: ModelOpt packed byte-size mismatch for " + proj);
+    std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+    MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.scale, ws, vt::DType::kI8,
+                           {out_dim, in_dim / 16})) {
+    r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+    VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+             "qwen3_5 dense: ModelOpt scale byte-size mismatch for " + proj);
+    std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+    MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  }
   return r;
 }
 
@@ -438,8 +494,10 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
 // and the disagreement is where a silent wrong-scale bug lives: #1166 measured a
 // `[96, 40]` block grid passing a per-tensor scale reader's byte floor and being
 // applied to the whole `[N, K]` weight, stopped only by the tensor NAME. The
-// checkpoint's `modules_to_not_convert` is the other half -- ~400 entries on
-// `Qwen/Qwen3.8-27B-FP8` -- which a probe reproduces only by accident.
+// checkpoint's `modules_to_not_convert` is the other half -- 882 entries on
+// `Qwen/Qwen3.8-27B-FP8` @`017b9c7a`, 636 of them outside the vision tower --
+// which a probe reproduces only by accident (#1614; the "~400" this line
+// carried was wrong by more than 2.2x however the list is sliced).
 //
 // Six combinations, four of them refused by name; the table is in the spec.
 bool IsFp8BlockProjection(const TensorExists& has, const std::string& proj,
@@ -729,6 +787,10 @@ bool DenseLmHeadFp4Enabled() {
   return v == nullptr || v[0] != '0';
 }
 
+bool DenseLmHeadTakesNvfp4(const TensorExists& has, const std::string& proj) {
+  return DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj);
+}
+
 void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out) {
@@ -738,7 +800,7 @@ void LoadDenseLmHead(const TensorResolver& get, const TensorExists& has,
   // LoadNvfp4AnyNaming every other NVFP4 projection takes, so the ModelOpt vs
   // compressed-tensors global-scale convention is handled in exactly one place.
   // vLLM's mixed scheme likewise resolves a quantized head (modelopt.py:2491-2496).
-  if (DenseLmHeadFp4Enabled() && IsNvfp4Projection(has, proj)) {
+  if (DenseLmHeadTakesNvfp4(has, proj)) {
     fp4_out = LoadNvfp4AnyNaming(get, has, proj);
     // The head is W4A16, whatever the naming. `LoadNvfp4AnyNaming` decides
     // activation-quant per SPELLING — the ModelOpt arm ignores `input_scale`
@@ -957,6 +1019,65 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // which leaves the routing below byte-identical to before this row.
   const Fp8BlockQuantConfig block = ReadFp8BlockQuantConfig(config);
 
+  // QUANT-QWEN38-27B-NVFP4-ARM (#821). The SECOND whole-checkpoint read of the
+  // quantization config, for the compressed-tensors spelling this file's
+  // per-projection dtype probe cannot resolve.
+  //
+  // `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d...` declares
+  // `format: "mixed-precision"`: layers 0-55's MLP is NVFP4 W4A4 and layers
+  // 56-63's MLP is FP8 W8A8, under the SAME module names. Which arm a
+  // projection takes is a REGEX OVER LAYER INDICES in `config_groups`, so no
+  // dtype probe can recover it — and its FP8 group ships a PER-OUTPUT-CHANNEL
+  // BF16 `weight_scale` with DYNAMIC per-token activations, which this file's
+  // `LoadFp8Raw` rung cannot represent. Before this call the loader entered the
+  // per-tensor arm anyway and died on `tensor not found:
+  // ...in_proj_qkv.input_scale`, a sentence about a checkpoint that is
+  // complete: the artifact ships ZERO `*.input_scale` because its activation
+  // scheme is dynamic, exactly as its config says.
+  //
+  // Empty on every checkpoint that is not compressed-tensors, and on every
+  // compressed-tensors checkpoint whose groups this build can execute, so every
+  // arm that loaded before this row still loads byte-identically.
+  const std::string ct_refusal =
+      layers::compressed_tensors::RefusalForHfConfigRaw(config.raw, all_names);
+  VT_CHECK(ct_refusal.empty(), "qwen3_5 dense: " + ct_refusal);
+
+  // QUANT-QWEN38-27B-NVFP4-ARM W5 (#821, campaign #1574). The THIRD
+  // whole-checkpoint read, for the OTHER `mixed-precision` spelling: ModelOpt's.
+  //
+  // Two 27B artifacts in this family declare `quant_method: "modelopt"`,
+  // `quant_algo: "MIXED_PRECISION"` and a `quantized_layers` map of exact
+  // module names — `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160`, which this tree has
+  // loaded and measured since #466, and `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`
+  // @ `36f717a2`. Both split 401 Linears into 208 per-tensor STATIC FP8 and 193
+  // W4A16_NVFP4 group_size 16. Neither is compressed-tensors, so the read above
+  // stops at `quant_method` and answers "" for both, and until this call
+  // NOTHING in this tree read either config: every routing decision for them
+  // was made by probing which tensor NAMES are present.
+  //
+  // That probe cannot be wrong about the bytes and it can be wrong about the
+  // CHECKPOINT, in both directions. A module the producer declared FP8 that
+  // ships an NVFP4 spelling takes the NVFP4 arm; a module declared unquantized
+  // that ships scales takes a quantized arm. Both load, both produce plausible
+  // numbers, and both match tokens while moving the wrong bytes — the one
+  // defect class `AGENTS.md` §"Inherit vLLM defaults" says a token gate cannot
+  // see. So the declaration is CROSS-CHECKED against the shipped spelling and a
+  // disagreement is refused by name.
+  //
+  // This CHECKS the probe rather than replacing it: no checkpoint whose config
+  // and tensors agree takes a different arm than it did before this line, and
+  // every non-ModelOpt checkpoint answers "" without reading anything. Routing
+  // by the declared algorithm instead of by the probe is a larger change that
+  // would move a gate model's arm; it is listed under `## Owed` in
+  // `.agents/specs/qwen38-27b-quant-arms.md` and tracked by its own issue.
+  const nlohmann::json* quant =
+      layers::compressed_tensors::QuantizationConfigOf(config.raw);
+  if (quant != nullptr) {
+    const std::string modelopt_refusal =
+        layers::modelopt::RefusalForQuantizationConfig(*quant, all_names);
+    VT_CHECK(modelopt_refusal.empty(), "qwen3_5 dense: " + modelopt_refusal);
+  }
+
   Qwen3_5DenseWeights w;
   // QWEN38-PER-CHANNEL-GDN W8A16: keep the per-channel fp8 projections raw (1
   // B/elem) instead of the bf16 dequant (2 B/elem, the measured 6.72->13.44
@@ -1003,15 +1124,21 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 //
 // M3 refused every LOADED block weight, because the dense forward knew only
 // fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
-// through to an EMPTY bf16 tensor. The forward reads them now
-// (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
-// what is left to refuse is a DEVICE with no kernel: `vt::MatmulFp8BlockScaled`
-// is a CPU correctness reference and the mainloop-scaled CUTLASS kernel is
-// milestone M5. This runs from `PrepareQwen3_5Dense`, i.e.
+// through to an EMPTY bf16 tensor. The forward reads all ten projections now,
+// through THREE entry points rather than one:
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them,
+// `MatmulFp8BlockMergedD` reads q/k/v as one operand, and
+// `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj` and `up_proj`. So
+// what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
+// mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
+// this now fires for a CUDA arch outside that cell. It stays inert on CPU,
+// where `vt::MatmulFp8BlockScaled` is registered as a correctness reference.
+// This runs from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, which every runner calls unconditionally before the
 // first forward and before any graph capture
 // (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a
-// capture rather than inside the first GEMM. Deleted by M5.
+// capture rather than inside the first GEMM. M5 NARROWED this rather than
+// deleting it: an arch outside the CUTLASS cell must still be refused by name.
 void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
                                           vt::DeviceType device) {
   if (dense_fp8_block::BlockFp8Runnable(device)) return;
@@ -1087,7 +1214,36 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(
     Qwen3_5DenseWeights& weights) {
   size_t released = 0;
   const auto release = [&released](OwnedTensor& tensor) {
-    if (tensor.HasHostBytes() && (tensor.d_dev || tensor.d_dev_f32)) {
+    // `HostMirrorIsRedundant`, NOT `d_dev || d_dev_f32` (the second instance of
+    // the use-after-free W0f introduced; #1299).
+    //
+    // `d_dev_f32` is a bf16->f32 UPCAST into a separate device allocation. It is
+    // not a copy of these bytes and it can never stand in for them, so it never
+    // made a host mirror redundant — it only looked like it did while every
+    // weight that had one also had a `d_dev`. On the aliasing arm that stopped
+    // being true: `PrepareBf16Resident` passes exactly four weights to BOTH
+    // `raw()` and `f32()` — `gdn.conv1d_weight`, `gdn.norm_weight`,
+    // `attn.q_norm`, `attn.k_norm` — and there `raw()` ALIASES (leaving `d_dev`
+    // null) while `f32()` allocates (setting `d_dev_f32`). The disjunction then
+    // passes and frees the very bytes the aliased raw tensor points at.
+    //
+    // NOTHING REACHES THAT COMBINATION, AND SINCE #1647 THE INVARIANT IS THE
+    // ONLY REASON. This paragraph used to name a second one:
+    // `DirectDeviceLoadEligible` also required `!platform.is_unified_memory()`,
+    // and on CUDA `is_unified_memory()` and `host_memory_is_device_addressable()`
+    // are the SAME `pageable && integrated` conjunction, computed independently
+    // in `src/vt/cuda/cuda_backend.cu` and `src/vllm/platforms/cuda.cpp`. That
+    // equality was an accident — no rule states it, no document records it and
+    // no gate holds it — and the sentence written here said so and concluded
+    // that asking the invariant instead of a proxy costs nothing. #1647 removed
+    // the accident, because `is_unified_memory()` was switching the whole
+    // stage-and-release lane off on the one device that needs it. What is left
+    // is the invariant itself, doing the work it was already doing: on the
+    // aliasing arm `ResidentWeight` leaves `d_dev` null, so `HostMirrorIsRedundant`
+    // answers false and an aliased weight is never released. The `d_dev_f32`
+    // disjunct stays deleted, and it stays redundant on the staging arm, where
+    // every weight with a `d_dev_f32` has a `d_dev` too.
+    if (tensor.HasHostBytes() && HostMirrorIsRedundant(tensor)) {
       released += tensor.bytes.size();
       tensor.ReleaseHost();
     }

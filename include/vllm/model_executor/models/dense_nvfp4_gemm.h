@@ -77,6 +77,31 @@ using vt::Backend;
 using vt::DType;
 using vt::Tensor;
 
+// ── A2-Q2b (#810): the CALLER-OWNED resident, so a consumer can opt OUT of the
+// address-keyed cache below without hand-rolling a parallel Marlin path.
+//
+// `MarlinDenseResidentFor` (below) keys its `static` map on the ADDRESS of the
+// `Nvfp4Weight`. That is issue #984: destroy one engine and build another in
+// the same process and the allocator can hand the new weights the old address,
+// so the new weights inherit an entry marked `ready` whose device pointers
+// belong to the previous engine. `Nvfp4Weight` already carries the
+// `resident_marlin` `ResidentSlot` that #237 added to fix exactly this, and
+// this header does not read it.
+//
+// A2-Q2b does not fix #984 — that needs the two-engine red-before #984 asks
+// for, and it is out of this row's scope. It declines to INHERIT it: NemotronH
+// owns its lm_head resident in a `ResidentSlot` (the same shape A2-Q2a used for
+// the MoE arena) and hands it in here. Threading the resident through is
+// additive — every existing caller passes nothing and keeps the address-keyed
+// default byte-for-byte — so this EXTENDS the seam rather than forking it,
+// which is what AGENTS.md `## Shared seams` asks for when the seam cannot
+// represent the behaviour a consumer needs.
+//
+// Declared unconditionally (defined only under VT_MARLIN_NVFP4) so the
+// dispatcher's signature does not change with the build flag; a pointer to an
+// incomplete type is all the non-Marlin build ever needs.
+struct MarlinDenseResident;
+
 // VT_NVFP4_MARLIN (default ON): the vendored Marlin NVFP4 W4A16 GEMM is the
 // validated path (35B gate +22%, token-for-token vs the pinned oracle). Only an
 // explicit VT_NVFP4_MARLIN=0 opts back out to the naive redundant-dequant kernel
@@ -235,7 +260,7 @@ inline bool GateUpPairFusableShape(const Nvfp4Weight& gw, const Nvfp4Weight& uw)
 // is verbatim the defect recorded RED-first for the OTHER implementation at
 // tests/vllm/model_executor/layers/test_linear_method.cpp:185-201 — group-32 E8M0
 // scales misread as group-16 fp8-e4m3, "GROSSLY wrong". No dense loader sets
-// `is_mxfp4` today (`LoadNvfp4AnyNaming`, qwen3_5_dense_weights.cpp:358-395, only
+// `is_mxfp4` today (`LoadNvfp4AnyNaming`, qwen3_5_dense_weights.cpp:359-396, only
 // ever produces NVFP4), so the defect is latent, not live — one loader line away.
 // Refusing it here costs the currently-reached W4A16 NVFP4 config nothing
 // (`is_mxfp4` is false on both halves) and keeps the split pair, which DOES
@@ -541,9 +566,11 @@ inline void* DenseMarlinWorkspace(Dev d, int* out_sms) {
 
 // y[M,N] = x[M,K] bf16 @ dequant(w).T via the single-expert Marlin W4A16 GEMM.
 inline DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w,
-                               DType out_dtype) {
+                               DType out_dtype, MarlinDenseResident* resident = nullptr) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  MarlinDenseResident& mr = MarlinDenseResidentFor(&w);
+  // A2-Q2b: a caller that owns the resident's lifetime supplies it; everyone
+  // else keeps the address-keyed cache, unchanged (#984).
+  MarlinDenseResident& mr = resident != nullptr ? *resident : MarlinDenseResidentFor(&w);
   if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
@@ -758,6 +785,47 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 #endif  // VT_MARLIN_NVFP4
 
 // --- The W4A16 dispatcher ---------------------------------------------------
+
+// ── A2-Q2b (#810): the dispatcher's OWN gate, as ONE predicate ───────────────
+//
+// `MatmulNvfp4W4A16D` below selects Marlin on THREE clauses. A caller that has
+// to know the answer BEFORE it calls — because the fallback is not merely
+// slower for it but pathological — must ask this function rather than restate
+// the clauses, and this exists because a restatement is exactly what went
+// wrong. A2-Q2b's first submission restated two of the three in NemotronH's
+// `DeviceLmHeadEligible` and dropped `MarlinW4A16Enabled()`, so under an
+// explicit `VT_NVFP4_MARLIN=0` the model said "eligible", the dispatcher fell
+// to the naive redundant-dequant arm, and because the caller hands in a
+// TRANSIENT `Nvfp4Weight` view the `ResidentNvfp4` cache below could never hit
+// — re-uploading the whole `[vocab, hidden]` operand on every decode step.
+//
+// A token gate cannot see any of that: the fallback computes the SAME value.
+// One expression with two call sites is what makes the two unable to drift.
+inline bool MarlinW4A16Selects(Dev d, DType act_dtype) {
+  // NO `#ifdef VT_MARLIN_NVFP4` HERE, and the absence is the design. This site
+  // only SELECTS a path, and every term it reads exists in every build:
+  // `MarlinW4A16Enabled()` is declared above the guarded region, and
+  // `vt::OpRegistered` IS the op/provider table's own answer to "is the Marlin
+  // arm realized for this device".
+  //
+  // The build flag and the registration are the SAME condition, so the guard
+  // would decide nothing the query does not already decide. `CMakeLists.txt`'s
+  // one `if(VLLM_CPP_MARLIN)` block adds `src/vt/cuda/cuda_moe_marlin.cu` —
+  // whose file-scope `Registrar` holds the tree's only
+  // `RegisterOp(OpId::kMoeGroupedGemmNvfp4Marlin, …)` — and defines
+  // `VT_MARLIN_NVFP4=1`, in that same block. A build without the macro
+  // therefore registers nothing, and this resolves false on exactly the builds
+  // a `#ifdef` would have excluded. Asking the table rather than the
+  // preprocessor is what `scripts/check-device-leakage.py` asks of a selection,
+  // and it is the call `nemotron_h_device.cpp`'s `moe_on_device` already made.
+  //
+  // The device clause is likewise an OP-AVAILABILITY question, not a
+  // `== kCUDA` one (registered only for kCUDA today, so this is byte-identical
+  // on the production build — accelerator-seam audit class A, work row S4).
+  return vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
+         MarlinW4A16Enabled() && act_dtype == DType::kBF16;
+}
+
 // y[M,N] = x[M,K] @ dequant(w).T for an NVFP4 W4A16 weight. Mirrors vLLM's
 // forced-Marlin selection for `use_a16` (__init__.py:879-881): on CUDA with a
 // BF16 activation take Marlin; otherwise fall back to the naive
@@ -765,19 +833,18 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 // reference). `w` MUST be W4A16 (alpha == 0) — a true-W4A4 weight belongs to
 // qwen3_5.cpp's private fp4-activation path and is rejected here.
 inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
-                              DType out_dtype) {
+                              DType out_dtype, MarlinDenseResident* resident = nullptr) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   VT_CHECK(!w.IsTrueW4A4(),
            "dense_nvfp4: true-W4A4 weight routed into the W4A16 dispatcher");
 #ifdef VT_MARLIN_NVFP4
   // Marlin requires a bf16 activation (vLLM's a16 path is bf16/fp16 too). The
-  // device gate is an OP-AVAILABILITY question, not a "== kCUDA" question: ask
-  // the vt::OpProvider table whether the Marlin NVFP4 grouped-GEMM is realized
-  // for this device (registered only for kCUDA today, so this is byte-identical
-  // on the production build — accelerator-seam audit class A, work row S4).
-  if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
-      MarlinW4A16Enabled() && x.dtype == DType::kBF16)
-    return MatmulNvfp4MarlinD(d, x, w, out_dtype);
+  // three clauses live in `MarlinW4A16Selects` above so a caller can ask the
+  // SAME question in advance instead of restating them (A2-Q2b).
+  if (MarlinW4A16Selects(d, x.dtype))
+    return MatmulNvfp4MarlinD(d, x, w, out_dtype, resident);
+#else
+  (void)resident;
 #endif
   ++MutableW4A16Stats().fallback_gemms;
   DBuf dout(d, out_dtype, {M, N});

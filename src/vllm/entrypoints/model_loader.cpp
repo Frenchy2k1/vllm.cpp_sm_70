@@ -22,11 +22,16 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
+#include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
@@ -36,6 +41,7 @@
 #include "vllm/transformers_utils/hf_cache.h"  // ENG-HF-MODEL-DOWNLOAD (#1280)
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
+#include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
@@ -147,11 +153,49 @@ vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
   return resolved.device;
 }
 
+// ENG-HYBRID-PLACEMENT W2 (#2023): build the resolved placement and SAY it.
+//
+// Called from `SelectQueueForModel`, which is the one function every load path
+// goes through and which already owns the device decision — its neighbour comment
+// records that it and `ResolveModelDeviceType` cannot answer differently. That
+// makes this "at model build" in the only sense the spec means, and it covers the
+// GGUF and safetensors paths with one call site rather than three.
+//
+// W2 RESOLVES AND REPORTS; IT MOVES NOTHING. The returned placement is dropped
+// here on purpose: W3 owns the routing that reads it. What lands today is the
+// refusal of an impossible placement and the line an operator needs to attribute
+// a slow run, and a placement that changes nothing prints nothing at all, so an
+// ordinary load is byte-identical on stderr as well as in behaviour.
+void ReportDevicePlacement(vt::DeviceType engine_device) {
+  const std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  if (overrides.empty()) return;
+  const vllm::DevicePlacement placement =
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device);
+  const std::string described = placement.Describe();
+  if (described.empty()) {
+    // Non-empty overrides that place NOTHING away from this device: `cpu_moe` on
+    // a CPU engine is exactly this. Say so, because the operator asked for
+    // something and is entitled to know it was inert rather than ignored.
+    std::cerr << "engine: device placement: " << overrides.size()
+              << (overrides.size() == 1 ? " override resolves"
+                                        : " overrides resolve")
+              << " to the engine's own device (" << vt::DeviceTypeName(engine_device)
+              << "), so nothing is placed" << std::endl;
+    return;
+  }
+  std::cerr << "engine: device placement: " << described << std::endl;
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vt::DeviceType resolved =
         ResolveModelDeviceType(architecture, device);
+    // NOT reported here. An EXPLICIT device is reported far earlier, in
+    // `FromModelDir`'s up-front device-resolution block, because that is ahead of
+    // all path and weight I/O and is therefore where an operator still sees the
+    // line when the load then fails. Reporting in both places would print twice.
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -159,6 +203,11 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
     // be created must FAIL the load loudly, never silently serve on CPU.
     return vt::GetBackend(resolved).CreateQueue();
   }
+  // The AUTO path reports here and not earlier: the architecture participates in
+  // the answer (`ResolveAutoDevice`), so the up-front block cannot know it yet.
+  // The explicit path is the other way round and is reported there.
+  ReportDevicePlacement(ResolveModelDeviceType(architecture, device));
+
   // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
   // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
   // on-device instead of the CPU dequant reference.
@@ -296,33 +345,11 @@ std::string ResolveDflashDraftDir(const std::string& path) {
   return vllm::transformers_utils::ResolveCachedSnapshotDir(path, hub_dir);
 }
 
-// Read a named BF16 tensor from safetensors shards into a host OwnedTensor
-// (mirrors the D2/D3 parity harness LoadTargetBf16). `nk` marks the torch
-// [N=out,K=in] Linear orientation for vt::MatmulBT (lm_head); false for the
-// embed lookup table.
-vllm::OwnedTensor LoadNamedBf16(const std::vector<vllm::SafetensorsFile>& shards,
-                               const std::string& name, bool nk) {
-  for (const vllm::SafetensorsFile& s : shards) {
-    for (const std::string& n : s.Names()) {
-      if (n != name) continue;
-      const vllm::StTensor& t = s.Get(name);
-      if (t.dtype != "BF16") {
-        throw std::runtime_error("dflash: target tensor " + name +
-                                 " is not BF16 (got " + t.dtype + ")");
-      }
-      vllm::OwnedTensor out;
-      out.dtype = vt::DType::kBF16;
-      out.rank = static_cast<int>(t.shape.size());
-      out.nk = nk;
-      for (int i = 0; i < out.rank; ++i)
-        out.shape[i] = t.shape[static_cast<size_t>(i)];
-      out.bytes.resize(t.nbytes);
-      std::memcpy(out.bytes.data(), t.data, t.nbytes);
-      return out;
-    }
-  }
-  return vllm::OwnedTensor{};
-}
+// The loader-local `LoadNamedBf16` that used to live here (the memcpy read of
+// the draft's shared tensors) is gone as of SPEC-DFLASH2 W9 (#1849): its one
+// remaining caller was the shared-embed read, which now goes through the
+// exported borrow-first `LoadDflashSharedEmbedBf16` (qwen3_dflash.h) so the
+// borrow is gated at the exact function production calls.
 
 // SPEC-DFLASH-GGUF B1: WHERE the draft's SHARED bf16 embed_tokens + lm_head
 // come from.
@@ -347,15 +374,40 @@ class SharedHeadSource {
   // Fill the draft's two shared tensors. Both arms produce the SAME thing: bf16
   // `[vocab, H]` with nk=false for the gather table and the same `[vocab, H]`
   // with nk=true for the MatmulBT head. Throws naming the source on absence.
-  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head) const {
+  //
+  // `head_was_quantized` is REQUIRED and has no default, which is a deliberate
+  // change from the defaulted `= nullptr` it carried through W3. SPEC-DFLASH2's
+  // fresh review found that deleting the third ARGUMENT at the DFlash call site
+  // below compiled clean and left all 38 dflash/gguf suites green after a full
+  // relink: the default silently turned the carry off, `lm_head_dequantized`
+  // stayed false, and D12's `RefuseQuantizedDflash2LmHead` guard lost its
+  // trigger while every gate stayed green. That is a silent-wrong the type system
+  // can refuse outright, so it does: every caller now names what it wants, and
+  // dropping the argument is a COMPILE ERROR rather than a green run. The DSpark
+  // caller passes `nullptr` explicitly and says why.
+  //
+  // `head_fp4` is the SPEC-DFLASH2-QUANT-LMHEAD (#1628) owner and is REQUIRED
+  // for the same reason `head_was_quantized` is: a defaulted argument is what
+  // silently turned the D12 carry off. `nullptr` means "this lane cannot compute
+  // with a packed head", and the safetensors arm then refuses a quantized target
+  // head exactly as it did before that row. The DSpark caller passes it and says
+  // why; the GGUF arm never sets it, because a GGUF target's `output.weight` is
+  // dequantized on the way in and is the case D12 refuses.
+  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
+                bool* head_was_quantized, vllm::Nvfp4Weight* head_fp4) const {
+    if (head_was_quantized != nullptr) *head_was_quantized = false;
+    if (head_fp4 != nullptr) *head_fp4 = vllm::Nvfp4Weight{};
     if (gguf_ != nullptr) {
-      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head);
+      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
-      *embed = LoadNamedBf16(
-          *shards_, "model.language_model.embed_tokens.weight", false);
-      *head = LoadNamedBf16(*shards_, "lm_head.weight", true);
+      // SPEC-DFLASH2 W9 (#1849): both shared reads are borrow-first now (the
+      // fail-closed BorrowStTensorBytes seam) — on a real target each copy
+      // this replaces was a ~2.54 GB anonymous buffer.
+      *embed = vllm::LoadDflashSharedEmbedBf16(
+          *shards_, "model.language_model.embed_tokens.weight");
+      vllm::LoadDflashSharedLmHead(*shards_, head, head_fp4);
     }
-    if (embed->Empty() || head->Empty()) {
+    if (embed->Empty() || (head->Empty() && (head_fp4 == nullptr || head_fp4->Empty()))) {
       throw std::runtime_error(
           "dflash: the target's bf16 embed_tokens + lm_head (which the draft "
           "SHARES) were not found in " +
@@ -448,21 +500,44 @@ std::vector<std::string> ReadDflashDraftArchitectures(const std::string& path) {
   return architectures;
 }
 
-// Refuse a DFlash2 draft BY NAME, before any weight is read.
+// Classify a DFlash2 draft BY NAME, before any weight is read, and refuse the arm
+// that is still missing.
 //
 // Upstream selects a different model class and a different speculator on the
 // `DFlash2DraftModel` architecture (registry.py:628 and
 // v1/worker/gpu/spec_decode/__init__.py:12-17 @ vllm-project/vllm#52816 head
 // `19c9351904df4c63042671bc67a866ca48dc7d6f`). This engine selects the draft lane
 // from the CLI method string alone, and a DFlash2 checkpoint's tensor set is
-// DFlash1's PLUS the conv and selector tensors -- so it loads through the DFlash1
-// loader with nothing missing and nothing thrown, and drafts with both new
-// mechanisms simply absent. That draft proposes worse tokens, the verify is
-// lossless, so the emitted tokens are still the target's and only acceptance
-// falls. AGENTS.md requires an unimplemented arm to refuse with the missing part
-// named rather than to degrade in silence, and this refusal is what SPEC-DFLASH2
-// W1 ships.
-void RefuseDflash2Draft(const std::string& draft_model_path) {
+// DFlash1's PLUS the conv and selector tensors -- so without this classification
+// it loads through the DFlash1 loader with nothing missing and nothing thrown,
+// and drafts with both new mechanisms simply absent. That draft proposes worse
+// tokens, the verify is lossless, so the emitted tokens are still the target's
+// and only acceptance falls.
+//
+// SPEC-DFLASH2 W2 (#1314) SPLITS the two container arms, because they are no
+// longer in the same state:
+//
+//  * SAFETENSORS is ADMITTED. Its grouped dynamic depthwise convolution is
+//    implemented (`vt::DFlashGroupedConv`), loaded (`LoadQwen3DFlash` reads the
+//    per-layer `attention_conv`/`mlp_conv` tensors) and RUN (every layer body of
+//    `Qwen3DFlashModel`), and as of W3 so is its CANDIDATE SELECTOR
+//    (`vllm::v1::Dflash2SelectCandidates`). What is still missing is the PATH
+//    WALK, and that is refused BY NAME one step later, after both have executed,
+//    at `RefuseDflash2PathWalk`. Refusing here instead would leave every
+//    line of W2 and W3 unreachable from any production entry point -- AGENTS.md
+//    `## Nothing lands dead`. The notice below is what a user gets at STARTUP so
+//    the later refusal is not a surprise; it is a notice and not a warning about
+//    a degraded result, because there is no degraded result: the engine refuses.
+//  * GGUF was REFUSED through W4, because the GGUF drafter ARM was wave W5:
+//    neither the config reader nor the weight path had a name for a conv tensor,
+//    so admitting the file would have loaded a DFlash1 draft out of a DFlash2
+//    checkpoint -- the exact silent degradation this function exists to prevent.
+//    W5 (#1314) LANDS that arm, so the refusal is gone and this container gets
+//    the same startup notice the other one does. Both arms now print and neither
+//    throws; the function stays because the notice is what tells a user the port
+//    is beyond the parity pin and carries no throughput number, which is not
+//    readable off any checkpoint.
+void CheckDflash2DraftArm(const std::string& draft_model_path) {
   // WHAT IDENTIFIED THE FILE, which differs by container and is quoted back to
   // the user because the two arms are otherwise indistinguishable in a message.
   std::string identity;
@@ -482,31 +557,45 @@ void RefuseDflash2Draft(const std::string& draft_model_path) {
     } catch (const std::exception&) {
       return;
     }
-    identity = "carries the DFlash2-only metadata key \"" + matched + "\"";
+    identity = "carries the DFlash2-only metadata key \"" + matched +
+               "\" (a GGUF declares no architecture this could read: the "
+               "published DFlash2 drafter writes the same \"dflash\" a DFlash1 "
+               "drafter writes)";
   } else {
+    // The safetensors arm, ADMITTED as of W2 and drafting as of W4. This is the
+    // container upstream classifies on, and the only one that HAS an
+    // architecture string to classify with.
     const std::vector<std::string> architectures =
         ReadDflashDraftArchitectures(draft_model_path);
     if (!vllm::SpeculativeConfig::IsDflash2Draft(architectures)) return;
     identity = "declares architecture \"DFlash2DraftModel\"";
   }
-  throw std::invalid_argument(
-      "speculative-config: the draft checkpoint at \"" + draft_model_path +
-      "\" " + identity +
-      ", and the DFlash2 draft lane "
-      "is not implemented here. Two mechanisms are missing: the grouped dynamic "
-      "depthwise convolution wrapped around each attention and each MLP sublayer, "
-      "and the candidate selector that replaces the per-slot argmax with a scored "
-      "path walk over the target head's top-K "
-      "(vllm/model_executor/models/qwen3_dflash2.py and "
-      "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py @ "
-      "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f). "
-      "Loading it through the DFlash1 lane instead would succeed, because a "
-      "DFlash2 checkpoint carries DFlash1's whole tensor set, and it would draft "
-      "worse tokens with no visible symptom: the verify is lossless, so the "
-      "emitted tokens are still the target's and only acceptance falls. Owed by "
-      "row SPEC-DFLASH2 (.agents/specs/dflash2-spec-decode.md), issue #1314 "
-      "(https://github.com/mudler/vllm.cpp/issues/1314). Use a DFlashDraftModel "
-      "checkpoint until that row lands.");
+  // W4 (#1314) removed the boundary on the safetensors arm; W5 removes it on the
+  // GGUF one, so this notice is now the function's WHOLE output and both
+  // containers reach it. It still prints, because three things a user cannot
+  // read off the checkpoint are true -- the port is beyond the parity pin, no
+  // throughput number has been taken for it, and the GGUF arm dequantizes a
+  // quantized drafter to bf16 -- and because a notice that vanished the moment
+  // the lane started working would leave a DFlash2 run indistinguishable from a
+  // DFlash1 one in the log.
+  std::cerr
+      << "vllm.cpp: the draft checkpoint at \"" << draft_model_path << "\" "
+      << identity
+      << ". Its grouped dynamic depthwise convolution, its CANDIDATE SELECTOR "
+         "and its PATH WALK are all implemented and will run, so this draft "
+         "DRAFTS -- from safetensors and from GGUF alike (row SPEC-DFLASH2 waves "
+         "W1-W5, .agents/specs/dflash2-spec-decode.md, issue #1314). Two things "
+         "are still owed and neither is silent: a GGUF drafter is DEQUANTIZED "
+         "wholesale to bf16 at load, so a k-quant draft costs its bf16 residency "
+         "rather than its file size, and no throughput number has been taken for "
+         "this architecture -- a DFlash2 draft runs its block forward off the "
+         "paged CUDA-graph fast path, because the candidate selector needs the "
+         "hidden states of the same forward its logits came from. This port "
+         "mirrors vllm-project/vllm#52816, which MERGED upstream on 2026-08-21 "
+         "at head 3406ec1dae9916f920b90f0dbf90dcf54923d042, merge commit "
+         "b389ac29465b33f9e9c534df221ea3c129e9793f. It does not advance the "
+         "parity pin, and the port is not yet reconciled onto that merged head "
+         "(issue #1561).\n";
 }
 
 // SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark
@@ -699,7 +788,16 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    shared.LoadInto(&shared_embed, &shared_lm_head);
+    // Both nullptr, and NEITHER a default. The DSpark lane has no DFlash2
+    // selector, so no guard reads a dequantized-head flag here; and its backbone
+    // holds ONE bf16 `lm_head` owner, so there is nowhere to put a packed head.
+    // A quantized target head therefore still refuses at
+    // `LoadDflashSharedLmHead`, by name and at startup. Both are NAMED rather
+    // than omitted so neither can be deleted at the DFlash call site without a
+    // build failure. Owed: .agents/specs/dflash2-spec-decode.md `## Owed` O26,
+    // issue #1628.
+    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr,
+                    /*head_fp4=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {
       draft->dspark->backbone.embed_tokens = std::move(shared_embed);
     }
@@ -763,14 +861,25 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
     source_kind = "safetensors";
   }
 
-  // The draft SHARES the target's embed_tokens + lm_head (bf16 in both
-  // containers of the NVFP4 27B: the safetensors leaves them unquantized, and
-  // the GGUF stores token_embd/output as ggml BF16 next to its NVFP4 body),
-  // exactly as vLLM's skip_substrs(embed_tokens)/tie handling. Common to BOTH
-  // draft sources and BOTH target containers since B1 - the source abstraction
-  // is what lets the four combinations share one code path.
-  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head);
-  draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
+  // The draft SHARES the target's embed_tokens + lm_head, exactly as vLLM's
+  // skip_substrs(embed_tokens)/tie handling. Common to BOTH draft sources and
+  // BOTH target containers since B1 - the source abstraction is what lets the
+  // four combinations share one code path.
+  //
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628) corrects what this comment used to claim,
+  // which was that the head is "bf16 in both containers of the NVFP4 27B". It is
+  // not: `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` stores `lm_head.weight` as
+  // ModelOpt NVFP4 (U8), and the read here refused it by stored dtype. It is now
+  // taken PACKED into `lm_head_fp4`, which is what the target itself computes
+  // with, so the DFlash2 selector reads the target head's exact top-K rather
+  // than a widened head's - the state D12 refuses and the state it admits are
+  // different, and the dtype cannot tell them apart.
+  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head,
+                  &draft->weights.lm_head_dequantized,
+                  &draft->weights.lm_head_fp4);
+  draft->weights.draft_vocab_size = draft->weights.lm_head_fp4.Empty()
+                                        ? draft->weights.lm_head.shape[0]
+                                        : draft->weights.lm_head_fp4.n;
   // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
   // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
   // config, fatal for the forward: the draft sizes its embedding lookup as
@@ -785,6 +894,47 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // the rule at B1, where the rows now come from a GGUF target's token_embd.
   if (draft->config.vocab_size == 0) {
     draft->config.vocab_size = draft->weights.embed_tokens.shape[0];
+  }
+  // SPEC-DFLASH2 W2 (#1314): the conv's block is the QUERY block, and the
+  // resolved `k` is its authority -- exactly as upstream sizes the conv from
+  // `1 + speculative_config.num_speculative_tokens` and never from the config key
+  // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+  // `66e5414c6d75a8529473d977f7458c140bbab8a0`). A conv masking against the wrong
+  // block is acceptance-only and token-invisible, so it is set from ONE place.
+  //
+  // W4 (#1314) made that one place the ONLY place: `LoadQwen3DFlash` no longer
+  // seeds the field from the checkpoint's `block_size`, so deleting this line
+  // leaves 0 rather than a plausible default and the first DFlash2 forward
+  // refuses by name (`Qwen3DFlashModel`'s `conv_block_size must be set` check).
+  // That is the discharge of spec `## Owed` O5's first item: the line was
+  // mutation-proven UNGATED by W2 -- deleting it compiled clean and left every
+  // suite green -- and it is now covered by the production reachability gate,
+  // tests/vllm/v1/spec_decode/test_dflash2_runner_reach.cpp, which generates
+  // through this loader path.
+  if (draft->weights.IsDflash2()) {
+    draft->weights.conv_block_size = draft->k + 1;
+    // GEOMETRY ONLY, and deliberately NOT the boundary. This line used to append
+    // "the candidate selector is NOT implemented", which W3 made false in the
+    // same wave that wrote it: the selector landed and the boundary moved to the
+    // path walk. A user loading a real DFlash2 directory then got that sentence
+    // AND `CheckDflash2DraftArm`'s corrected notice, which contradict each other,
+    // and the stale one named the wave that had just shipped as still owing the
+    // mechanism.
+    //
+    // The boundary has exactly ONE owner, for the reason `FromModelDir` already
+    // states beside its own call: `CheckDflash2DraftArm` runs on every path that
+    // reaches this function -- `ResolveSpecConfig` for the constructor and
+    // `FromModelDir` line ~1889 ahead of every load -- so its notice has already
+    // been printed by the time anything gets here. A second copy adds nothing a
+    // user can act on and cannot be gated from any entry point this repository
+    // can drive (spec `## Owed` O5), so it went stale within one wave and would
+    // again at W4 and W5. What this line uniquely knows is the RESOLVED conv
+    // geometry, which the notice above cannot report because it runs before any
+    // weight is read, so that is all it says.
+    std::cerr << "vllm.cpp: DFlash2 draft: grouped conv taps="
+              << draft->weights.conv_taps
+              << " group=" << draft->weights.conv_group_size
+              << " block=" << draft->weights.conv_block_size << "\n";
   }
   std::cerr << "vllm.cpp: DFlash draft loaded from " << source_kind << " "
             << draft_dir << " (k=" << draft->k << ", taps=" << num_taps
@@ -1052,13 +1202,16 @@ vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
 // (when otherwise compatible).
 bool LoadedEngine::ResolveAsyncEnabled(
     const vllm::SchedulerConfig& scheduler_config, bool runner_supports_async,
-    bool is_pooling_model) {
+    bool is_pooling_model, bool spec_decode_incompatible) {
   // Pooling models resolve async scheduling OFF (the mirror of vLLM disabling
   // it by default for pooling models, vllm/config/vllm.py:1068-1073) — the
   // landed is_pooling_model arm of ResolveAsyncScheduling, wired here since
   // ARCH-ONE-SURFACE ROW 6. false (every text arch) is byte-identical.
+  // spec_decode_incompatible (SPEC-DFLASH2 W7, #1824) is the vllm.py:1076-1087
+  // arm: a speculative method OUTSIDE the Eagle-type family resolves OFF; an
+  // Eagle-type one (mtp/dflash/dspark) passes false and stays ON.
   return vllm::AsyncSchedulingEnabled(scheduler_config.ResolveAsyncScheduling(
-      runner_supports_async, is_pooling_model));
+      runner_supports_async, is_pooling_model, spec_decode_incompatible));
 }
 
 std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
@@ -1068,13 +1221,15 @@ std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     vllm::v1::StructuredOutputManager* structured_output_manager,
     std::optional<vllm::SpeculativeConfig> speculative_config) {
   if (async_enabled) {
-    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189). SPEC-MTP: the
-    // async-scheduling draft-in-output path is deferred, so speculation forces
-    // the synchronous Scheduler below — async_enabled is never true when a
-    // speculative_config is present.
+    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189). SPEC-DFLASH2
+    // W7 (#1824): the speculative_config now rides into the AsyncScheduler —
+    // an Eagle-type speculator keeps async scheduling and the AsyncScheduler
+    // needs the config for num_lookahead_tokens, the spec budget, and the
+    // -1 placeholder assignment.
     return std::make_unique<vllm::v1::AsyncScheduler>(
         std::move(scheduler_config), std::move(kv_cache_config), block_size,
-        enable_caching, structured_output_manager);
+        enable_caching, structured_output_manager,
+        std::move(speculative_config));
   }
   return std::make_unique<vllm::v1::Scheduler>(
       std::move(scheduler_config), std::move(kv_cache_config), block_size,
@@ -1087,6 +1242,49 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     return std::nullopt;  // production default: no speculation.
   }
   const vllm::SpeculativeConfig& cli = *params.speculative_config;
+  // SPEC-DRAFTER-CHAIN W1 (#1522): THE PRODUCTION READER of the parsed chain,
+  // and the reason the field does not land dead.
+  //
+  // W1 lands the field, its validation and its refusals, and NO chain
+  // behaviour. Nothing resolves a chain and nothing changes which speculator
+  // drafts. That leaves exactly one way for the wave to be harmful, and it is
+  // not a malformed document: it is a WELL-FORMED one that parses, stores, and
+  // is then ignored. The engine would draft with one speculator — or with none —
+  // under a document whose author believes it configures several, and any
+  // measurement taken there is a measurement of a configuration nobody chose.
+  // That is #1160's failure with a larger blast radius, so the chain is REFUSED
+  // BY NAME rather than silently reduced.
+  //
+  // FIRST in this function, before every method branch, because two of those
+  // branches read a draft checkpoint's own config.json off disk
+  // (`CheckDflash2DraftArm`, `ReadDsparkDraftKeys`) and because `cli.method` is
+  // EMPTY on a chain config — it would otherwise fall through to the "only
+  // methods mtp, dflash and ngram are supported" line at the bottom and tell the
+  // user that "" is not one of them.
+  //
+  // `FromModelDir` calls this function ahead of its path resolution so the
+  // refusal also precedes every weight operation, which is what G5 means by
+  // "before any weight I/O"; `tests/vllm/entrypoints/test_drafter_chain_reach.cpp`
+  // asserts that ordering by refusing a chain against a path that does not
+  // exist.
+  if (cli.use_drafter_chain()) {
+    std::string listed;
+    for (const vllm::SpeculativeChainEntry& entry : cli.drafter_chain) {
+      if (!listed.empty()) listed += ", ";
+      listed += "\"" + entry.method + "\"";
+    }
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp.drafter_chain\" [" + listed +
+        "] parses and validates here, but NOTHING resolves a chain yet: this "
+        "engine still drafts with exactly one speculator per step. It is "
+        "refused rather than silently reduced to one drafter or to no "
+        "speculation at all, because a run under a configuration nobody chose "
+        "is worse than a run that does not start. Per-sequence resolution is "
+        "owed by row SPEC-DRAFTER-CHAIN wave W3, after the per-drafter "
+        "attribution of W2 (.agents/specs/drafter-chain.md), issue "
+        "https://github.com/mudler/vllm.cpp/issues/1522. Name one method at the "
+        "top level to run today.");
+  }
   // SPEC-DFLASH D5: the block-diffusion drafter. num_speculative_tokens is REQUIRED
   // (= the draft block_size, e.g. 16; speculative.py raises if None) and there is no
   // n_predict-module divisibility (the drafter is non-autoregressive). The concrete
@@ -1107,7 +1305,7 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     // OMISSION rather than by decision. This is the production caller
     // `SpeculativeConfig::IsDflash2Draft` would otherwise lack.
     if (cli.draft_model_path.has_value()) {
-      RefuseDflash2Draft(*cli.draft_model_path);
+      CheckDflash2DraftArm(*cli.draft_model_path);
     }
     vllm::SpeculativeConfig cfg =
         vllm::SpeculativeConfig::ResolveDflash(*cli.num_speculative_tokens);
@@ -1323,14 +1521,115 @@ vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
   // The per-block byte geometry is independent of the block count, so build a
   // probe at the override-or-256 count, read its geometry to resolve the real
   // count, and only rebuild when the resolved count differs.
+  // Once per load — this function is the single call site (the LoadedEngine
+  // ctor's kv_cfg_ member initializer), and ApplyResolvedCacheDType below runs
+  // up to twice.
+  WarnUncalibratedKvScales(params);
   const int probe_blocks = params.num_blocks > 0 ? params.num_blocks : 256;
   vllm::v1::KVCacheConfig probe =
       MakeKVCacheMaybeSpec(model, config, block_size, probe_blocks, spec);
+  // KV-FP8 W3 — the storage dtype is applied to the PROBE, before
+  // ResolveNumBlocks reads its geometry. That ordering IS the halved-block
+  // feature: `KVBytesPerBlock(probe)` is the divisor knob 2 sizes the pool with,
+  // so an fp8 page (1 byte/element vs bf16's 2) halves the divisor and doubles
+  // the block count at the same --kv-cache-memory. Applying it after would size
+  // the pool from a bf16 page and then serve it as fp8, which is the same pool
+  // in half the bytes rather than twice the pool.
+  ApplyResolvedCacheDType(params, probe);
   const int resolved = ResolveNumBlocks(params, probe);
   if (resolved == probe_blocks) {
     return probe;
   }
-  return MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
+  vllm::v1::KVCacheConfig sized =
+      MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
+  ApplyResolvedCacheDType(params, sized);
+  return sized;
+}
+
+// Upstream's `logger.warning_once` for the defaulted-scale case
+// (`kv_cache.py:150-156`), lifted out of ApplyResolvedCacheDType because that
+// function runs up to TWICE per load (probe, then the resized config) and a
+// warning that fires twice reads as two engines. Once per LOAD, not once per
+// process: two engines in one process both deserve the line.
+void LoadedEngine::WarnUncalibratedKvScales(const EngineParams& params) {
+  const vllm::ResolvedKvCacheScales scales = vllm::ResolveKvCacheScales(
+      params.kv_cache_dtype, /*calculate_kv_scales=*/false,
+      vllm::kKvScaleUnloaded, vllm::kKvScaleUnloaded);
+  if (scales.origin == vllm::KvScaleOrigin::kNotQuantized || !scales.uncalibrated) {
+    return;
+  }
+  std::cerr << vllm::UncalibratedKvScaleWarning(params.kv_cache_dtype);
+  std::cerr.flush();
+}
+
+void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
+                                           vllm::v1::KVCacheConfig& cfg) {
+  // `params.kv_cache_dtype` is already resolved against the checkpoint by
+  // FromModelDir; here it only has to become bytes.
+  const vllm::v1::ResolvedCacheDType resolved = vllm::v1::ParseCacheDType(
+      params.kv_cache_dtype, vllm::v1::ResolveKvCacheDType());
+  // The scale pair, resolved through the SAME four-arm mirror of
+  // `BaseKVCacheMethod.process_weights_after_loading` that upstream uses. Both
+  // loaded scales are the `KVCacheScaleParameter` sentinel because no model's
+  // weight loader extracts `k_scale`/`v_scale` yet (owed, see the spec's
+  // `## Owed`), so a declaring checkpoint lands on `kDeclaredButAbsent`, which
+  // is a DIFFERENT state from a checkpoint that declared nothing. The #1574
+  // subject `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` reaches this arm only when an
+  // operator types `--kv-cache-dtype fp8`: its inline
+  // `config.json:quantization_config` declares no `kv_cache_*` key, and that is
+  // the document both engines read (`transformers_utils/config.py:751-761`).
+  const vllm::ResolvedKvCacheScales scales = vllm::ResolveKvCacheScales(
+      params.kv_cache_dtype, /*calculate_kv_scales=*/false,
+      vllm::kKvScaleUnloaded, vllm::kKvScaleUnloaded);
+  if (scales.origin == vllm::KvScaleOrigin::kNotQuantized) {
+    // Nothing declared an fp8 KV cache. Do NOT reach for a scale: ApplyCacheDType
+    // returns immediately on the auto/bf16 path anyway, and asking
+    // ScalesForFp8Store here would be the invented-default this port refuses.
+    vllm::v1::ApplyCacheDType(cfg, resolved, /*k_scale=*/1.0F, /*v_scale=*/1.0F);
+    return;
+  }
+  float k_scale = 0.0F;
+  float v_scale = 0.0F;
+  // The uncalibrated line is NOT printed here. This function runs up to twice
+  // per load (the probe, then the resized config), and a process-static
+  // `call_once` would fix that by printing once for the process instead — which
+  // silences the SECOND engine in the same process rather than the second call
+  // of the same load. `WarnUncalibratedKvScales` above is the once-per-load
+  // owner, and it is the only caller of the message.
+  vllm::ScalesForFp8Store(scales, &k_scale, &v_scale);
+  vllm::v1::ApplyCacheDType(cfg, resolved, k_scale, v_scale);
+}
+
+int LoadedEngine::ResolveMaxNumSeqs(const EngineParams& params,
+                                    const vllm::v1::KVCacheConfig& kv_cfg) {
+  const int configured = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+  const vllm::v1::HybridKvBudget budget =
+      vllm::v1::ComputeHybridKvBudget(kv_cfg);
+  const int resolved =
+      vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  if (resolved >= configured) {
+    // Attention-only models, pure-recurrent models, and every hybrid whose
+    // budget already holds the configured concurrency land here: no line, no
+    // change, byte-identical to before this resolver existed.
+    return configured;
+  }
+  // A reduction is never silent. Upstream logs its own block-size raise and its
+  // auto-fit for the same reason: a number the operator did not choose, that
+  // changes what the engine serves, has to appear in the engine's own output.
+  // It names WHAT was compared against WHAT, because a bound whose wiring is
+  // invisible in the report cannot be audited.
+  std::cerr << "INFO recurrent-state budget: reduced max_num_seqs from "
+            << configured << " to " << resolved << ". The KV pool ("
+            << kv_cfg.num_blocks << " blocks) holds "
+            << budget.unified_num_blocks
+            << " unified pages of " << budget.unified_block_tokens
+            << " tokens (one page = one " << budget.mamba_page_bytes
+            << "-byte GDN state), and each sequence owns "
+            << budget.slots_per_seq
+            << " of them. Raise --num-blocks / --kv-cache-memory for more"
+               " concurrent sequences, or lower num_speculative_tokens.\n";
+  std::cerr.flush();
+  return resolved;
 }
 
 int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
@@ -1396,6 +1695,101 @@ std::unique_ptr<LoadedModel> AttachMtp(std::unique_ptr<LoadedModel> model,
   return model;
 }
 
+// #1946. The header carries the argument; this is the mechanism.
+bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target) {
+  // The DSpark lane is NOT this lane. A DSpark checkpoint usually ships its own
+  // table and keeps it by value inside Qwen3DSparkWeights, and the loader's
+  // fallback fills THAT rather than `weights.embed_tokens` -- so binding here
+  // would rebind a field the DSpark forward never reads while leaving the copy
+  // that costs the memory in place. Skipped by name, and owed as its own row.
+  if (draft.dspark != nullptr) return false;
+  const OwnedTensor* shared = target.shared_embed_tokens();
+  if (shared == nullptr) return false;
+  const OwnedTensor& own = draft.weights.embed_tokens;
+  // Nothing was read into the draft (an in-memory draft built without one), or
+  // it is ALREADY the target's tensor. Either way there is no second copy and
+  // no rebind to make; returning false keeps `EmbedTable()` on whatever the
+  // caller set up.
+  if (own.Empty() || shared == &own) return false;
+
+  // The one discriminator, and it is load-bearing rather than defensive: a GGUF
+  // target may keep its table F16 in place (`LoadEmbedAndHead`'s kKeepF16 arm)
+  // while `LoadGgufSharedEmbedAndHeadBf16` always hands the draft BF16. Those
+  // are different bytes at different widths, and aliasing them would make the
+  // draft gather f16 rows through a bf16 view -- silently wrong tokens, which no
+  // memory gate would ever see.
+  bool same = own.dtype == shared->dtype && own.rank == shared->rank;
+  for (int i = 0; same && i < own.rank; ++i) same = own.shape[i] == shared->shape[i];
+  if (!same) {
+    const auto describe = [](const OwnedTensor& w) {
+      std::string s(vt::Name(w.dtype));
+      s += " [";
+      for (int i = 0; i < w.rank; ++i) {
+        if (i != 0) s += ", ";
+        s += std::to_string(w.shape[i]);
+      }
+      return s + "]";
+    };
+    std::cerr << "vllm.cpp: DFlash draft embed NOT shared with the target: the "
+                 "draft read "
+              << describe(own) << " and the target holds " << describe(*shared)
+              << ". Both tables stay resident; tokens are unaffected.\n";
+    return false;
+  }
+
+  // The bytes this rebind stops uploading a second time. Read from the draft's
+  // OWN copy, which is the allocation that goes away, and read BEFORE the clear.
+  //
+  // DERIVED FROM THE GEOMETRY, not from `bytes.size()` (#1946 review). The two
+  // agree for every table this arm can see, because the guard above has just
+  // proved dtype/rank/shape equal on both sides. They stop agreeing the moment a
+  // buffer is a BORROWED view that is longer than its tensor -- an over-long
+  // safetensors mapping slice, a shared bf16 expansion -- and then the number on
+  // stderr would be the buffer's length rather than the table's. `RowSizeBytes`
+  // is what the DEVICE allocation will be, which is the quantity the line
+  // claims, and it is defined for block-quant and elementwise dtypes alike.
+  const size_t saved = vt::RowSizeBytes(own.dtype, own.Numel());
+  draft.weights.shared_embed_tokens = shared;
+  // `del draft_inner.embed_tokens` (utils.py:73). Not tidiness: leaving the
+  // draft's OwnedTensor populated leaves a second `d_dev` FIELD reachable, so a
+  // future call site that reads `weights.embed_tokens` instead of `EmbedTable()`
+  // would re-open the whole 2.5 GB with every gate green. An empty table makes
+  // that call site refuse at its first `ResidentWeight` instead, by name.
+  //
+  // THAT REFUSAL IS A CHECK, NOT A PROPERTY OF THE EMPTY TENSOR (#1953).
+  // This comment used to say `vt::Embedding` would refuse an empty table. It
+  // would not have: `vt::Embedding` validates ranks, shapes, dtypes, contiguity
+  // and device, and `ResidentWeight` takes the shape from the caller, so an empty
+  // tensor passed every one of those and the failure was a SIGSEGV on the host
+  // arm and a zero-byte allocation read out of bounds on a device arm. The
+  // refusal now lives in `ResidentWeight` itself (dense_attn_block.h), and
+  // `test_dflash2_embed_dedup.cpp` drives this exact call site to gate it.
+  draft.weights.embed_tokens = OwnedTensor{};
+  std::cerr << "vllm.cpp: DFlash draft embed SHARED with the target (one device "
+               "copy, "
+            << saved << " B saved)\n";
+  return true;
+}
+
+// #1946: the member-initialiser wrapper for BindDflashDraftSharedEmbed, so the
+// rebind happens WHILE the engine is being built rather than in a body that a
+// later member could forward before. Null model or null draft passes through
+// untouched, which is every non-speculative load.
+//
+// `static`, because it is generically named, sits in the public
+// `vllm::entrypoints` namespace and no header declares it: without this it was
+// an external symbol (`nm -C` reported `T vllm::entrypoints::BindSharedEmbed`)
+// that a future translation unit could collide with. `BindDflashDraftSharedEmbed`
+// is the exported lever, and it is exported deliberately so the gate reaches the
+// function production calls; this wrapper is not.
+static std::unique_ptr<DflashDraft> BindSharedEmbed(
+    std::unique_ptr<DflashDraft> draft, const LoadedModel* target) {
+  if (draft != nullptr && target != nullptr) {
+    (void)BindDflashDraftSharedEmbed(*draft, *target);
+  }
+  return draft;
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params,
                            std::optional<Qwen3_5MTPWeights> mtp_weights)
@@ -1412,20 +1806,46 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
                              std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
 
+// SPEC-DFLASH2 W3 (#1314): the DFlash counterpart of the overload above. See the
+// header for why it exists and what it makes reachable.
+LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::unique_ptr<DflashDraft> dflash_draft)
+    : LoadedEngine(std::move(config), MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                   std::move(tokenizer), params, /*preselected_queue=*/nullptr,
+                   std::move(dflash_draft)) {}
+
 LoadedEngine::LoadedEngine(HfConfig config,
                            std::unique_ptr<LoadedModel> model,
                            tok::Tokenizer tokenizer,
                            const EngineParams& params,
                            vt::Queue* preselected_queue,
-                           std::unique_ptr<DflashDraft> dflash_draft)
+                           std::unique_ptr<DflashDraft> dflash_draft,
+                           std::optional<multimodal::Qwen3VLVisionWeights>
+                               vision_tower,
+                           multimodal::Qwen3VLVisionConfig vision_config,
+                           bool mmproj_tower_skipped)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
+      // LOAD-GGUF-MMPROJ: the `clip` projector's tower, already loaded and
+      // already refused-or-accepted by FromModelDir before the tokenizer.
+      // nullopt on every load that named no --mmproj.
+      vision_tower_(std::move(vision_tower)),
+      vision_config_(vision_config),
+      // #607 L3: the projector was named and deliberately left unread. Reported
+      // by skipped_towers() beside the model's own skipped stages.
+      mmproj_tower_skipped_(mmproj_tower_skipped),
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
-      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
-      dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
+      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
+      // #1946: rebound onto the target's embedding table on the way in, which is
+      // why `model_` is initialised (and declared) first. THE PRODUCTION CALL
+      // SITE: all three draft loaders -- the GGUF branch, the two safetensors
+      // branches, and the in-memory W3 overload -- funnel into this constructor,
+      // and it is the first point at which the target and the draft both exist.
+      dflash_draft_(BindSharedEmbed(std::move(dflash_draft), model_.get())),
       tokenizer_(std::move(tokenizer)),
       // #607 L2: carry the multimodal input limits onto the engine, so the ONE
       // config object every consumer asks (GetLimitPerPrompt) is the one the
@@ -1443,6 +1863,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
       max_model_len_(ResolveMaxModelLen(
           params, config_, kv_cfg_,
           params.block_size > 0 ? params.block_size : 32)),
+      // The serving concurrency, clamped to the recurrent-state budget the KV
+      // pool affords. See ResolveMaxNumSeqs (issue #1983).
+      max_num_seqs_(ResolveMaxNumSeqs(params, kv_cfg_)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
@@ -1463,7 +1886,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
                   ? *preselected_queue
                   : SelectQueueForModel(model_->registration().architecture,
                                         params.device),
-              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              /*max_num_reqs=*/max_num_seqs_,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
               resolved_spec_config_,
@@ -1480,22 +1903,25 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // step_with_batch_queue; 1 otherwise). Since the 2026-07-17 flip the default
       // (no env) resolves ON (VT_ASYNC_RUNNER default ON), mirroring vLLM;
       // VT_ASYNC_RUNNER=0 / VT_ASYNC_SCHED=0 roll back to the synchronous path.
-      // SPEC-MTP I5d: speculation uses the out-of-band take_draft_token_ids /
-      // post_step path, which is the SYNCHRONOUS scheduler's contract; the
-      // async-scheduling draft-in-output variant is deferred (spec §2.5), so a
-      // configured speculator forces sync scheduling here.
-      async_scheduling_enabled_(!resolved_spec_config_.has_value() &&
-          ResolveAsyncEnabled(
+      // SPEC-DFLASH2 W7 (#1824): async scheduling now SURVIVES an Eagle-type
+      // speculator (mtp/dflash/dspark — vllm/config/vllm.py:1064-1112 at the
+      // pin), the draft-in-output path having landed: the AsyncScheduler ships
+      // -1 placeholder drafts, the runner fills them from its own propose, and
+      // post_step is skipped under async. A method upstream refuses (host
+      // ngram, draft_model at the pin) still forces the synchronous scheduler
+      // through the spec_decode_incompatible arm. This line is the production
+      // reach for the whole wave — the reachability mutation reverts it to the
+      // pre-W7 `!resolved_spec_config_.has_value() &&` form.
+      async_scheduling_enabled_(ResolveAsyncEnabled(
           MakeSchedulerConfig(
-              max_model_len_,
-              params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           runner_.runner_supports_async(),
-          model_->registration().info.is_pooling_model)),
+          model_->registration().info.is_pooling_model,
+          /*spec_decode_incompatible=*/resolved_spec_config_.has_value() &&
+              !resolved_spec_config_->async_scheduling_compatible())),
       max_concurrent_batches_(MakeSchedulerConfig(
-                                  max_model_len_,
-                                  params.max_num_seqs > 0 ? params.max_num_seqs
-                                                          : 8,
+                                  max_model_len_, max_num_seqs_,
                                   max_num_batched_tokens_, params.policy)
                                   .MaxConcurrentBatches(async_scheduling_enabled_)),
       // The engine-wide structured-output manager, native backend over the
@@ -1503,14 +1929,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // core.py:134). Wired into the scheduler + engine cores below so
       // response_format / C-ABI structured constraints gate decoding.
       structured_output_manager_(
-          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+          max_num_seqs_,
           vllm::v1::MakeNativeBackendFactory(
               tokenizer_, static_cast<int>(config_.vocab_size))),
       // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
       scheduler_(MakeScheduler(
           async_scheduling_enabled_,
           MakeSchedulerConfig(
-              max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           kv_cfg_, params.block_size > 0 ? params.block_size : 32,
           /*enable_caching=*/prefix_caching_enabled_,
@@ -1545,7 +1971,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
   //
   // An UNKNOWN budget (MemAvailable unreadable) never refuses.
   {
-    const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+    // The RESOLVED concurrency, not the configured one: the guard must weigh
+    // what the runner allocates (issue #1983). ResolveMaxNumSeqs is the single
+    // source of truth for that number.
+    const int seqs = max_num_seqs_;
     const int64_t state_needed =
         vllm::v1::recurrent_state_bytes(kv_cfg_, seqs);
     const int64_t host_available = vllm::v1::host_available_memory_bytes();
@@ -1610,6 +2039,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
   std::cerr << "vllm.cpp: Asynchronous scheduling is "
             << (async_scheduling_enabled_ ? "enabled" : "disabled")
             << " (max_concurrent_batches=" << max_concurrent_batches_ << ")\n";
+  // SPEC-DFLASH2 W7 (#1824): tell the runner which scheduling mode resolved —
+  // under async + a speculator it fills the scheduler's -1 draft placeholders
+  // from its own propose and corrects the optimistic num_computed_tokens.
+  // Before any step runs (WarmupKernels below is the first).
+  runner_.set_async_scheduling(async_scheduling_enabled_);
   WarmupKernels();
 }
 
@@ -1684,7 +2118,68 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 }
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
-    const std::string& model_dir, const EngineParams& params) {
+    const std::string& model_dir, const EngineParams& params_in) {
+  // SPEC-DRAFTER-CHAIN W1 (#1522): refuse a drafter chain BEFORE anything else
+  // this function does.
+  //
+  // G5 requires the refusal to land "before any weight I/O", and the ordering is
+  // the requirement rather than tidiness. Below this line the function reads the
+  // checkpoint's quantization config, installs two process-global
+  // configurations, resolves a device, stats the model directory, parses a
+  // config, builds a tokenizer and maps weights. A chain config cannot produce
+  // an engine, so every one of those is work spent on a load that will not
+  // happen, and the two installs are not free, because one of them latches
+  // decisions that a later engine in the same process cannot retake.
+  //
+  // It delegates to `ResolveSpecConfig` rather than repeating the test, so there
+  // is ONE chain refusal with ONE message. `ResolveSpecConfig` runs again in the
+  // constructor further down, which is what refuses a chain on the loader paths
+  // that do not come through this function.
+  //
+  // It reads `params_in`, the UNRESOLVED argument, deliberately: it must run
+  // ahead of the KV-FP8 W3 stanza below, whose `ReadQuantConfigJson` opens a
+  // file inside `model_dir`. The case
+  // "kv-fp8 W3 G10: the drafter-chain refusal runs BEFORE the KV resolution" in
+  // `tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` gates that order, by
+  // pointing at a directory that EXISTS and declares fp8 -- which
+  // `test_drafter_chain_reach.cpp` cannot do, because its nonexistent path makes
+  // `ReadQuantConfigJson` answer "" without opening anything.
+  if (params_in.speculative_config.has_value() &&
+      params_in.speculative_config->use_drafter_chain()) {
+    (void)ResolveSpecConfig(params_in, vllm::HfConfig{});
+  }
+  // KV-FP8 W3: resolve `--kv-cache-dtype` against the CHECKPOINT once, here,
+  // before any consumer reads it. Upstream does exactly this and in exactly this
+  // position: `EngineArgs.create_engine_config` calls
+  // `resolve_kv_cache_dtype_string(self.kv_cache_dtype, model_config)` and hands
+  // the RESULT to `CacheConfig(cache_dtype=...)` (`arg_utils.py:1915-1929`), so
+  // nothing downstream of the config ever sees the unresolved "auto".
+  //
+  // `params` shadows the argument from here on, so every later reference in this
+  // function reads the resolved value and no call site had to change. The only
+  // field that differs is `kv_cache_dtype`.
+  //
+  // THIS IS THE ONLY PLACE A CHECKPOINT'S DECLARATION IS READ. The direct
+  // `LoadedEngine(config, weights, ...)` constructors take `kv_cache_dtype`
+  // verbatim, which is right: they are handed weights that are already in
+  // memory and there is no checkpoint directory to ask.
+  EngineParams params = params_in;
+  {
+    const vllm::ResolvedCacheDTypeString resolved =
+        vllm::ResolveKvCacheDTypeString(params.kv_cache_dtype,
+                                        vllm::ReadQuantConfigJson(model_dir));
+    if (resolved.declared_by_checkpoint) {
+      // Say it. An operator who typed no flag and gets a quantized KV cache
+      // because the checkpoint asked for one deserves to read that sentence
+      // rather than infer it from a block count that doubled.
+      std::cerr << "engine: the checkpoint declares kv_cache_quant_algo -> "
+                   "--kv-cache-dtype "
+                << resolved.cache_dtype
+                << " (pass an explicit --kv-cache-dtype to override)"
+                << std::endl;
+    }
+    params.kv_cache_dtype = resolved.cache_dtype;
+  }
   // ENG-RESIDENCY-CONFIG (#1110): install the host-RAM -> DISK residency config
   // FIRST — before the offloader below, before the device resolution, before any
   // path or weight operation.
@@ -1746,6 +2241,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   << shadowed << std::endl;
       }
     }
+    // ENG-HYBRID-PLACEMENT (#2018): the one pairing inside this key that is legal
+    // and slow rather than legal and fine. Printed unconditionally of
+    // `installed.empty()`, because the placement can come from the environment
+    // alone, in which case the installed DOCUMENT is empty and the collision is
+    // still real.
+    const std::string collision = vllm::DescribePlacementResidencyCollision();
+    if (!collision.empty()) {
+      std::cerr << "engine: weight residency: " << collision << std::endl;
+    }
   }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at
@@ -1791,6 +2295,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (params.device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(params.device));
+    // ENG-HYBRID-PLACEMENT W2 (#2023): the EXPLICIT device is fully known here,
+    // because `ResolveModelDeviceType` ignores the architecture on this branch, so
+    // the placement can be resolved and reported ahead of all path and weight I/O
+    // — which is where an operator still reads the line when the load then fails.
+    ReportDevicePlacement(ResolveModelDeviceType(/*architecture=*/"",
+                                                 params.device));
     (void)ResolveExplicitDeviceType(
         params.device, named_platform == nullptr
                            ? std::nullopt
@@ -1821,13 +2331,28 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // checkpoint had already been read through the DFlash1 loader. Both target
   // containers pass through this line, and the `.gguf` branch immediately below
   // returns before the later one. This is a REFUSAL and not a second resolution:
-  // it calls the same `RefuseDflash2Draft` the constructor's `ResolveSpecConfig`
+  // it calls the same `CheckDflash2DraftArm` the constructor's `ResolveSpecConfig`
   // calls and decides nothing else, so the classification keeps one owner and
   // one message.
   if (params.speculative_config.has_value() &&
       params.speculative_config->method == "dflash" &&
       params.speculative_config->draft_model_path.has_value()) {
-    RefuseDflash2Draft(*params.speculative_config->draft_model_path);
+    CheckDflash2DraftArm(*params.speculative_config->draft_model_path);
+  }
+
+  // LOAD-GGUF-MMPROJ (#821): a projector is a SECOND GGUF beside a GGUF
+  // language file, and nothing else. A safetensors checkpoint carries its
+  // vision tower in its own shards, so accepting --mmproj there and quietly
+  // ignoring it would load a tower the user did not ask for and drop the one
+  // they named. Refuse by name instead, before any path or config I/O.
+  if (!params.mmproj_path.empty() &&
+      !(fs::is_regular_file(dir) && dir.extension() == ".gguf")) {
+    throw std::runtime_error(
+        "--mmproj: a multimodal projector attaches to a .gguf language file, "
+        "and '" +
+        model_dir +
+        "' is not one. A safetensors checkpoint carries its vision tower in "
+        "its own shards and needs no projector file");
   }
 
   // A single `.gguf` file: config + weights + tokenizer all come from the
@@ -1910,6 +2435,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // that call LATCHES: moving a non-latching file scan in front of it would
       // change which loads fix the process's streaming answer, and this repair
       // has no business moving that.
+      //
+      // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870): resolved ONCE and reused below by
+      // `CheckDeviceWeightFit` as well, so the two calls that ask this process's
+      // residency policy about this file can never resolve two different
+      // answers to the same `getenv` reads.
+      const GgufLoadPolicy gguf_load_policy = GgufLoadPolicy::FromEnv();
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
@@ -1918,7 +2449,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           gguf_arch.factory->streams_routed_experts &&
           ResolveExpertStreamRequested() &&
           GgufExpertTowersReachSlotLane(gguf, kStreamedExpertSuffix,
-                                        GgufLoadPolicy::FromEnv())) {
+                                        gguf_load_policy)) {
         // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
         // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
         // writes. The arena is the store's own arithmetic — `slots *
@@ -1936,13 +2467,99 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   ResolveExpertStreamSlotBytes(static_cast<int64_t>(slice)));
         }
       }
+      // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870): `RouteGgufTensor`'s own totality
+      // guarantee ("anything else is kExpandBf16") makes this condition an
+      // EXACT description of every tensor's residency, not a guess — see the
+      // header on `GgufStagedWeightFootprint`. `cpu_ref` needs no term of its
+      // own: it is a CPU-only oracle switch, and `needs_weight_staging` above
+      // already excludes every load it could apply to.
+      const bool policy_forces_full_expand =
+          GgufPolicyForcesFullExpand(gguf_load_policy);
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.needs_weight_staging(),
           DeviceWeightBudgetBytes(
               target.residency_policy().device_memory_total_bytes),
-          /*model_dtype_bytes=*/2, lane);
+          /*model_dtype_bytes=*/2, lane, policy_forces_full_expand);
       if (fit.refuse) throw std::runtime_error(fit.message);
+    }
+    // QUANT-QWEN38-27B-GGUF-ARM (#821): refuse a qwen3_5-family GGUF carrying
+    // tensors NOTHING in its loader reads, here, before the projector, the
+    // tokenizer and every weight byte.
+    //
+    // The reason it is worth a refusal rather than a warning is one file.
+    // `Qwen3.8-27B-Q4_K_M.gguf` states `qwen35.block_count = 65` and
+    // `qwen35.nextn_predict_layers = 1`: 64 decoder blocks plus an MTP drafter
+    // at `blk.64`. A reader that spends the whole 65 on the trunk gets a model
+    // that loads, decodes fluently, and is the wrong graph — and the ten of
+    // `blk.64`'s tensors that stop being read are the ONLY evidence of it,
+    // because nothing downstream ever asks about a tensor it did not want.
+    //
+    // Placed AFTER the device-fit refusal so the existing error ordering this
+    // branch documents is unchanged, and gated on the architecture the same way
+    // `HfConfigFromGgufDispatch` gates its builders, so a family whose
+    // enumeration lives elsewhere is not accounted against qwen3_5's.
+    if (vllm::IsQwen3_5Gguf(gguf)) {
+      vllm::RefuseUnaccountedQwen3_5Gguf(gguf, config);
+    }
+    // LOAD-GGUF-MMPROJ (#821): the SECOND file. Opened, validated and READ
+    // here — after the architecture resolve and the device-fit refusal, and
+    // BEFORE the tokenizer and every weight byte — for the same reason the fit
+    // refusal sits there: a projector this build cannot load must cost the user
+    // a message, not a 17 GB map followed by one.
+    //
+    // llama.cpp's `--mmproj` is the user-facing convention this mirrors
+    // (b10451 `tools/mtmd/mtmd-cli.cpp`); the file is a `clip`-architecture
+    // GGUF and NOT a shard of the language file, which is why
+    // `GgufFile::Open`'s own `DetectSplit` shard merge is not the seam.
+    std::optional<multimodal::Qwen3VLVisionWeights> vision_tower;
+    multimodal::Qwen3VLVisionConfig vision_config;
+    // #607 L3: whether the read below was deliberately not done. Distinct from
+    // `!vision_tower` — that is also true of every load that named no
+    // `--mmproj`, and "there is no projector here" is not "the projector was
+    // freed" (the same distinction the Muse Glimmer text-only case draws).
+    bool mmproj_tower_skipped = false;
+    std::optional<vllm::GgufFile> mmproj;
+    if (!params.mmproj_path.empty()) {
+      mmproj = vllm::GgufFile::Open(params.mmproj_path);
+      vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
+      vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
+      // QUANT-QWEN38-27B-GGUF-ARM (#821): the projector's own accounting, and
+      // it runs BEFORE the read, so a file this reader would only partly
+      // consume costs a message rather than a silently incomplete tower.
+      vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
+                                        params.mmproj_path);
+      // #607 L3, the THIRD production tower load, and the one the first cut of
+      // this row missed. It is a tower like the other two: `--mmproj` names a
+      // projector, this reads every one of its tensors into owned host f32, and
+      // the engine holds them for the process lifetime. So
+      // `--language-model-only` zeroed every limit, refused every image request,
+      // AND STILL PAID FOR THE PROJECTOR — the exact L2 failure this row exists
+      // to close, surviving on the one architecture nothing was looking at.
+      //
+      // Gated on the same predicate and the same modality set as the two
+      // safetensors sites ({"image","video"} — interfaces.py:293 and
+      // qwen3_vl.py:1747), because this projector IS the Qwen3-VL tower, read
+      // out of a `clip` GGUF instead of out of the model's own shards. `image:
+      // 0` alone must therefore not skip it here either.
+      //
+      // ONLY THE READ IS CONDITIONAL. `GgufFile::Open`, both refusals and
+      // `ClipMmprojVisionConfig` above still run: that is the construct half of
+      // construct-without-initialise (utils.py:762), so the geometry resolves
+      // either way and a `--mmproj` this build cannot load is still refused by
+      // name rather than accepted in silence at zero limits. What stops is the
+      // storage — and with it the reader's own missing-tensor refusals, which is
+      // the mirror of `StageMissingLayer` keeping a skipped stage out of the
+      // loader's key accounting (utils.py:693-695).
+      //
+      // `vision_tower` stays nullopt, which is already a supported engine state:
+      // it is what every load that named no `--mmproj` produces.
+      if (vllm::SkipTowerForModalities(&params.multimodal, {"image", "video"})) {
+        mmproj_tower_skipped = true;
+      } else {
+        vision_tower =
+            vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+      }
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
     // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
@@ -1971,8 +2588,18 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           "this file declares no <arch>.nextn_predict_layers (it was converted "
           "with --no-mtp, or predates llama.cpp's Qwen3.5 MTP support)");
     }
-    std::unique_ptr<LoadedModel> model =
-        ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
+    // #607 L3, THE PRODUCTION CALL SITE for the tower skip (one of three, all in
+    // this function). The engine's multimodal limits are borrowed for the load,
+    // so a loader that owns a tower can leave it uninitialised when every
+    // modality it serves is at limit 0 — the mirror of upstream reading
+    // `vllm_config.model_config.multimodal_config` inside the model's __init__
+    // (interfaces.py:288-293). `params` outlives the call. Deleting this
+    // assignment leaves the flag accepted and inert, which is exactly the
+    // failure L2 recorded and L3 exists to close; test_tower_skip's reachability
+    // case is the gate that catches it.
+    ModelSource gguf_source = ModelSource::FromGguf(gguf);
+    gguf_source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
     // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
     // safetensors branch's maybe_attach_mtp. The GGUF is still mapped here; the
     // loader owns its dequantized copies, so nothing borrows past this scope.
@@ -2013,7 +2640,8 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     }
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
-        /*preselected_queue=*/nullptr, std::move(dflash)));
+        /*preselected_queue=*/nullptr, std::move(dflash),
+        std::move(vision_tower), vision_config, mmproj_tower_skipped));
   }
 
   // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config
@@ -2173,8 +2801,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       registration.factory->stage_on_load;
   if (!queue_load) {
     const auto t_weights = std::chrono::steady_clock::now();
-    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-        config, ModelSource::FromSafetensorsOwned(shards));
+    // #607 L3 production call site (see the GGUF branch above for the argument).
+    ModelSource source = ModelSource::FromSafetensorsOwned(shards);
+    source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
     maybe_attach_mtp(*model);
@@ -2191,8 +2821,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       SelectQueueForModel(registration.architecture, params.device);
   try {
     const auto t_weights = std::chrono::steady_clock::now();
-    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-        config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
+    // #607 L3 production call site (see the GGUF branch above for the argument).
+    ModelSource source = ModelSource::FromSafetensorsOwned(shards, &load_queue);
+    source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
     maybe_attach_mtp(*model);

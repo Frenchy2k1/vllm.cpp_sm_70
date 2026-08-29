@@ -29,6 +29,8 @@
 #include "vllm/model_executor/models/muse_glimmer_vision.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/op_provider.h"
+#include "vt/ops.h"
 
 #include "muse_glimmer_vision_goldens.inc"
 
@@ -350,4 +352,56 @@ TEST_CASE("muse_glimmer_vision_tower_bf16_within_envelope") {
                          std::size(muse_glimmer_vision_ref::kTowerOut));
   MESSAGE("tower output (bf16): ", Fmt(et));
   CHECK_MESSAGE(et.rel_l2 < 2e-2, "bf16 tower output: ", Fmt(et));
+}
+
+// --- ROUTING: WHICH attention op the tower names -----------------------------
+// The 50 blocks are the whole cost of this tower, and it must not pay them on
+// the "Correctness-grade (M0.9)" kernel `vt::Attention` is frozen on
+// (src/vt/cuda/cuda_ops.cu:1456-1460) -- issue #1545, class issue #1544.
+//
+// No case above can see that choice, BY CONSTRUCTION rather than by oversight:
+// on CPU `kAttentionDenseFlash` is registered to the SAME `AttentionKernel`
+// function pointer as `kAttention` (src/vt/cpu/cpu_ops.cpp:3750-3761), so every
+// number in this file is byte-identical whichever op the forward names. A
+// numeric assertion would therefore pass before the routing change and after
+// it, which is an assertion that measures nothing. The op-provider SELECTION
+// counter is the instrument that does see it, used here exactly as
+// tests/vllm/models/test_ltx2.cpp:665-686 uses it for the same question.
+//
+// The expected count is DERIVED, so this fails on a PARTIAL re-route and not
+// only on a total one. FixtureConfig is 3 layers {window, full, window} over
+// FixtureImages' 12x12 (grid 6x6) and 8x8 (grid 4x4) images with a 4x4 window
+// block, so a window layer segments as [16,8,8,4] + [16] = 5 calls and a full
+// layer as [36] + [16] = 2:  5 + 2 + 5 = 12.
+TEST_CASE("muse_glimmer_vision_tower_routes_attention_to_dense_flash") {
+  vt::Backend* cpu = vt::TryGetBackend(vt::DeviceType::kCPU);
+  REQUIRE(cpu != nullptr);
+  const MuseGlimmerVisionConfig cfg = FixtureConfig();
+  const MuseGlimmerVisionWeights w = FixtureWeights(cfg);
+
+  vt::EnableOpProviderCallStats(true);
+  const unsigned long long flash_before =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU).selections;
+  const unsigned long long naive_before =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU).selections;
+  const std::vector<float> tower =
+      vllm::multimodal::MuseGlimmerVisionForward(FixtureImages(), w, cfg, *cpu, nullptr);
+  const unsigned long long flash_after =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU).selections;
+  const unsigned long long naive_after =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU).selections;
+  vt::EnableOpProviderCallStats(false);
+
+  MESSAGE("attention selections: dense-flash +", flash_after - flash_before, ", naive +",
+          naive_after - naive_before);
+  CHECK(flash_after - flash_before == 12ull);
+  CHECK(naive_after - naive_before == 0ull);
+
+  // ...and the routed forward is still the GATED forward. On CPU this is
+  // byte-identical to the case above for the reason in the comment; the bound is
+  // the same 2e-2 bf16 envelope and is NOT widened here.
+  const Err et = Compare(tower, muse_glimmer_vision_ref::kTowerOut,
+                         std::size(muse_glimmer_vision_ref::kTowerOut));
+  MESSAGE("tower output (routed, bf16): ", Fmt(et));
+  CHECK_MESSAGE(et.rel_l2 < 2e-2, "routed tower output: ", Fmt(et));
 }

@@ -66,6 +66,85 @@ struct Qwen3DFlashLayerAttnMode {
   int64_t sliding_window = 0;  // >0 for SWA layers; 0 for full layers
 };
 
+// SPEC-DFLASH2 W2 (#1314): the grouped dynamic depthwise convolution that wraps
+// ONE sublayer of a DFlash2 draft block. EMPTY on a DFlash1 draft, which is what
+// `Qwen3DFlashWeights::IsDflash2` reads.
+//
+// BEYOND-PIN, from `DFlashGroupedConv` (vllm/model_executor/models/qwen3_dflash2.py
+// @ vllm-project/vllm#52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`).
+//
+// Both tensors are named exactly as the published checkpoint stores them
+// (`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+// safetensors header read 2026-08-19):
+//   layers.N.attention_conv.base_kernel               bf16 (2, 2, 5120)
+//   layers.N.attention_conv.kernel_projection.weight  bf16 (1280, 5120)
+// and the same pair under `mlp_conv`.
+//
+// `base_kernel` dim 0 is the SIDE -- 0 = `prepare` (before the sublayer), 1 =
+// `finish` (after it) -- and NOT a tap. On this checkpoint `taps` is also 2, so
+// the two axes are indistinguishable by shape and only the port note separates
+// them. `kernel_projection` maps hidden -> `2 * taps * num_groups` (1280 =
+// 2*2*320 at hidden 5120 / conv_group_size 16), i.e. ONE projection of the
+// sublayer input carrying BOTH sides' deltas.
+struct Qwen3DFlashConvWeights {
+  OwnedTensor base_kernel;        // bf16 [2, taps, H]; dim 0 is the SIDE
+  OwnedTensor kernel_projection;  // bf16 raw-NK [2*taps*num_groups, H], nk
+  bool Empty() const { return base_kernel.bytes.empty(); }
+};
+
+// SPEC-DFLASH2 W3 (#1314): the CANDIDATE SELECTOR of a DFlash2 draft. EMPTY on a
+// DFlash1 draft, which is what `Qwen3DFlashWeights::IsDflash2` reads.
+//
+// BEYOND-PIN, from `CandidateSelector` and `DFlash2Qwen3ForCausalLM`
+// (vllm/model_executor/models/qwen3_dflash2.py:231-356 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`). The
+// PR head MOVED from `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19
+// (#1404). `_score_edges`, `CandidateSelector` and every line of
+// `compute_candidates` except the LM-head guard are BYTE-IDENTICAL at the two
+// heads; the two things that changed are ported or recorded on
+// `Dflash2SelectorWeights::kNonPortSetModelTag` below.
+//
+// The three tensors are named exactly as the published checkpoint stores them
+// (`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+// safetensors header read 2026-08-19):
+//   candidate_selector.hidden_projection.weight  bf16 (256, 5120)
+//   candidate_selector.predecessor_codebook      bf16 (248320, 256)   127 MB
+//   candidate_selector.successor_codebook        bf16 (248320, 256)   127 MB
+//
+// The two codebooks are ~254 MB resident that the DFlash1 lane never allocates
+// (`## Risks/decisions` D5). Upstream stores them bf16 and so do we; whether a
+// narrower dtype would serve is NOT decided by this row.
+struct Dflash2SelectorWeights {
+  OwnedTensor hidden_projection;     // bf16 raw-NK [rank, H], nk
+  OwnedTensor predecessor_codebook;  // bf16 [vocab, rank]
+  OwnedTensor successor_codebook;    // bf16 [vocab, rank]
+  int64_t rank = 0;    // dflash_config.selector_rank (256 on both drafts)
+  int64_t top_k = 0;   // dflash_config.selector_top_k (16 on both drafts)
+  // The two OUTPUT SCALARS, applied to the candidate VALUES in
+  // `compute_candidates` BEFORE the selector scores them
+  // (`DFlash2Qwen3ForCausalLM.compute_candidates` @ that head). A wrong value
+  // reorders the top-K and moves acceptance without raising anything, which is
+  // this row's signature invisible defect, so `## Risks/decisions` D9 requires
+  // them gated against a checkpoint that SETS them:
+  // `z-lab/Muse-Glimmer-30B-DFlash2` ships 0.19611613513818404 and 20.0, while
+  // `z-lab/Qwen3.8-27B-DFlash2` ships neither and takes both defaults (#1327).
+  float output_multiplier = 1.0f;
+  // `float(dflash_config.get("final_logit_softcapping") or 0.0)`, then DISABLED
+  // when not > 0 — upstream's own `softcap if softcap > 0 else None`. So 0 here
+  // means "no softcap" and never "cap at zero".
+  float final_logit_softcapping = 0.0f;
+  bool Empty() const { return predecessor_codebook.bytes.empty(); }
+  // A DELIBERATE NON-PORT, recorded rather than skipped in silence. Upstream
+  // wraps the selector's construction in `set_model_tag("dflash2_candidate_selector")`
+  // because `CandidateSelector` carries its own `@support_torch_compile` and is
+  // built while the draft's model tag is still active, so without a tag of its
+  // own the two share a torch.compile cache namespace and the selector loads the
+  // draft's graph. It is the only behavioural change #52816 made to this file
+  // between the two heads. This engine has no torch.compile and no compile
+  // cache, so there is nothing for a tag to disambiguate.
+  static constexpr const char* kNonPortSetModelTag = "dflash2_candidate_selector";
+};
+
 // One DFlash draft decoder layer: input/post standard RMSNorm + plain Qwen3
 // attention (merged qkv, per-head q/k norm, NeoX RoPE) + SwiGLU MLP. Weights are
 // kept in the on-disk torch-Linear [N=out,K=in] orientation (nk=true) for
@@ -80,18 +159,69 @@ struct Qwen3DFlashLayerWeights {
   OwnedTensor gate_up_proj;  // bf16 raw-NK [2*I, H] (rows gate|up), nk
   OwnedTensor down_proj;     // bf16 raw-NK [H, I], nk
   Qwen3DFlashLayerAttnMode attn_mode;
+  // SPEC-DFLASH2 W2 (#1314): the two grouped convolutions of a DFlash2 block,
+  // wrapping the attention and the MLP sublayer respectively. Both EMPTY on a
+  // DFlash1 draft, and the forward then runs byte-for-byte as before.
+  Qwen3DFlashConvWeights attention_conv;
+  Qwen3DFlashConvWeights mlp_conv;
 };
 
-// Whole DFlash draft weights. The draft owns its OWN embed_tokens and lm_head
-// (unlike the MTP head, which shares the target's) plus the fc aux-combine, the
+// Whole DFlash draft weights. The draft owns the fc aux-combine, the
 // hidden_norm (applied to combined target features before the context-KV proj,
 // D3), the final norm, and an optional dedicated mask embedding.
+//
+// It does NOT own its embedding table, and this comment used to say it did
+// (#1946). The z-lab checkpoint ships none: the draft runs the TARGET's table,
+// which the loader read into `embed_tokens` here and which
+// `BindDflashDraftSharedEmbed` now rebinds onto the target's own tensor, exactly
+// as the MTP head has always shared it. The head is still the draft's own copy,
+// and its dedup is owed (see the spec's `## Owed`).
 struct Qwen3DFlashWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H] (embed lookup)
+  // #1946: the TARGET's table, borrowed, once `BindDflashDraftSharedEmbed` has
+  // rebound it — the mirror of upstream's `del draft_inner.embed_tokens;
+  // draft_inner.embed_tokens = target_embed`
+  // (vllm/v1/worker/gpu/spec_decode/dflash/utils.py:64-74 @ b389ac29465b33f9e9c534df221ea3c129e9793f).
+  //
+  // WHY A POINTER AND NOT A COPY. `ResidentWeight` caches the host->device
+  // upload on the OwnedTensor itself (`if (!w.d_dev)`), so two OwnedTensors over
+  // the same bytes are two device allocations however the HOST bytes are shared
+  // — which is what W9 (#1849) fixed and what it could not fix. One tensor is
+  // one `d_dev`, allocated by whichever side forwards first and never
+  // reallocated, so the address cannot depend on load order and stays fixed for
+  // the life of any graph that reads it.
+  //
+  // BORROWED from the target LoadedModel, which outlives the draft (LoadedEngine
+  // declares `model_` ahead of `dflash_draft_` for exactly this). Null on a
+  // draft that was never rebound: an unbound draft still runs its own
+  // `embed_tokens`, which is what every pre-#1946 path did.
+  //
+  // ONCE REBOUND, `embed_tokens` IS EMPTY, and reading it instead of
+  // `EmbedTable()` is refused by `ResidentWeight` by name (dense_attn_block.h).
+  // That refusal is a check #1953 added; it is NOT something the
+  // empty tensor gets for free. `vt::Embedding` validates ranks, shapes, dtypes,
+  // contiguity and device and never the byte length, and the shape it sees comes
+  // from the caller, so before that check an empty table produced a null host
+  // alias or a zero-byte device allocation read as [vocab, H].
+  const OwnedTensor* shared_embed_tokens = nullptr;
+  // The table the draft's four embed lookups actually gather from. The ONE
+  // accessor, so a rebind cannot reach three of the four sites.
+  const OwnedTensor& EmbedTable() const {
+    return shared_embed_tokens != nullptr ? *shared_embed_tokens : embed_tokens;
+  }
   OwnedTensor fc;            // bf16 raw-NK [H, H*num_taps], nk (combine_hidden_states)
   OwnedTensor hidden_norm;   // bf16 [H] (normed before context-KV proj, D3)
   OwnedTensor final_norm;    // bf16 [H] (model.norm)
   OwnedTensor lm_head;       // bf16 raw-NK [draft_vocab, H], nk
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628): the SHARED head when the target stores it
+  // as ModelOpt/compressed-tensors NVFP4. EXACTLY ONE of `lm_head` and
+  // `lm_head_fp4` is populated, which is the one-owner rule
+  // `Qwen3_5DenseWeights` already applies to the target's own head
+  // (`LoadDenseLmHead`, qwen3_5_dense.h). The draft's logits GEMM routes on it,
+  // so a packed head is COMPUTED WITH rather than widened at load: the DFlash2
+  // selector's whole input is the target head's exact top-K, and widening the
+  // head is the case `RefuseQuantizedDflash2LmHead` refuses.
+  Nvfp4Weight lm_head_fp4;   // NVFP4 [N=draft_vocab, K=H] (else empty)
   // Optional dedicated mask embedding [H] substituted at mask_token_id
   // (has_separate_mask_embedding). Empty for the z-lab 27B (in-vocab mask token).
   OwnedTensor mask_embedding;
@@ -99,6 +229,42 @@ struct Qwen3DFlashWeights {
   int64_t num_taps = 0;         // len(target_layer_ids); fc input = H*num_taps
   int32_t mask_token_id = -1;   // dflash_config.mask_token_id (248070 for 27B)
   int64_t draft_vocab_size = 0;
+  // SPEC-DFLASH2 W2 (#1314): the conv geometry. `conv_taps` is
+  // `dflash_config.conv_kernel_size` and is 0 on a DFlash1 draft, which is what
+  // makes it the DFlash2 discriminator here -- a DFlash1 checkpoint declares
+  // none of these keys and carries no conv tensor.
+  int64_t conv_taps = 0;        // dflash_config.conv_kernel_size (2 on both drafts)
+  int64_t conv_group_size = 0;  // dflash_config.conv_group_size (16 on both drafts)
+  // The QUERY block the conv masks its taps against: `1 + num_speculative_tokens`,
+  // NOT `dflash_config.block_size`. Upstream sizes it from the speculative config
+  // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+  // `66e5414c6d75a8529473d977f7458c140bbab8a0`) and the checkpoint key only ever
+  // supplies that value's DEFAULT, through `k`.
+  //
+  // `LoadQwen3DFlash` DOES NOT FILL IT. Whoever knows the resolved `k` is the
+  // only writer -- `LoadDflashDraft` in production -- and until then it is 0,
+  // which every DFlash2 forward refuses by name. W3 and earlier seeded it from
+  // the checkpoint key so a direct caller had a usable value, and that is what
+  // made the loader's own assignment ungateable: deleting it left a plausible
+  // block behind and no gate could see the difference (spec `## Owed` O5,
+  // mutation-proven green by W2). SPEC-DFLASH2 W4 (#1314) removes the seed.
+  int64_t conv_block_size = 0;
+  // SPEC-DFLASH2 W3 (#1314): TRUE when the SHARED lm_head above was produced by
+  // DEQUANTIZING a quantized target tensor rather than read as dense floats.
+  // Only the GGUF target arm can set it (`LoadGgufSharedEmbedAndHeadBf16`
+  // dequantizes a q6_K/NVFP4 `output.weight` to bf16); the safetensors arm
+  // refuses a non-BF16 head one layer up in `LoadNamedBf16`. It exists because
+  // the DFlash2 selector's whole input is the target head's EXACT top-K, which a
+  // dequantized head does not produce -- the case upstream's LM-head guard
+  // refuses by name. See `RefuseQuantizedDflash2LmHead`
+  // (qwen3_dflash2.h). Read only by that guard; the DFlash1 lane is unaffected,
+  // which is why the flag is recorded rather than refused at load.
+  bool lm_head_dequantized = false;
+  // SPEC-DFLASH2 W3 (#1314): the candidate selector. EMPTY on a DFlash1 draft.
+  // It is loaded whenever `IsDflash2()`, because a DFlash2 checkpoint that
+  // carried the conv and no selector is not a shape this port knows how to run.
+  Dflash2SelectorWeights candidate_selector;
+  bool IsDflash2() const { return conv_taps > 0; }
 };
 
 // Load the z-lab DFlash draft checkpoint. The on-disk names follow vLLM's
@@ -116,6 +282,49 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
 Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
                                    const HfConfig& config, int64_t num_taps,
                                    int32_t mask_token_id);
+
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628). Fill the draft's SHARED `lm_head` from the
+// TARGET's safetensors shards, taking the SAME arm the target's own loader takes.
+//
+// The DFlash/DSpark draft owns no head: it runs the TARGET's over its own hidden
+// states. Through W5 this read was a single `LoadNamedBf16("lm_head.weight")`
+// inside `SharedHeadSource` (model_loader.cpp), so it refused ANY head not
+// stored as dense bf16 — including the ModelOpt NVFP4 head of
+// `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`, which is the only checkpoint the
+// BENCH-QWEN38-27B-SOTA campaign's speculative arm has (#1628). It refused on
+// the STORED DTYPE, which cannot separate the two states `## Risks/decisions`
+// D12 is about: a head DEQUANTIZED into something the target does not compute
+// with, and a head kept PACKED and computed with natively.
+//
+// So the routing decision is `LoadDenseLmHead`'s (qwen3_5_dense.h), asked once
+// here for the draft exactly as the target asks it for itself: a
+// ModelOpt/compressed-tensors NVFP4 head lands PACKED in `head_fp4`, every other
+// storage form lands as raw-NK bf16 in `head_bf16`. Upstream reaches the same
+// place by construction — at the MERGED #52816 head `b389ac29` `compute_candidates`
+// carries no quant-method check at all and goes through
+// `LogitsProcessor.get_top_k_tokens` -> `_apply_head` ->
+// `lm_head.quant_method.apply` (logits_processor.py:241-286,132-142), which IS
+// the target's own logits path.
+//
+// EXACTLY ONE output is populated. Throws, naming the target shards, when the
+// head is absent; throws naming the arm when the head is NVFP4 with an
+// ACTIVATION scale in force (`VT_MODELOPT_W4A4=1`), because the fp4-activation
+// GEMM is not the W4A16 dispatcher this draft's logits GEMM takes.
+void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
+                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4);
+
+// SPEC-DFLASH2 W9 (#1849). Fill the draft's SHARED embedding table from the
+// TARGET's safetensors shards, borrow-first: a whole-range verbatim bf16 read
+// the draft never mutates, so it takes the fail-closed direct-upload seam
+// (`BorrowStTensorBytes`) and views the file mapping instead of holding a
+// ~2.54 GB anonymous copy of bytes the target's own loader already borrows.
+// Same lookup (exact name, first shard that has it), same "is not BF16"
+// refusal, same EMPTY-on-absence contract as the loader-local `LoadNamedBf16`
+// read it replaces; `nk` stays false (the [vocab, H] gather-table
+// orientation). Exported so the borrow is gated at the exact function
+// `SharedHeadSource::LoadInto` calls.
+OwnedTensor LoadDflashSharedEmbedBf16(const std::vector<SafetensorsFile>& shards,
+                                      const std::string& name);
 
 // Resolve the per-layer attention modes from config.layer_types, the optional
 // dflash_config overrides, and the optional top-level `is_causal`. Exposed for
@@ -161,14 +370,52 @@ struct DflashDeviceKVStore;
 // this to attend over pre-inserted context K/V.
 class Qwen3DFlashModel {
  public:
+  // SPEC-DFLASH2 W8 (#1837) — DEVICE handles out of a block forward. The
+  // candidate selector's whole input is the block forward's logits and its
+  // post-final-norm hidden, and through W7 both crossed the host boundary
+  // (~17 MB/step at the published shapes) only to be re-uploaded. Upstream's
+  // `_generate_draft` (dflash2/speculator.py @ b389ac2946) never downloads
+  // either. The views are pool-backed: `keep_*` owns the storage when the call
+  // allocated it (`DBuf::ReleaseShared`), and is EMPTY when the store's
+  // persistent CUDA-graph output buffers own it — those live as long as the
+  // store, and the selector consumes the views in the same step.
+  struct DflashBlockDeviceOut {
+    vt::Tensor logits;                  // [Tq, draft_vocab] f32, device
+    vt::Tensor hidden;                  // [Tq, H] bf16, device (post-final-norm)
+    std::shared_ptr<void> keep_logits;
+    std::shared_ptr<void> keep_hidden;
+  };
+
+  // SPEC-DFLASH2 W8 (#1838) — a device-resident combined-features buffer (the
+  // fc output), same pool-backed ownership shape as DflashBlockDeviceOut.
+  struct DflashCombinedDevice {
+    vt::Tensor tensor;                  // [T, H] bf16, device
+    std::shared_ptr<void> keep;
+  };
+
   // The fc aux-combine (combine_hidden_states, qwen3_dflash.py:750-770): a bias-
   // free Linear [H*num_taps]->[H] over the D1 multi-tap `[T, H*num_taps]` output
   // (column order = ascending target_layer_ids). Returns [T,H] bf16 as a device
   // buffer's host download for parity checks. This is the combined feature that
   // D3 will normalize (hidden_norm) and project into the context KV cache.
+  // Since W8 it is a marshaling shell over CombineAuxFeaturesDevice — one GEMM
+  // implementation — and stays bit-identical because bf16->f32->bf16 round
+  // trips are exact.
   static std::vector<float> CombineAuxFeatures(const std::vector<float>& aux_features,
                                                int64_t T, const Qwen3DFlashWeights& weights,
                                                const HfConfig& config, vt::Queue& queue);
+
+  // SPEC-DFLASH2 W8 (#1838): the SAME fc aux-combine, straight off the runner's
+  // device-resident aux tap (`Qwen3_5AuxTaps.tensor`, bf16 [T, H*num_taps]) with
+  // no host round trip: one vt::MatmulBT, no casts. Mirrors upstream's
+  // `combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))` consuming the
+  // target's device tensors (dflash/speculator.py::propose @ b389ac2946). The
+  // dtype is ASSERTED bf16 by name rather than assumed, which is what the old
+  // host loop did silently.
+  static DflashCombinedDevice CombineAuxFeaturesDevice(const vt::Tensor& aux_bf16,
+                                                       const Qwen3DFlashWeights& weights,
+                                                       const HfConfig& config,
+                                                       vt::Queue& queue);
 
   // CONTEXT-FREE block forward -> [T, draft_vocab] f32 logits (the D2 isolation
   // gate). `input_ids` are the mask-block token ids (anchor + k mask_token_id per
@@ -284,11 +531,82 @@ class Qwen3DFlashModel {
 
   // ---- D11 Part A (device-resident append-only draft-KV store) ------------
   //
+  // #1919: HOW BIG THE STORE IS, AND WHO DECIDED. Until #1919 the answer was a
+  // compile-time `kDflashMaxCtxSlots = 4096` with no relation to the
+  // `max_model_len` the engine advertises and admits, so a server at
+  // `--max-model-len 12288` accepted an 8K-token prompt and then threw out of
+  // the middle of an EngineCore step. Upstream keeps NO private store: the
+  // DFlash draft's context K/V goes into the engine's own paged KV cache
+  // (`vllm/model_executor/models/qwen3_dflash.py:604-620` at pin `5559679229`)
+  // whose block tables are `cdiv(max_model_len, block_size)`
+  // (`vllm/v1/worker/gpu/model_runner.py:426,444`), and its per-step bound is
+  // `min(max_seq_len + num_query_per_req, max_model_len)`
+  // (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:331-333`).
+  //
+  // So the capacity is resolved from the engine's own context, plus the
+  // `num_query_per_req` headroom the (1+k) query block needs — the W11 paged
+  // route writes that block at slots `[C, C+Tq)`, and
+  // `ClassifyDflashBlockAttn` declines the fast route below it.
+  //
+  // A CAP IS STILL REQUIRED, because `max_model_len` alone can be absurd: the
+  // pool is per request, per draft layer, bf16, and doubled for K and V, so a
+  // 262144-token context is about a gigabyte per concurrent request and this
+  // box has OOM-rebooted from unbounded device residency (#1647).
+  //
+  // THE BUDGET IS A TOTAL, NOT A PER-REQUEST ALLOWANCE, and that is the point
+  // of it. The runner builds ONE store per BATCH ROW, so peak device residency
+  // is `bytes_per_request * max_num_reqs` — a per-request budget of 256 MiB was
+  // an 8 GiB aggregate at the `--max-num-seqs 32` `docs/USAGE.md` itself shows,
+  // none of it accounted by `gpu_memory_utilization`, which is the same
+  // unbounded-residency shape #1647 names. So `kDflashCtxTotalBudgetBytes`
+  // bounds the SUM across concurrent requests and the per-request share is
+  // `total / max_num_reqs`. `VT_DFLASH_CTX_MAX_TOKENS` overrides the cap in
+  // TOKENS per request, and the aggregate arithmetic is then the operator's
+  // own. A capped resolution is ANNOUNCED at startup rather than applied
+  // silently, together with the aggregate it costs, and a request that outgrows
+  // the store falls back to the non-speculative path instead of refusing or
+  // throwing.
+  //
+  // Every field is reported rather than derived by the caller, so the startup
+  // line can state what it compared against what instead of printing one
+  // number.
+  struct DflashCtxStoreSizing {
+    int64_t slots = 0;             // resolved capacity, a multiple of page_size
+    int64_t want_slots = 0;        // max_model_len + num_query_per_req, page-rounded
+    int64_t budget_slots = 0;      // what the byte budget (or the override) allows
+    int64_t page_size = 0;         // rows per paged context page
+    int64_t bytes_per_slot = 0;    // K+V, all draft layers, one context row
+    int64_t bytes_per_request = 0; // slots * bytes_per_slot
+    int64_t max_num_reqs = 0;      // concurrent batch rows == concurrent stores
+    int64_t bytes_total = 0;       // bytes_per_request * max_num_reqs, the residency
+    int64_t budget_bytes = 0;      // the TOTAL budget the cap was taken from
+    bool overridden = false;       // VT_DFLASH_CTX_MAX_TOKENS named the cap
+    bool capped = false;           // slots < want_slots
+  };
+
+  // Resolve the store's capacity for one draft geometry and one engine context.
+  // Pure host arithmetic, no device read, so a CPU gate covers CUDA exactly.
+  //
+  // `max_num_reqs` is REQUIRED and has no default, for the same reason
+  // `MakeDeviceKVStore`'s capacity has none: the budget it divides is the
+  // aggregate one, and a defaulted 1 would silently restore the per-request
+  // budget this parameter exists to remove.
+  static DflashCtxStoreSizing ResolveCtxStoreSizing(const HfConfig& config,
+                                                    int64_t max_model_len,
+                                                    int64_t num_query_per_req,
+                                                    int64_t max_num_reqs);
+
   // Create an empty per-request device KV store for `config.num_hidden_layers`
-  // draft layers. Held by the runner across verify steps (shared_ptr so the runner
-  // header needs only the forward declaration).
+  // draft layers, holding `max_ctx_slots` context rows. Held by the runner
+  // across verify steps (shared_ptr so the runner header needs only the forward
+  // declaration).
+  //
+  // `max_ctx_slots` is REQUIRED and has no default on purpose (#1919). A
+  // defaulted overload would let a call site keep the old fixed capacity
+  // silently, which is the defect this parameter exists to remove.
   static std::shared_ptr<DflashDeviceKVStore> MakeDeviceKVStore(const HfConfig& config,
-                                                                vt::Queue& queue);
+                                                                vt::Queue& queue,
+                                                                int64_t max_ctx_slots);
 
   // Project the `count` NEW context rows (`new_features` [count,H] f32 at absolute
   // `new_positions` [count]) to per-layer bf16 K/V ON DEVICE and append them (as a
@@ -301,8 +619,28 @@ class Qwen3DFlashModel {
                                     const Qwen3DFlashWeights& weights, const HfConfig& config,
                                     vt::Queue& queue);
 
+  // SPEC-DFLASH2 W8 (#1838): the SAME projection+append, fed DEVICE-side. Gathers
+  // the accepted-prefix rows `rows` (host i32 indices into `combined`, ascending
+  // committed-position order — the rejection output already determines them) with
+  // one vt::IndexSelect and runs the identical projection+scatter tail
+  // AppendContextKVDevice runs, so the appended bits are the host path's exactly:
+  // the host path's f32 detour around the same bf16 source was an exact round
+  // trip. `combined` is the [T, H] bf16 CombineAuxFeaturesDevice output.
+  static void AppendContextKVDeviceRows(DflashDeviceKVStore& store,
+                                        const vt::Tensor& combined,
+                                        const std::vector<int32_t>& rows,
+                                        const std::vector<int32_t>& new_positions,
+                                        const Qwen3DFlashWeights& weights,
+                                        const HfConfig& config, vt::Queue& queue);
+
   // Number of context rows currently resident in a device store.
   static int64_t DeviceKVNumCtx(const DflashDeviceKVStore& store);
+
+  // How many context rows the store can hold in total (#1919). The runner reads
+  // it to decide, BEFORE appending, whether this request still fits — which is
+  // what turns the capacity condition from a thrown `VT_CHECK` inside an
+  // EngineCore step into a per-request fallback to the non-speculative path.
+  static int64_t DeviceKVCapacity(const DflashDeviceKVStore& store);
 
   // CONTEXT-AWARE block forward over PERSISTENT DEVICE stores (the D11 production
   // path): concatenates the `stores` (one per propose request, in ctx_cu order) into
@@ -311,12 +649,22 @@ class Qwen3DFlashModel {
   // BIT-IDENTICAL to ForwardBlockLogitsWithPrecomputedKV given identical appends.
   // `ctx_cu`/`cu` are the per-request context/query boundaries (length num_reqs+1);
   // ctx_cu.back() == sum of the stores' num_ctx.
+  // SPEC-DFLASH2 W8 (#1837): `device_out`, when non-null, receives the logits
+  // and the post-final-norm hidden as DEVICE handles and the HOST return vector
+  // comes back EMPTY — downloading it is the round trip #1837 measures.
+  // Requesting `device_out` does NOT disqualify the single-request PAGED branch
+  // (unlike `final_out`, whose host contract is what cost a DFlash2 draft the
+  // D13 paged forward and its CUDA-graph capture), so a DFlash2 propose runs
+  // paged+captured exactly as a DFlash1 one does. `device_out` together with
+  // `final_out` is refused by name: no caller wants the same hidden both
+  // resident and downloaded.
   static std::vector<float> ForwardBlockLogitsWithDeviceKV(
       const std::vector<DflashDeviceKVStore*>& stores, const std::vector<int32_t>& ctx_cu,
       const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
       const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
       vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out = nullptr,
-      std::vector<float>* final_out = nullptr);
+      std::vector<float>* final_out = nullptr,
+      DflashBlockDeviceOut* device_out = nullptr);
 };
 
 // prepare_dflash_inputs (dflash/speculator.py:472-687, the _prepare_dflash_inputs_kernel

@@ -1177,3 +1177,34 @@ about magnitudes. **Two greedy prompts are not a token-exactness claim.**
 - **The drafter has still never run.** §10.5's acceptance A/B is unchanged.
 - **No speed axis.** §0 stands: the pinned oracle cannot load `muse_glimmer`, so
   there is no denominator and none is claimed here on any axis.
+
+## Owed
+
+- [#1466](https://github.com/mudler/vllm.cpp/issues/1466) —
+  `tests/vllm/models/test_muse_glimmer_text.cpp:532`, `CHECK(diff <= 5e-4)` is
+  the W1 measurement rounded up (`3a54c4b7d`'s body quotes 1.21e-04) with no
+  derivation beside it. `4712dac40` gave `vt`'s gated activations upstream's
+  rounding polarity, which is correct, and grew the envelope 2.8x to 3.43e-04 —
+  0.687 of the bound. Found while gating
+  [#1458](https://github.com/mudler/vllm.cpp/issues/1458), which repairs the
+  other member of the same class in the same case (`bdiff <= 1e-5`) and
+  deliberately leaves this one to its own derivation. A repair owes a measured
+  floor or a precision argument, never a bigger constant.
+
+- [#1566](https://github.com/mudler/vllm.cpp/issues/1566) — **the perception
+  encoder is an UNREACHED staged slice, so everything W3 built is dead code
+  today.** `MuseGlimmerVisionForward` is reached only from
+  `MuseGlimmerEncodePixelGroups` (`muse_glimmer_mm.cpp:191`) and
+  `MuseGlimmerGenerateGreedyViaRegistry` (`:276`), and neither has a caller in
+  `src/`, in `examples/` or in `include/vllm.h` — only in `tests/`.
+  `muse_glimmer_registry.cpp:13-14` states it: *"The perception encoder is still
+  W3, so an image or video prompt is a pending brick."* §3's W4 and W5 own the
+  wiring. Until they land, every change inside the tower is the staged-slice
+  exception in `.agents/reachability.md` and has to name this issue in its commit
+  body and its pull request body. The first one that does is
+  [#1545](https://github.com/mudler/vllm.cpp/issues/1545), which routes the
+  tower's 50 attention layers off the correctness-grade kernel
+  ([muse-glimmer-vision-attn-flash.md](muse-glimmer-vision-attn-flash.md)). The
+  issue exists because the model's umbrella
+  [#268](https://github.com/mudler/vllm.cpp/issues/268) is closed, so there was
+  nothing open left to name.

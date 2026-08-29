@@ -44,6 +44,21 @@ constexpr const char* kGpt4oRegex =
   throw std::runtime_error("tokenizer: " + msg);
 }
 
+// The SentencePiece unk sentinel. `Tokenizer::EncodePlainSp` pushes it as a
+// symbol for a character with no vocabulary token and no byte fallback, so it
+// travels through `BpeMerge` and must never be merged. Upstream keeps the same
+// split -- `merge_word` builds the Word, including its unk handling, before
+// `merge_all` runs (`tokenizers/src/models/bpe/model.rs:382-460`).
+//
+// `Tokenizer::FinalizeTables` asserts at LOAD that no merge names it, which is
+// the reserved-identifier guarantee `.agents/specs/bpe-quadratic-merge.md`
+// §Risks asks for: `MergeRanks::Find` then answers `kNoSymbol` for it on every
+// checkpoint we accept, and no merge can apply to a `kNoSymbol` symbol.
+const std::string& UnkSentinel() {
+  static const std::string kUnk("\x01\x01unk\x01\x01");
+  return kUnk;
+}
+
 // Splits a legacy-form merge entry "left right" (exactly one space, both
 // halves nonempty); used by both the HF and GGUF loaders.
 void SplitMergeEntry(const std::string& s, std::string& left,
@@ -59,13 +74,42 @@ void SplitMergeEntry(const std::string& s, std::string& left,
 
 // Inserts one merge pair at `rank`; duplicates fail loud (HF silently keeps
 // the LAST rank for duplicates; we keep neither).
-void InsertMerge(MergeRanks& ranks, const std::string& left,
-                 const std::string& right, int32_t rank) {
-  const auto [it, inserted] = ranks.emplace(MergeKey(left, right), rank);
-  if (!inserted) {
+//
+// The VOCABULARY RULE mirrors HF `tokenizers`
+// (`tokenizers/src/models/bpe/model.rs:174-192`): a merge whose left token,
+// right token, or concatenation is absent from the vocabulary is
+// `MergeTokenOutOfVocabulary` AT LOAD. We had no such rule, so a merge could
+// produce a symbol that `Tokenizer::EncodePlain` then failed on PER REQUEST,
+// with a message about a symbol nobody wrote. Moving the failure to load is
+// where upstream puts it and where a user can act on it.
+//
+// This is a behaviour change on malformed inputs, and it is deliberate: a
+// checkpoint that loads today and fails on some prompts is refused at load
+// instead. All seven `tokenizer.json` files committed under `tests/` carry zero
+// offending merges, so it costs nothing that this tree can load. The GGUF arm
+// is the one with no oracle -- HF never reads GGUF, and
+// `tokenizer.ggml.merges` is written by a CONVERTER rather than copied -- which
+// is why the message names the missing token.
+//
+// `merged` is `left + right` whole. Upstream trims
+// `continuing_subword_prefix` off the right half (`model.rs:169-173,186`), and
+// `FromHfJson` below already refuses a non-empty `continuing_subword_prefix`,
+// so that term is 0 on everything we accept.
+void InsertMerge(MergeRanks& ranks,
+                 const std::unordered_map<std::string, int32_t>& vocab,
+                 const std::string& left, const std::string& right,
+                 int32_t rank) {
+  const std::string merged = left + right;
+  for (const std::string* token : {&left, &right, &merged}) {
+    if (vocab.find(*token) == vocab.end()) {
+      Fail("merge token \"" + *token + "\" at merge rank " +
+           std::to_string(rank) + " (\"" + left + " " + right +
+           "\") is not in the vocabulary");
+    }
+  }
+  if (!ranks.Insert(left, right, rank)) {
     Fail("duplicate merge pair \"" + left + " " + right + "\" at rank " +
-         std::to_string(rank) + " (first seen at rank " +
-         std::to_string(it->second) + ")");
+         std::to_string(rank));
   }
 }
 
@@ -109,11 +153,46 @@ constexpr const char* kDsPunctRegex =
 constexpr const char* kDsTrailWsRegex = "\\s+$";
 constexpr const char* kDsCjkRegex = "[\u4E00-\u9FA5\u0800-\u4E00\uAC00-\uD7FF]+";
 
-// Recognizes the DeepSeek `Sequence` pre_tokenizer EXACTLY: five Splits with the
-// verbatim patterns above (all Isolated, non-inverted), then
-// Digits(individual_digits=true), then ByteLevel(add_prefix_space=false,
-// use_regex=false). Returns false (not "fail") for anything else, so the
-// ordinary single-Split path still gets its own diagnostics.
+// The DeepSeek-V3 family (DeepSeek-V3, DeepSeek-R1, DeepSeek-V4-Flash) ships a
+// DIFFERENT `Sequence`: FOUR stages, three of them `Split`, and it shares not
+// one pattern with the five above. llama.cpp keeps the two as separate cases of
+// one switch -- LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM and
+// LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, src/llama-vocab.cpp:308-325 @ b10451
+// (10bf611e5, the pinned llama.cpp oracle) -- and so does this file.
+//
+// Transcribed VERBATIM from the DeepSeek-V4-Flash checkpoint's tokenizer.json
+// (sha256 8f9f37ca…33cf; the exact bytes are committed at
+// tests/parity/goldens/tokenizer_deepseek_v3/tokenizer.json), and compared
+// byte-for-byte below, for the same reason the V2 patterns are: a DeepSeek
+// variant that ships different classes must fail loudly rather than tokenize
+// subtly wrong. The transcription is SELF-CHECKING -- if any byte here is
+// wrong the recognizer does not fire on the real file and
+// test_tokenizer_parity_deepseek_v3 reds on the very first case.
+//
+// The CJK class is written with \u escapes for the same lookalike reason the V2
+// classes are: U+3040 is UNASSIGNED and U+30A0 is a hyphen, so a literal-UTF-8
+// spelling of that class would be three invisible or misleading glyphs in a
+// row. Note that the WORD regex carries LITERAL CR/LF BYTES inside its
+// `[\r\n]` classes where the Qwen checkpoints write the two-character escapes;
+// `\r`/`\n` in a C++ literal produce exactly those bytes, so it compares equal
+// without the canonicalization DetectPattern applies on the single-Split path.
+constexpr const char* kDsV3DigitsRegex = "\\p{N}{1,3}";
+constexpr const char* kDsV3CjkRegex =
+    "[\u4E00-\u9FA5\u3040-\u309F\u30A0-\u30FF]+";
+constexpr const char* kDsV3WordRegex =
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+"
+    "|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
+    "| ?[\\p{P}\\p{S}]+[\r\n]*"
+    "|\\s*[\r\n]+"
+    "|\\s+(?!\\S)"
+    "|\\s+";
+
+// Recognizes the DeepSeek-V2 `Sequence` pre_tokenizer EXACTLY: five Splits with
+// the verbatim kDsNewline/kDsLetters/kDsPunct/kDsTrailWs/kDsCjk patterns above
+// (all Isolated, non-inverted), then Digits(individual_digits=true), then
+// ByteLevel(add_prefix_space=false, use_regex=false). Returns false (not
+// "fail") for anything else, so the ordinary single-Split path still gets its
+// own diagnostics. The V3 sibling is IsDeepSeekV3PreTokenizer below.
 bool IsDeepSeekPreTokenizer(const json& node) {
   if (!node.is_object() || node.value("type", "") != "Sequence") return false;
   const auto it = node.find("pretokenizers");
@@ -139,6 +218,43 @@ bool IsDeepSeekPreTokenizer(const json& node) {
     return false;
   }
   const json& bl = (*it)[6];
+  return bl.is_object() && bl.value("type", "") == "ByteLevel" &&
+         !bl.value("add_prefix_space", true) && !bl.value("use_regex", false);
+}
+
+// Recognizes the DeepSeek-V3 `Sequence` pre_tokenizer EXACTLY: three Splits
+// with the verbatim patterns above (all Isolated, non-inverted), then
+// ByteLevel(add_prefix_space=false, use_regex=false). Returns false (not
+// "fail") for anything else, exactly like its V2 sibling, so the ordinary
+// single-Split path still gets its own diagnostics.
+//
+// WHY IT CANNOT BE THE GENERIC WALK. The walk collects Split regexes into a
+// flat list and then insists on exactly ONE, because for a single full-cover
+// alternation the pattern IS the whole splitting rule. Here there are three,
+// and they COMPOSE: each stage re-splits the pieces the previous one produced,
+// so the list order is semantics rather than an accident of the file. A walk
+// that concatenated or alternated them would be a different function
+// (`\p{N}{1,3}` alternated with the third pattern never groups digits before
+// the word rule sees them). See src/vllm/tokenizer/pretokenizer.cpp.
+bool IsDeepSeekV3PreTokenizer(const json& node) {
+  if (!node.is_object() || node.value("type", "") != "Sequence") return false;
+  const auto it = node.find("pretokenizers");
+  if (it == node.end() || !it->is_array() || it->size() != 4) return false;
+  const char* want[3] = {kDsV3DigitsRegex, kDsV3CjkRegex, kDsV3WordRegex};
+  for (int i = 0; i < 3; ++i) {
+    const json& s = (*it)[static_cast<size_t>(i)];
+    if (!s.is_object() || s.value("type", "") != "Split") return false;
+    if (s.value("behavior", "") != "Isolated" || s.value("invert", false)) {
+      return false;
+    }
+    const auto pat = s.find("pattern");
+    if (pat == s.end() || !pat->is_object() || !pat->contains("Regex") ||
+        !(*pat)["Regex"].is_string()) {
+      return false;
+    }
+    if ((*pat)["Regex"].get<std::string>() != want[i]) return false;
+  }
+  const json& bl = (*it)[3];
   return bl.is_object() && bl.value("type", "") == "ByteLevel" &&
          !bl.value("add_prefix_space", true) && !bl.value("use_regex", false);
 }
@@ -323,9 +439,15 @@ bool IsValidUtf8(const uint8_t* p, size_t n) {
 SplitPattern DetectPattern(const json& doc) {
   const auto it = doc.find("pre_tokenizer");
   if (it == doc.end() || it->is_null()) Fail("missing pre_tokenizer");
-  // Checked BEFORE the single-Split walk: the DeepSeek family is a seven-stage
-  // pipeline whose components (Digits, five Splits) the walk cannot express.
+  // Checked BEFORE the single-Split walk: both DeepSeek families are
+  // Sequence PIPELINES whose components the walk cannot express -- V2's
+  // Digits stage and five Splits, V3's three COMPOSING Splits. The walk
+  // accepts exactly one Split, so without these two lines a DeepSeek
+  // checkpoint is refused rather than mis-tokenized, which is what
+  // `vllm-server` did to every DeepSeek-V4-Flash safetensors artifact
+  // (#1924): `expected exactly one Split pre-tokenizer, found 3`.
   if (IsDeepSeekPreTokenizer(*it)) return SplitPattern::kDeepSeek;
+  if (IsDeepSeekV3PreTokenizer(*it)) return SplitPattern::kDeepSeekV3;
   std::vector<std::string> regexes;
   bool saw_byte_level = false;
   bool byte_level_use_regex = false;
@@ -505,6 +627,16 @@ void Tokenizer::FinalizeTables() {
   for (const auto& t : added_tokens_) check_id(t.id);
   if (vocab_.empty() && added_tokens_.empty()) Fail("empty vocab");
 
+  // The unk sentinel must stay outside the merge table's identifier space, or
+  // `EncodePlainSp` could merge a symbol that is not a token. `InsertMerge`
+  // above already refuses any merge naming a token absent from the vocabulary,
+  // so this can only fire on a checkpoint that puts the sentinel's bytes in its
+  // vocabulary AND names them in a merge. Checked once here rather than per
+  // request.
+  if (merge_ranks_.Find(UnkSentinel()) != MergeRanks::kNoSymbol) {
+    Fail("the unk sentinel is named by a merge; it must not be a real symbol");
+  }
+
   token_text_.assign(max_id + 1, std::string());
   is_added_.assign(max_id + 1, 0);
   for (const auto& kv : vocab_) {
@@ -522,6 +654,20 @@ void Tokenizer::FinalizeTables() {
     }
     slot = t.text;
     is_added_[static_cast<size_t>(t.id)] = t.special ? 2 : 1;
+  }
+
+  // The longest STORED token text, computed once here rather than per request.
+  // Callers use it as an upper bound on the bytes ONE token can account for in
+  // the input, so it has to be an over-estimate and never an under-estimate.
+  // The stored form gives that for free on both families: a byte-level token
+  // stores one mapped CODEPOINT per input byte (1-2 UTF-8 bytes each), and a
+  // SentencePiece token stores its literal text with the metaspace mark (3
+  // bytes) standing in for one space and "<0xNN>" (6 bytes) for one fallback
+  // byte. Measured over the four committed goldens: 256 (Qwen3.6, DeepSeek-V2),
+  // 192 (muse_glimmer), 48 (Mistral).
+  max_token_bytes_ = 0;
+  for (const std::string& text : token_text_) {
+    if (text.size() > max_token_bytes_) max_token_bytes_ = text.size();
   }
 }
 
@@ -677,7 +823,7 @@ Tokenizer Tokenizer::FromHfJsonBytes(std::string_view tokenizer_json,
         right.find(' ') != std::string::npos) {
       Fail("malformed merge entry at rank " + std::to_string(rank));
     }
-    InsertMerge(tok.merge_ranks_, left, right, rank);
+    InsertMerge(tok.merge_ranks_, tok.vocab_, left, right, rank);
     ++rank;
   }
 
@@ -780,19 +926,45 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     // Decode() never performs, so "off" is already our behaviour and there is
     // nothing to carry over.
     tok.pattern_ = SplitPattern::kGpt4o;
-  } else if (pre == "joyai-llm" || pre == "deepseek-llm" || pre == "deepseek-v3" ||
-             pre == "laguna") {
+  } else if (pre == "deepseek-llm") {
+    // The DeepSeek-V2 family. llama.cpp maps this pre name to
+    // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM (src/llama-vocab.cpp:2162 @ b10451,
+    // regexes at :308-316) — the same splitting rule this file ports as the
+    // seven-stage SplitPattern::kDeepSeek. It used to resolve to kLlama3 as a
+    // "close approximation" — added by the DeepSeek-V4 W8 spike before
+    // kDeepSeek existed, and never revisited once it did. It is not close:
+    // kDeepSeek isolates every newline, groups digits ONE at a time rather
+    // than in threes, and carries enumerated letter/punct/CJK classes that
+    // kLlama3's `\p{L}`/`\p{N}` alternation does not have.
+    tok.pattern_ = SplitPattern::kDeepSeek;
+  } else if (pre == "deepseek-v3" || pre == "joyai-llm" ||
+             pre == "hunyuan-dense") {
+    // The DeepSeek-V3 family (DeepSeek-V3, DeepSeek-R1, DeepSeek-V4-Flash).
+    // These are exactly the three pre names llama.cpp maps to
+    // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM (src/llama-vocab.cpp:2170, :2351 and
+    // :2355 @ b10451), and that pre-type carries its own three regexes at
+    // :318-325 — BYTE-IDENTICAL to this checkpoint's three, and ported verbatim
+    // as SplitPattern::kDeepSeekV3 (#1924).
+    //
+    // These also used to resolve to kLlama3 as a "close approximation", with a
+    // comment naming the DeepSeek-V4-Flash GGUF (antirez/ds4 q2-imatrix,
+    // pre="joyai-llm") as the artifact that forced it. The approximation is
+    // real and it is wrong on ordinary text: kLlama3 gives "(" + "x" where
+    // this family binds "(x" into one piece, and it splits contractions the
+    // other way round. Same failure shape as #347, where a `\p{N}{1,3}`
+    // lookalike silently claimed the GPT-4o family.
+    //
+    // llama.cpp also sets clean_spaces = false for this pre-type. That flag
+    // drives llama.cpp's own detokenizer space fixups, which our byte-level
+    // Decode() never performs, so "off" is already our behaviour.
+    tok.pattern_ = SplitPattern::kDeepSeekV3;
+  } else if (pre == "laguna") {
     // Laguna-S-2.1 GGUFs tag pre="laguna"; the vocab is gpt2 byte-level BPE and
     // the pretokenizer is the GPT-2/Llama-3 byte-level family. Mapped to kLlama3
     // as a close APPROXIMATION for Encode() (feed the reference engine's own ids
-    // for a token-EXACT cross-check); Decode() is vocab-based and exact.
-    // DeepSeek-V4-Flash GGUFs (antirez/ds4 q2-imatrix) tag pre="joyai-llm". The
-    // vocab is gpt2 byte-level BPE; the pretokenizer regex is the GPT-2/Llama-3
-    // byte-level family. We map it to kLlama3 for our-side Encode() as a close
-    // APPROXIMATION (it may differ from DeepSeek's exact regex on rare boundary
-    // pretokens) — for a token-EXACT cross-check, feed the reference engine's own
-    // input ids. Decode() is vocab-based and pattern-INDEPENDENT, so detokenizing
-    // generated ids is exact regardless.
+    // for a token-EXACT cross-check); Decode() is vocab-based and exact. Left
+    // alone by #1924: llama.cpp has no `laguna` pre name at all, so unlike the
+    // DeepSeek names above there is no exact pre-type to resolve it onto.
     tok.pattern_ = SplitPattern::kLlama3;
   } else {
     Fail("unsupported tokenizer.ggml.pre \"" + pre + "\"");
@@ -861,7 +1033,7 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     std::string left;
     std::string right;
     SplitMergeEntry(std::get<std::string>(entry.v), left, right);
-    InsertMerge(tok.merge_ranks_, left, right, rank);
+    InsertMerge(tok.merge_ranks_, tok.vocab_, left, right, rank);
     ++rank;
   }
 
@@ -942,7 +1114,7 @@ void Tokenizer::EncodePlainSp(std::string_view text, bool at_input_start,
   //    present in the vocab, else (with byte_fallback) decomposes into its
   //    UTF-8 bytes as "<0xNN>" tokens, else becomes unk. Merges then run over
   //    these symbols; fuse_unk collapses consecutive unks WITHIN the pretoken.
-  static const std::string kUnk("\x01\x01unk\x01\x01");  // never a real symbol
+  const std::string& kUnk = UnkSentinel();  // never a real symbol
   const auto encode_piece = [&](std::string_view piece) {
     std::vector<std::string> symbols;
     size_t pos = 0;

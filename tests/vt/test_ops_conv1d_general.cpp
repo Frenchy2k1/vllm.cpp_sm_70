@@ -6,33 +6,46 @@
 // THREE CLAIMS, THREE INSTRUMENTS. Each is stated here because a green that
 // cannot say which claim it covers is the failure mode this file exists inside.
 //
-// (1) THE CPU PROVIDER IS THE PRE-OP HOST LOOP. The oracle is
-//     `SerialConv1d` / `SerialConvTranspose1d` below, VERBATIM copies of
+// (1) THE CPU PROVIDER WALKS THE DECLARED ORDER. The oracle is `SerialConv1d`
+//     / `SerialConvTranspose1d` below. They were VERBATIM copies of
 //     `vllm::vocoder1d::Conv1d` / `ConvTranspose1d` as they stood at 8fa405bb7,
-//     the commit every MiniMax-Music3 / MiniMax-H3 / LTX-2.5 / IndexTTS-2.5
-//     golden was taken on. Comparing the op against itself at two thread counts
-//     would prove only determinism; it would pass just as happily if the move
-//     into the seam had reassociated every sum. The pre-change code is the only
-//     oracle that can see that, so it is carried here rather than referenced.
+//     which let this clause read "IS THE PRE-OP HOST LOOP". #1474 narrowed
+//     their accumulators from `double` to `float` in lockstep with the kernels,
+//     so they no longer transcribe that loop's arithmetic and this clause is
+//     weaker than it was: what it asserts is that the ORDER did not move, not
+//     that the values match a historical implementation. Comparing the op
+//     against itself at two thread counts would still prove only determinism —
+//     it would pass just as happily if the move into the seam had reassociated
+//     every sum — so a separate scalar transcription is still the only oracle
+//     that can see an order change, and it is carried here rather than
+//     referenced. The WIDTH is gated separately and NOT against ourselves:
+//     `tests/vllm/models/test_host_parallel.cpp`, `accumulates in f32, which is
+//     what torch does`, asserts torch's own measured answer for a reduction
+//     engineered to separate the two widths.
 //     `tests/vllm/models/test_host_parallel.cpp` makes the same comparison
 //     through the four models' own entry point; this file covers the shapes
 //     that entry point cannot express — padding != 0, dilation on the transposed
 //     op, output_padding, and batch > 1.
 //
 // (2) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE. Not within a
-//     tolerance. Both walk one f64 accumulator per output element in the same
+//     tolerance. Both walk one f32 accumulator per output element in the same
 //     order; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56) and
-//     the device kernel pins itself with `__dmul_rn`/`__dadd_rn`, so every
-//     operation on both arms is an IEEE double multiply or add with
-//     round-to-nearest-even. `memcmp` is therefore the right instrument and a
+//     the device kernel pins itself with `__fmul_rn`/`__fadd_rn`, so every
+//     operation on both arms is an IEEE single multiply or add with
+//     round-to-nearest-even. NOT RUN at that width: #1474 narrowed both arms on
+//     a box with no CUDA toolkit and no lease, so these cases have skipped ever
+//     since — .agents/specs/vt-conv1d-f32-accumulator.md §7. `memcmp` is therefore the right instrument and a
 //     tolerance would be the wrong one: a transposed weight axis, a dropped
 //     zero-skip or a reassociated sweep all land well inside any epsilon anyone
 //     would write. Skips cleanly with a LOUD message when no GPU is present.
 //
 // (3) EQUALITY IS TESTED WHERE IT CAN ACTUALLY FAIL. An f64 accumulator stored
-//     through an f32 cannot show a ~2^-53 relative change, so an order defect on
-//     well-scaled data is INVISIBLE — measured, not assumed: see the mutation
-//     record in tests/vllm/models/test_host_parallel.cpp. Every claim above is
+//     through an f32 could not show a ~2^-53 relative change, so an order defect
+//     on well-scaled data was INVISIBLE — measured, not assumed: see the
+//     mutation record in tests/vllm/models/test_host_parallel.cpp. #1474
+//     narrowed the accumulator, which can only make well-scaled data more
+//     sensitive; the engineered cases stay, because a gate is not retired on the
+//     argument that something else now covers it. Every claim above is
 //     therefore also exercised on engineered catastrophic cancellation, taps of
 //     +2^40 and -2^40 against small remainders.
 //
@@ -49,7 +62,14 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/cpu/cpu_conv1d_block.h"  // Conv1dTimeBlock, kConv1dPosTile
 #include "vt/ops.h"
+// The shipped-geometry case below READS the vocoder's configuration rather than
+// transcribing it. `MiniMaxMusic3VocoderConfig` carries the channel counts and
+// the upsampling ratios; `kVocoderResidualDilations` / `kVocoderResidualUnits`
+// carry the residual stack. Both are header-only, so this adds no link edge.
+#include "vllm/model_executor/models/minimax_music3_acoustic.h"
+#include "vllm/model_executor/models/minimax_music3_loader.h"
 
 using vt::Conv1dArgs;
 using vt::ConvTranspose1dArgs;
@@ -131,7 +151,7 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
     for (int64_t oc = 0; oc < out_channels; ++oc) {
       const int64_t g = oc / out_per_group;
       for (int64_t t = 0; t < length; ++t) {
-        double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
+        float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0F;
         for (int64_t step = 0; step < in_per_group; ++step) {
           const int64_t ic = reverse_ic ? in_per_group - 1 - step : step;
           const int64_t src_c = g * in_per_group + ic;
@@ -139,13 +159,11 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
             const int64_t k = reverse_k ? kernel - 1 - tap : tap;
             const int64_t pos = t * a.stride - a.padding + k * a.dilation;
             if (pos < 0 || pos >= in_len) continue;
-            acc += static_cast<double>(
-                       in[static_cast<size_t>((n * in_channels + src_c) * in_len + pos)]) *
-                   static_cast<double>(
-                       weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
+            acc += in[static_cast<size_t>((n * in_channels + src_c) * in_len + pos)] *
+                   weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)];
           }
         }
-        out[static_cast<size_t>((n * out_channels + oc) * length + t)] = static_cast<float>(acc);
+        out[static_cast<size_t>((n * out_channels + oc) * length + t)] = acc;
       }
     }
   }
@@ -178,21 +196,20 @@ std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t b
   const int64_t out_per_group = out_channels / a.groups;
   const int64_t full = (in_len - 1) * a.stride + a.dilation * (kernel - 1) + 1;
   std::vector<float> out(static_cast<size_t>(batch * out_channels * length));
-  std::vector<double> acc(static_cast<size_t>(out_channels * full));
+  std::vector<float> acc(static_cast<size_t>(out_channels * full));
   for (int64_t n = 0; n < batch; ++n) {
-    std::fill(acc.begin(), acc.end(), 0.0);
+    std::fill(acc.begin(), acc.end(), 0.0F);
     for (int64_t step = 0; step < in_channels; ++step) {
       const int64_t ic = reverse_ic ? in_channels - 1 - step : step;
       const int64_t g = ic / in_per_group;
       for (int64_t t = 0; t < in_len; ++t) {
-        const double value = in[static_cast<size_t>((n * in_channels + ic) * in_len + t)];
-        if (value == 0.0) continue;
+        const float value = in[static_cast<size_t>((n * in_channels + ic) * in_len + t)];
+        if (value == 0.0F) continue;
         for (int64_t oc = 0; oc < out_per_group; ++oc) {
           const int64_t dst_c = g * out_per_group + oc;
           for (int64_t k = 0; k < kernel; ++k) {
             acc[static_cast<size_t>(dst_c * full + t * a.stride + k * a.dilation)] +=
-                value * static_cast<double>(
-                            weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)]);
+                value * weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)];
           }
         }
       }
@@ -200,9 +217,9 @@ std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t b
     for (int64_t c = 0; c < out_channels; ++c) {
       for (int64_t t = 0; t < length; ++t) {
         const int64_t p = t + a.padding;
-        double value = p < full ? acc[static_cast<size_t>(c * full + p)] : 0.0;
+        float value = p < full ? acc[static_cast<size_t>(c * full + p)] : 0.0F;
         if (bias != nullptr) value += (*bias)[static_cast<size_t>(c)];
-        out[static_cast<size_t>((n * out_channels + c) * length + t)] = static_cast<float>(value);
+        out[static_cast<size_t>((n * out_channels + c) * length + t)] = value;
       }
     }
   }
@@ -759,4 +776,393 @@ TEST_CASE("vt conv1d ops agree CPU-vs-CUDA under CATASTROPHIC CANCELLATION") {
   const std::vector<float> fcuda =
       RunFwd(gpu, in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr, {1, cout, flout}, fwd);
   RequireBitIdentical(fcuda, fcpu, "Conv1d cancellation cuda-vs-cpu");
+}
+
+// --- The (time block, output row) decomposition (#1664) --------------------
+//
+// WHY THESE CASES ARE NOT COVERED BY THE TWO ABOVE. The cancellation cases at
+// `cin = 32` produce a block length of 4064 against an output length of 197, so
+// the whole convolution is ONE block and the second axis of the decomposition
+// is never entered. They would stay green with the block loop deleted, which is
+// the state a passing suite cannot otherwise report. Every case below asserts
+// FIRST that its own shape produces more than one block, and only then asserts
+// what crossing a boundary must not change.
+
+TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundary") {
+  // The ONE property the bit-identity argument rests on. A block length that is
+  // not a multiple of `kConv1dPosTile` re-cuts the position tiles, so a tile
+  // that takes the constant-trip-count fast path today would take the chunked
+  // path instead — a code-path change wearing a scheduling change's clothes,
+  // which spec §18.4 prices at up to 5x.
+  const int64_t strides[] = {1, 2, 4, 8};
+  const int64_t dilations[] = {1, 2, 3, 9};
+  const int64_t kernels[] = {1, 4, 7, 8, 16};
+  const int64_t channels[] = {1, 3, 64, 96, 192, 384, 768, 1024, 4096, 65536};
+  const int64_t lengths[] = {1, 7, 32, 33, 197, 300, 2752, 22016};
+  int64_t checked = 0;
+  int64_t multi_block = 0;
+  int64_t maximal = 0;
+  int64_t single_block = 0;
+  for (const int64_t stride : strides) {
+    for (const int64_t dilation : dilations) {
+      for (const int64_t kernel : kernels) {
+        for (const int64_t cin : channels) {
+          for (const int64_t length : lengths) {
+            const int64_t block =
+                vt::cpu::Conv1dTimeBlock(cin, kernel, stride, dilation, length);
+            ++checked;
+            REQUIRE(block >= 1);
+            REQUIRE(block <= length);
+            // Either the whole length (one block, nothing to align) or a
+            // multiple of the tile.
+            const bool aligned = block == length || block % vt::cpu::kConv1dPosTile == 0;
+            INFO("cin=" << cin << " k=" << kernel << " s=" << stride << " d=" << dilation
+                        << " len=" << length << " block=" << block);
+            CHECK(aligned);
+            if (block < length) {
+              ++multi_block;
+              // THE BUDGET, AT EVERY STRIDE. After #1770 removed rule (1) this is
+              // the whole of `Conv1dTimeBlock`, and it was gated only through the
+              // vocoder-geometry case, all of whose shapes are stride 1. Dropping
+              // `stride` from the slice arithmetic overruns the budget by up to
+              // `stride` times and left every suite green; this is where that is
+              // caught. `vocoder1d::DownSample1d` calls `vt::Conv1d` with
+              // `stride = ratio`, so stride > 1 is reachable and not hypothetical.
+              const int64_t row_bytes = cin * stride * 4;
+              const int64_t slice = cin * ((block - 1) * stride + (kernel - 1) * dilation + 1) * 4;
+              INFO("row_bytes=" << row_bytes << " slice=" << slice);
+              if (block > vt::cpu::kConv1dPosTile) {
+                // The UPPER bound stays guarded: at the one-tile floor the block is
+                // the minimum rather than an answer, and its slice may legitimately
+                // exceed the budget because `kConv1dPosTile` positions are taken
+                // whatever the geometry costs.
+                CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+              }
+              // MAXIMALITY, and it is the half nothing asserted. The bound above is
+              // satisfied by any block small enough -- including one HALF the size,
+              // which doubles the block count and so doubles the weight re-reads
+              // that this row exists to price. One tile more must not fit:
+              // `block + kConv1dPosTile` rows of activation plus the dilated
+              // kernel's fixed term overrun the budget. The `+ 1` is the function's
+              // own conservatism, which charges `block` rows where the slice spans
+              // `block - 1`.
+              //
+              // UNGUARDED, unlike the upper bound, and that is measured rather than
+              // assumed: at the one-tile floor the slice already exceeds the budget,
+              // so the bound is trivially true there rather than false. Guarding it
+              // exempted 1 435 of 2 560 multi-block shapes for nothing.
+              ++maximal;
+              CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * row_bytes >
+                    vt::cpu::kConv1dSliceBytes);
+            } else {
+              // THE SINGLE-BLOCK ARM, which asserted NOTHING and is the symmetric
+              // hole to the one the maximality bound closed. Everything above lives
+              // under `block < length`, so a change that refused to block until a
+              // shape needed two whole blocks moved 512 shapes out of the checked
+              // arm and left this case GREEN at 14 cases / `SUCCESS!`. A shape is
+              // allowed one block only when its WHOLE activation fits the budget --
+              // or when the length is under one position tile, which is the floor
+              // the function cannot go below.
+              ++single_block;
+              const int64_t whole =
+                  cin * ((length - 1) * stride + (kernel - 1) * dilation + 1) * 4;
+              // A named bool because doctest forbids `||` inside CHECK.
+              const bool one_block_is_earned =
+                  whole <= vt::cpu::kConv1dSliceBytes || length <= vt::cpu::kConv1dPosTile;
+              INFO("whole=" << whole);
+              CHECK(one_block_is_earned);
+            }
+          }
+        }
+      }
+    }
+  }
+  // TEETH. A budget large enough to swallow every geometry would make every
+  // `aligned` above trivially true through the `block == length` arm, and the
+  // sweep would assert nothing. This says the sweep actually contains the case
+  // it exists for.
+  INFO("checked=" << checked << " multi-block=" << multi_block << " maximal=" << maximal
+                  << " single-block=" << single_block);
+  CHECK(checked > 0);
+  CHECK(multi_block > 0);
+  // TEETH for the upper bound, which is the one still guarded: a change that drove
+  // every block to the one-tile floor would make it vacuous while the case stayed
+  // green.
+  CHECK(maximal > 0);
+  // TEETH for the single-block arm, for the same reason in the other direction.
+  CHECK(single_block > 0);
+}
+
+namespace {
+
+// One `vt::Conv1d` call the MiniMax-Music3 vocoder makes at a given window.
+struct VocoderConvShape {
+  std::string name;
+  int64_t in_ch;
+  int64_t out_ch;
+  int64_t kernel;
+  int64_t dilation;
+  int64_t in_len;   // AFTER the pad the caller applies
+  int64_t length;   // produced positions
+};
+
+// Every `vt::Conv1d` the vocoder runs for one stream at a `latents`-frame
+// window, DERIVED FROM THE CONFIGURATION rather than transcribed.
+//
+// WHY IT IS DERIVED. The previous revision of this gate carried the six channel
+// counts and lengths as literals copied by hand out of
+// `minimax_music3_loader.h`. A hand-copied constant cannot notice that its
+// source moved: a checkpoint whose `decoder_hidden_dim` or `upsampling_ratios`
+// differ would leave this case green while the production shapes collapsed back
+// to one block, which is precisely the drift the case exists to catch. So the
+// walk below reads `MiniMaxMusic3VocoderConfig` and the residual-stack
+// constants and reproduces the recurrence in `minimax_music3_acoustic.cpp`
+// `VocoderDecode` / `VocoderBlock` / `VocoderResidualUnit`.
+//
+// WHAT IS STILL MIRRORED, stated rather than glossed: the SHAPE OF THE CHAIN --
+// which convolutions exist, their kernel sizes (7 / 1 / 7) and the pads their
+// callers apply -- is written twice, here and in `VocoderDecode`. The config is
+// no longer. The residual cross-check is that `VocoderDecode` itself refuses at
+// run time unless the chain produces `latents * hop_length()` samples
+// (minimax_music3_acoustic.cpp:857-861), and the walk below reproduces that same
+// invariant from the ratios, so a change to the upsampling arithmetic on either
+// side stops agreeing with the other.
+std::vector<VocoderConvShape> Music3VocoderConvShapes(
+    const vllm::MiniMaxMusic3VocoderConfig& config, int64_t latents) {
+  using vllm::models::music3::kVocoderResidualDilations;
+  using vllm::models::music3::kVocoderResidualUnits;
+  std::vector<VocoderConvShape> shapes;
+  const int64_t hidden = config.decoder_hidden_dim;
+  int64_t current = latents;
+  // `dec_in_proj`, a 1x1 over one of the two streams (:110-115).
+  shapes.push_back({"dec_in_proj", config.stream_channels(), config.decoder_input_dim, 1, 1,
+                    current, current});
+  // `conv_in`: nn.Conv1d(kernel_size=7, padding=3) (:89), so the caller pads 3/3.
+  shapes.push_back({"conv_in", config.decoder_input_dim, hidden, 7, 1, current + 6, current});
+  for (size_t index = 0; index < config.upsampling_ratios.size(); ++index) {
+    const int64_t stride = config.upsampling_ratios[index];
+    const int64_t output_dim = hidden >> (index + 1);
+    // ConvTranspose1d(kernel=2*stride, padding=ceil(stride/2)) (:57).
+    const int64_t padding = (stride + 1) / 2;
+    current = (current - 1) * stride - 2 * padding + 2 * stride;
+    for (int64_t unit = 0; unit < kVocoderResidualUnits; ++unit) {
+      const int64_t dilation = kVocoderResidualDilations[unit];
+      // `pad = (7 - 1) * dilation // 2`, symmetric (:39).
+      const int64_t pad = (7 - 1) * dilation / 2;
+      const std::string tag = "b" + std::to_string(index) + "_u" + std::to_string(unit);
+      shapes.push_back({tag + "_conv1 k7 d" + std::to_string(dilation), output_dim, output_dim, 7,
+                        dilation, current + 2 * pad, current});
+      shapes.push_back({tag + "_conv2 k1", output_dim, output_dim, 1, 1, current, current});
+    }
+  }
+  const int64_t last_output = hidden >> config.upsampling_ratios.size();
+  // `conv_out`: kernel 7, padding 3, ONE output channel.
+  shapes.push_back({"conv_out", last_output, 1, 7, 1, current + 6, current});
+  return shapes;
+}
+
+}  // namespace
+
+TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition is reached") {
+  // REACHABILITY, as a gate rather than as a paragraph. A scheduling change is
+  // invisible to every arithmetic assertion in this file BY DESIGN — the cases
+  // below would stay green with the block loop deleted, because a rows-only
+  // partition computes the same bytes. So the thing that has to be asserted is
+  // that production SHAPES enter the second axis at all. If a future budget or
+  // geometry change collapses them back to one block, the decomposition becomes
+  // dead code that no test can otherwise notice.
+  //
+  // The geometries come from `MiniMaxMusic3VocoderConfig`'s own defaults, read
+  // rather than copied (`Music3VocoderConvShapes` above). LTX-2.5, IndexTTS-2.5
+  // and MiniMax-H3 reach the same op and are not enumerated here: this case
+  // asserts that the path is entered, not that every consumer enters it.
+  //
+  // WHAT NO SUITE HERE COVERS, named because §6c of the spec had to be
+  // corrected for saying otherwise: this case evaluates the FUNCTION, and the
+  // arithmetic gate on a shape that actually crosses a block boundary lives at
+  // `tests/vllm/models/test_vocoder1d.cpp` — through
+  // `vllm::vocoder1d::Conv1d`, the body all four audio consumers call.
+  const vllm::MiniMaxMusic3VocoderConfig config;
+  // 344 latent frames: the length .agents/specs/minimax-music3.md §18.8a's
+  // sweep tops out at.
+  const std::vector<VocoderConvShape> shapes = Music3VocoderConvShapes(config, 344);
+  REQUIRE(shapes.size() > 8U);
+
+  // The chain's own length invariant, reproduced from the ratios. This is what
+  // makes the derived walk answerable to `VocoderDecode`, which refuses at run
+  // time unless it produces exactly this many samples.
+  int64_t hop = 1;
+  for (const int64_t ratio : config.upsampling_ratios) hop *= ratio;
+  CHECK(shapes.back().length == 344 * hop);
+
+  // WHAT THE BLOCK LENGTH IS ALLOWED TO BE, on every shape the chain runs.
+  // `Conv1dTimeBlock` carries ONE rule since #1770 -- the cache budget -- so a
+  // shape either blocks, in which case the block must land on a position-tile
+  // boundary and its activation slice must fit `kConv1dSliceBytes`, or its whole
+  // activation already fits and it returns `length`. There is no third answer,
+  // and the previous revision of this case asserted a second rule that was
+  // measured worth nothing and removed (`.agents/specs/vt-conv1d-block-condition.md`).
+  int64_t multi = 0;
+  int64_t single = 0;
+  bool saw_conv_out = false;
+  for (const VocoderConvShape& sh : shapes) {
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.kernel, 1, sh.dilation, sh.length);
+    const int64_t blocks = (sh.length + block - 1) / block;
+    INFO(sh.name << ": in_ch=" << sh.in_ch << " out_ch=" << sh.out_ch << " length=" << sh.length
+                 << " in_len=" << sh.in_len << " block=" << block << " blocks=" << blocks);
+    REQUIRE(block >= 1);
+    REQUIRE(block <= sh.length);
+    if (block < sh.length) {
+      ++multi;
+      CHECK(blocks > 1);
+      CHECK(block % vt::cpu::kConv1dPosTile == 0);
+      // The slice one unit of work touches. A block that overran the budget
+      // would be the residency argument's own premise failing silently.
+      const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+      // AND IT IS THE LARGEST SUCH BLOCK, which the bound above does not say. A
+      // block half this size satisfies it and doubles the weight re-reads.
+      if (block > vt::cpu::kConv1dPosTile) {
+        CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * sh.in_ch * 4 >
+              vt::cpu::kConv1dSliceBytes);
+      }
+      if (sh.out_ch == 1) saw_conv_out = true;
+    } else {
+      // ONE BLOCK, and it has to be one block for the stated reason rather than
+      // by accident: the whole activation fits the budget. Asserting the reason
+      // is what stops a future budget change from collapsing the chain back to
+      // the pre-decomposition loop while this case stayed green.
+      ++single;
+      const int64_t whole = sh.in_ch * ((sh.length - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      CHECK(whole <= vt::cpu::kConv1dSliceBytes);
+    }
+  }
+  INFO("multi-block=" << multi << " single-block=" << single);
+  CHECK(multi > 0);
+  CHECK(single > 0);  // TEETH: a budget that swallowed nothing would make the
+                      // `block == length` arm above unreachable and untested
+  // `conv_out` is the shape the row-only partition could not reach at all: ONE
+  // output row means `rows == 1`, and `ForOutputRows` runs a single row inline
+  // on the caller at every thread count. It is 15.3x on `thor:gpu0`.
+  CHECK(saw_conv_out);
+
+  // AND THE ANSWER MOVES WITH THE WINDOW, which is why the budget is stated as a
+  // comparison against the geometry rather than as a list of shape names. A
+  // 20-latent window leaves strictly MORE of the chain inside one block than a
+  // 344-latent one, because a shorter activation is a smaller footprint at the
+  // identical channel count. A gate that only ever evaluated one window could
+  // not see that, and neither could a rule written as a list.
+  int64_t single_short = 0;
+  for (const VocoderConvShape& sh : Music3VocoderConvShapes(config, 20)) {
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.kernel, 1, sh.dilation, sh.length);
+    INFO(sh.name << " at 20 latents: block=" << block << " length=" << sh.length);
+    if (block < sh.length) {
+      CHECK(block % vt::cpu::kConv1dPosTile == 0);
+      // The same two bounds as the 344-latent walk above. The shorter window is a
+      // DIFFERENT set of answers -- six shapes single-block against one -- so
+      // asserting them only at 344 left that set ungated.
+      const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      INFO("slice=" << slice);
+      if (block > vt::cpu::kConv1dPosTile) CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+      CHECK(slice + (vt::cpu::kConv1dPosTile + 1) * sh.in_ch * 4 > vt::cpu::kConv1dSliceBytes);
+    } else {
+      ++single_short;
+      const int64_t whole = sh.in_ch * ((sh.length - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      const bool one_block_is_earned =
+          whole <= vt::cpu::kConv1dSliceBytes || sh.length <= vt::cpu::kConv1dPosTile;
+      INFO("whole=" << whole);
+      CHECK(one_block_is_earned);
+    }
+  }
+  INFO("single-block at 20 latents=" << single_short << ", at 344=" << single);
+  CHECK(single_short > single);
+}
+
+TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCKS") {
+  // The `ic` axis again, at a shape whose block length is SHORTER than its
+  // output length, so the decomposition's second axis is on the path. 1024
+  // input channels at kernel 8 give a block of 96 against an output of 300.
+  const int64_t cin = 1024, cout = 6, kernel = 8;
+  const int64_t lout = 300;
+  Conv1dArgs args;  // stride 1, padding 0, dilation 1
+  const int64_t lin = lout + kernel - 1;
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(cin, kernel, args.stride, args.dilation, lout);
+  INFO("block=" << block << " lout=" << lout);
+  REQUIRE(block < lout);          // the case is NOT one block
+  REQUIRE(lout % block != 0);     // and the last block is SHORT, which is the
+                                  // boundary a whole-division shape never tests
+  const float kBig = 1099511627776.0F;  // 2^40
+  std::vector<float> in = Spread(static_cast<size_t>(cin * lin), 0x5A5Au);
+  std::vector<float> w = Spread(static_cast<size_t>(cout * cin * kernel), 0xA5A5u);
+  for (int64_t t = 0; t < lin; ++t) {
+    in[static_cast<size_t>(0 * lin + t)] = kBig;
+    in[static_cast<size_t>(1 * lin + t)] = -kBig;
+  }
+  for (int64_t oc = 0; oc < cout; ++oc) {
+    for (int64_t k = 0; k < kernel; ++k) {
+      w[static_cast<size_t>((oc * cin + 1) * kernel + k)] =
+          w[static_cast<size_t>((oc * cin + 0) * kernel + k)];
+    }
+  }
+  REQUIRE(vt::Conv1dOutLength(lin, kernel, args) == lout);
+  const std::vector<float> want =
+      SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout);
+  const std::vector<float> got = RunFwd(Cpu(), in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr,
+                                        {1, cout, lout}, args);
+  RequireBitIdentical(got, want, "Conv1d block-crossing cancellation cpu-vs-oracle");
+  {
+    const std::vector<float> other =
+        SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout, /*reverse_ic=*/true);
+    size_t differing = 0;
+    for (size_t i = 0; i < other.size(); ++i) {
+      if (std::memcmp(&other[i], &want[i], sizeof(float)) != 0) ++differing;
+    }
+    INFO("order sensitivity: " << differing << " of " << want.size());
+    CHECK(differing > 0);
+  }
+}
+
+TEST_CASE("vt::Conv1d holds its TAP order under cancellation ACROSS TIME BLOCKS") {
+  // The `k` axis at the same multi-block shape. Reversing `ic` alone walks
+  // straight through a `k` defect and vice versa — the two axes are separately
+  // gated for the reason recorded above `SerialConvTranspose1d`, where a
+  // reversed `k` loop left four whole suites green.
+  const int64_t cin = 1024, cout = 6, kernel = 8;
+  const int64_t lout = 300;
+  Conv1dArgs args;
+  const int64_t lin = lout + kernel - 1;
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(cin, kernel, args.stride, args.dilation, lout);
+  INFO("block=" << block << " lout=" << lout);
+  REQUIRE(block < lout);
+  const float kBig = 1099511627776.0F;  // 2^40
+  std::vector<float> in = Spread(static_cast<size_t>(cin * lin), 0x1357u);
+  std::vector<float> w = Spread(static_cast<size_t>(cout * cin * kernel), 0x2468u);
+  // Input channel 0 is CONSTANT, so its taps all read the same value whatever
+  // their positions are; its first two weights cancel at 2^40 and its remaining
+  // six are O(1). Sweeping `k` ascending cancels at once and keeps the small
+  // remainder exactly; any other tap order carries 2^40 and quantises.
+  for (int64_t t = 0; t < lin; ++t) in[static_cast<size_t>(0 * lin + t)] = 1.0F;
+  for (int64_t oc = 0; oc < cout; ++oc) {
+    w[static_cast<size_t>((oc * cin + 0) * kernel + 0)] = kBig;
+    w[static_cast<size_t>((oc * cin + 0) * kernel + 1)] = -kBig;
+  }
+  REQUIRE(vt::Conv1dOutLength(lin, kernel, args) == lout);
+  const std::vector<float> want =
+      SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout);
+  const std::vector<float> got = RunFwd(Cpu(), in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr,
+                                        {1, cout, lout}, args);
+  RequireBitIdentical(got, want, "Conv1d block-crossing tap cancellation cpu-vs-oracle");
+  {
+    const std::vector<float> other =
+        SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout, /*reverse_ic=*/false,
+                     /*reverse_k=*/true);
+    size_t differing = 0;
+    for (size_t i = 0; i < other.size(); ++i) {
+      if (std::memcmp(&other[i], &want[i], sizeof(float)) != 0) ++differing;
+    }
+    INFO("tap-order sensitivity: " << differing << " of " << want.size());
+    CHECK(differing > 0);
+  }
 }

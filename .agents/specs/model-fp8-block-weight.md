@@ -117,7 +117,7 @@ struct Fp8BlockWeight {
 };
 ```
 
-`Fp8Weight` (`qwen3_5_weights.h:342-355`) is three host floats — `weight_scale`,
+`Fp8Weight` (`qwen3_5_weights.h:568-581`) is three host floats — `weight_scale`,
 `input_scale`, and the `alpha = input_scale * weight_scale` folded at load. A
 block scheme has **no `input_scale` at all** (the activation scheme is dynamic;
 the target checkpoint ships zero such tensors) and its weight scale is a 2-D
@@ -139,7 +139,7 @@ its own geometry cannot be paired with the wrong one.
 
 ### The loader rung
 
-`load_projection` in `LoadAttnDense` (`qwen3_5_dense_weights.cpp:470-479`)
+`load_projection` in `LoadAttnDense` (`qwen3_5_dense_weights.cpp:471-480`)
 probes NVFP4, then `dtype == "F8_E4M3"`, then bf16. A block-wise weight **is**
 `F8_E4M3`, so it fell into the per-tensor arm and asked for a `weight_scale`
 that a block-wise checkpoint spells `weight_scale_inv`. That is #1166.
@@ -154,8 +154,13 @@ rung at all and would otherwise have sent a block-wise MLP into
 
 A dtype probe alone is not enough, for two measured reasons.
 
-**`modules_to_not_convert` is a ~400-entry list** that a probe reproduces only
-by accident. A projection this checkpoint deliberately left unquantized is
+**`modules_to_not_convert` is an 882-entry list** on
+`Qwen/Qwen3.8-27B-FP8` @`017b9c7a` -- 882 of them unique, 636 outside the vision
+tower -- that a probe reproduces only by accident. The "~400" this line carried
+until [#1614](https://github.com/mudler/vllm.cpp/issues/1614) was wrong by more
+than 2.2x, and no reading of the list produces it: the visual entries are
+duplicated under two naming conventions, so distinct modules are about 759, and
+half of 882 is 441. A projection this checkpoint deliberately left unquantized is
 `BF16` on disk and a probe agrees with the config by luck; the moment a
 checkpoint ships an `F8_E4M3` tensor for a module it also lists as excluded, the
 probe and the config disagree and only one of them is right.

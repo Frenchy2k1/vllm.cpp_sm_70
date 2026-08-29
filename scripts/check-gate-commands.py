@@ -335,6 +335,17 @@ def audit() -> list[dict]:
 # the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
 # the gated population, so its verdict is None rather than a downgraded one.
 # A shrink for a real record edit, named as the message demands.
+# 2026-08-21: -SPEC-BPE-QUADRATIC-MERGE. It entered on 2026-08-19 as GROWTH,
+# when its `## Gates` section gained the `g++` build and the two run lines for
+# `tools/bench/bpe_encode_cost.cpp`, and it leaves now because the row was
+# promoted `GATING` -> `DONE` by its closing commit (fix `67823aee2`, PR #1539,
+# issue #1365). Same shape and same reason as ENG-TRAILER-MERGE-ARTIFACTS above:
+# `DONE` is not in GATED_STATES, so the row leaves the AUDITED population and its
+# verdict becomes None rather than a downgraded one. It did NOT lose its command
+# -- the recipe is still in the spec and still runnable by hand -- which is
+# exactly the distinction `ratchet_errors` draws, and why this is a shrink for a
+# real record edit rather than a gate erasing its own finding. A shrink, named as
+# the message demands, and re-pinned in the SAME change as the promotion.
 # 2026-08-11: +ENG-FORGE-COAUTHOR. Reaches ACTIVE on its committed spec (issue
 # #418), whose Gates section names the preflight, tests/scripts and
 # agent-integration invocations plus the per-commit re-verification of
@@ -410,7 +421,37 @@ def audit() -> list[dict]:
 # verdict. Found while merging origin/main into row/ENG-HF-MODEL-DOWNLOAD and
 # fixed in that flow under #1376, because the fix is small and clear and a red
 # main blocks every other row's gate. Growth, so the set is re-pinned.
+# 2026-08-22: +SERVE-REQUEST-LENGTH-GUARD enters the runnable population with the
+# row itself (#1541). GROWTH, so the set is re-pinned in the same change, per the
+# note above. Its spec `## Gates` names a configure, a ninja target list and three
+# suite invocations that genuinely fail on a broken guard -- the same three the
+# implementing branch's red-then-green evidence was taken from -- so the credit is
+# the row's own and not inherited.
+# 2026-08-24: +ENG-UPSTREAM-LTX2-PIN enters the runnable population when its spec
+# lands (#1433). GROWTH, so the set is re-pinned in the same change, per the note
+# above. The credit is the row's OWN and is not inherited: its `## Gates` names
+# `scripts/check-oracle-pins.py`, its `--self-test`, `scripts/check-agent-record.py`
+# and two pytest suites, and the first genuinely fails on a broken record rather
+# than exiting 0 in any tree. That was proved by mutation in the same change, both
+# directions: deleting `.agents/oracles/ltx-2.md` reds with `admitted by the
+# AGENTS.md table but has no .agents/oracles/ record`, and deleting the AGENTS.md
+# table row reds with `pinned in .agents/oracles/ but absent from the AGENTS.md
+# table`. A record row is credited for the checker that reads the record, which is
+# the only thing a record row can execute.
+# 2026-08-25: +ENG-POOL-BEST-FIT enters the runnable population when its spec
+# lands (#1922). GROWTH, so the set is re-pinned in the same change, per the note
+# above. The credit is the row's OWN: its `## Gates` names a configure, the
+# focused target, TWO invocations of the SAME binary whose verdicts must
+# DIFFER -- `./build/tests/test_engine_scratch_steady_state` must pass and
+# `VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state` must fail --
+# then the full build and `ctest`. A gate that names both arms of a same-binary
+# A/B cannot be satisfied by a tree in which the guard does nothing, which is
+# exactly what "genuinely fails on a broken guard" asks for, and it was proved by
+# three mutations in the same change rather than asserted.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-POOL-BEST-FIT",
+    "ENG-UPSTREAM-LTX2-PIN",
+    "SERVE-REQUEST-LENGTH-GUARD",
     "ENG-CUDAGRAPH-BREAK",
     "ENG-HF-MODEL-DOWNLOAD",
     "ENG-RESIDENCY-CONFIG",
@@ -460,6 +501,29 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-ASYNC-LLM",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
+    # 2026-08-22: +BACKEND-TENSTORRENT-GDN enters the runnable population when
+    # its spec lands (#1715). The credit is the PRE-EXISTING suites its
+    # `## Gates` binds -- the full TT suite, the CPU gate, and
+    # `scripts/agent-preflight.sh` -- which run today and genuinely fail on a
+    # broken tree. The row's own doctest cases are still OWED (spec-first,
+    # W1/W2 not implemented), so this is an inherited credit in the exact
+    # shape the #1541 note describes, not a certificate.
+    "BACKEND-TENSTORRENT-GDN",
+    # LTX25-VAE-DEVICE-RESIDENCY (2026-08-25, issue #1451): GROWTH, re-pinned in
+    # the same change. `KERNEL-LTX2-VAE` is a NEW row rather than an existing one
+    # that changed shape, and it enters the runnable population because its
+    # Gates section names two test binaries and a ctest sweep that can fail --
+    # `test_diffusion_device_seam` (the residency assertion, a host-device
+    # transfer COUNT on a fake accelerator) and `test_ltx2_vae` (the committed
+    # decode goldens the ten kernel arms were transcribed from). Neither is a
+    # `git diff`, so the row earns the entry rather than being carried by one.
+    "KERNEL-LTX2-VAE",
+    # 2026-08-23: +BACKEND-TENSTORRENT-QWEN35 enters the runnable population
+    # when its spec lands (#1715 wiring row). Same inherited-credit shape as
+    # BACKEND-TENSTORRENT-GDN above: the credit is the pre-existing full TT
+    # suite, CPU gate, and agent-preflight.sh; the row's own sweep/e2e gates
+    # are owed (spec-first).
+    "BACKEND-TENSTORRENT-QWEN35",
 })
 
 

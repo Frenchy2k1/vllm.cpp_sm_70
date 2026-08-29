@@ -30,6 +30,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -38,14 +39,24 @@
 #include <vector>
 
 #include "minimax_music3_acoustic_goldens.inc"
+// The stage profiler is an INTERNAL instrument under src/ and deliberately not
+// on the public surface; this target reaches it the same way test_music3_profile
+// does (`-I src`, tests/CMakeLists.txt). It is here because the intra-DiT spans
+// live inside `DitForwardDevice` and only this file can drive that forward.
+#include "vllm/model_executor/models/music3_profile.h"
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
 #include "vllm/model_executor/models/minimax_music3_device.h"
+#include "vllm/model_executor/models/minimax_music3_speech.h"
 #include "vt/backend.h"
+// VT-CONV1D-MODEL-BLOCK (#1684): the multi-block case asserts the geometry it
+// claims rather than assuming it. Same reach as test_vocoder1d.
+#include "vt/cpu/cpu_conv1d_block.h"
 #include "vt/device.h"
 
 namespace {
 
 namespace m3 = vllm::models::music3;
+namespace m3profile = vllm::models::music3::profile;
 
 constexpr double kRelTol = 1e-5;
 constexpr double kAbsFloor = 1e-6;
@@ -816,6 +827,190 @@ TEST_CASE("music3 acoustic: the DEVICE-resident DiT matches upstream on CUDA") {
   CheckDeviceDit(q, "cuda");
 }
 
+// ---------------------------------------------------------------------------
+// The INTRA-DiT SPANS (#1542, spec §21.3)
+//
+// WHY THIS GATE IS A CALL-COUNT GATE AND NOT A TIMING ONE. What can go wrong
+// with a hand-placed bracket is placement, not arithmetic: a mark left out, a
+// mark inside the layer loop that belonged outside it, a mark that names the
+// neighbour's bucket. Every one of those changes a CALL COUNT deterministically,
+// on any box, at any load — while the seconds themselves are the thing being
+// measured and cannot also be the assertion. So the counts are asserted exactly
+// and the times are asserted only for the two properties the accounting depends
+// on: that every intra-DiT bucket is a SPAN (so `sum(leaf)` and `unattributed`
+// in every §15/§20 table are untouched), and that the spans PARTITION the
+// forward rather than sample it.
+//
+// The CPU backend is the right place for it. `Backend::Synchronize` is a no-op
+// on a CPU queue, so the placement contract is tested without a device and
+// without the sync perturbation that is the whole reason the spans are a second
+// opt-in — and placement is architecture-independent, being a property of where
+// the calls sit in the source.
+namespace {
+
+// Restores BOTH flags, so a later case in this binary still sees the shipped
+// default. `test_music3_profile.cpp`'s ArmedProfile does the same for the outer
+// one; this file needs the pair.
+struct ArmedDitSpans {
+  ArmedDitSpans()
+      : profile_(m3profile::EnabledFlag()), spans_(m3profile::DitSpansFlag()) {
+    m3profile::EnabledFlag() = true;
+    m3profile::DitSpansFlag() = true;
+  }
+  ~ArmedDitSpans() {
+    m3profile::EnabledFlag() = profile_;
+    m3profile::DitSpansFlag() = spans_;
+  }
+  bool profile_;
+  bool spans_;
+};
+
+const m3profile::Bucket* FindBucket(const char* name) {
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name == name) return &bucket;
+  }
+  return nullptr;
+}
+
+// One device forward on a CPU queue, with the table freshly begun. Returns the
+// wall time of the FORWARD ALONE — the staging above it is outside the bracket,
+// because a partition assertion against a bracket that also contained a 36-block
+// weight upload would be measuring the upload.
+double RunOneProfiledDeviceForward() {
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+  const size_t latent_count =
+      static_cast<size_t>(config.in_channels * vllm_test::kMusic3DitLength);
+  const size_t condition_count =
+      static_cast<size_t>(vllm_test::kMusic3DitLength * config.condition_dim);
+  const std::vector<float> latents = ToVector(vllm_test::kMusic3DitLatents, latent_count);
+  const std::vector<float> condition = ToVector(vllm_test::kMusic3DitCondition, condition_count);
+  m3::DitWeights host = DitWeights();
+  vt::Queue q{vt::Device{}, nullptr};
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(q, config, host, /*release_host=*/false);
+  m3profile::Begin();
+  const auto t0 = m3profile::Now();
+  const std::vector<float> out = m3::DitForwardDevice(
+      q, latents, vllm_test::kMusic3DitLength, condition, vllm_test::kMusic3DitTimestep, config,
+      staged);
+  const double seconds = std::chrono::duration<double>(m3profile::Now() - t0).count();
+  // The forward has to have actually produced the tensor; a span table over a
+  // throw would be a green gate over no work at all.
+  REQUIRE(out.size() == latent_count);
+  return seconds;
+}
+
+// The nine spans that sit INSIDE the layer loop, so their call count is
+// `num_layers` per forward. Listed in source order.
+const char* const kPerLayerSpans[] = {"dit.norm1", "dit.qkv",    "dit.rope",
+                                      "dit.attn",  "dit.attn_out", "dit.norm2",
+                                      "dit.ff_in", "dit.silu",   "dit.ff_out"};
+
+// The seven that sit outside it, once per forward, in source order.
+const char* const kPerForwardSpans[] = {"dit.pack", "dit.pre",      "dit.temb",
+                                        "dit.rope_build", "dit.post", "dit.readback",
+                                        "dit.untranspose"};
+
+}  // namespace
+
+TEST_CASE("music3 acoustic: the intra-DiT spans are placed once per layer and once per forward") {
+  const ArmedDitSpans armed;
+  (void)RunOneProfiledDeviceForward();
+  const int64_t layers = DitConfig().num_layers;
+  REQUIRE(layers > 1);  // a 1-layer config could not tell the two groups apart
+
+  for (const char* name : kPerLayerSpans) {
+    const m3profile::Bucket* bucket = FindBucket(name);
+    const std::string missing = std::string("missing intra-DiT span: ") + name;
+    REQUIRE_MESSAGE(bucket != nullptr, missing);
+    const std::string wrong = std::string(name) + " ran " + std::to_string(bucket->calls) +
+                              " times, expected once per layer = " + std::to_string(layers);
+    CHECK_MESSAGE(bucket->calls == layers, wrong);
+  }
+  for (const char* name : kPerForwardSpans) {
+    const m3profile::Bucket* bucket = FindBucket(name);
+    const std::string missing = std::string("missing intra-DiT span: ") + name;
+    REQUIRE_MESSAGE(bucket != nullptr, missing);
+    const std::string wrong = std::string(name) + " ran " + std::to_string(bucket->calls) +
+                              " times, expected once per forward";
+    CHECK_MESSAGE(bucket->calls == 1, wrong);
+  }
+
+  // The geometry the split must be read against, so a reader never has to infer
+  // `seq` from a vocoder latent count the way spec §21.1 had to. Both are SUMS
+  // over the forwards in a run; here there is exactly one.
+  const m3profile::Bucket* seq_sum = FindBucket("dit.seq_sum");
+  REQUIRE(seq_sum != nullptr);
+  CHECK(seq_sum->calls == vllm_test::kMusic3DitLength + 1);
+  const m3profile::Bucket* length_sum = FindBucket("dit.length_sum");
+  REQUIRE(length_sum != nullptr);
+  CHECK(length_sum->calls == vllm_test::kMusic3DitLength);
+}
+
+TEST_CASE("music3 acoustic: every intra-DiT bucket is a SPAN, so no §20 table moves") {
+  const ArmedDitSpans armed;
+  (void)RunOneProfiledDeviceForward();
+
+  // THE ACCOUNTING PROPERTY THIS ROW RESTS ON. `music3_profile.h` sums LEAVES
+  // and only prints SPANS. If one of these landed as a leaf it would be added to
+  // `sum(leaf)` alongside the `denoise.dit_device` leaf that already contains
+  // it, every §15.7 and §20 table would double-count the DiT, and
+  // `unattributed` would go negative — a corrupted split that still prints.
+  int64_t timed = 0;
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name.rfind("dit.", 0) != 0) continue;
+    if (bucket.seconds < 0.0) continue;  // dit.seq_sum / dit.length_sum are pure counters
+    ++timed;
+    const std::string leaked = bucket.name + " landed as a LEAF; it must be a span";
+    CHECK_MESSAGE(bucket.span, leaked);
+  }
+  CHECK(timed == 16);  // 9 per-layer + 7 per-forward, and no more
+}
+
+TEST_CASE("music3 acoustic: the intra-DiT spans PARTITION the forward, they do not sample it") {
+  const ArmedDitSpans armed;
+  const double bracket = RunOneProfiledDeviceForward();
+
+  double summed = 0.0;
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name.rfind("dit.", 0) == 0 && bucket.seconds >= 0.0) summed += bucket.seconds;
+  }
+  MESSAGE("intra-DiT spans sum to " << summed << " s of a " << bracket
+                                    << " s bracket around the forward");
+  // Contiguity gives the upper bound by construction: each mark charges only the
+  // interval since the previous one, so the spans cannot exceed the whole.
+  CHECK(summed <= bracket);
+  // The lower bound is the one that catches a MISSING bracket. It is deliberately
+  // loose — the two host loops that open and close the forward sit inside the
+  // bracket and inside the spans alike, and the clock is read sixteen times — but
+  // it still fails hard on a dropped mark, because the largest of the sixteen
+  // (`dit.ff_in`) is most of the forward on its own.
+  CHECK(summed >= 0.5 * bracket);
+}
+
+TEST_CASE("music3 acoustic: with the spans OFF the DiT forward emits NO dit.* bucket") {
+  // G2, spec §21.4: the shipped profiled path. `VLLM_CPP_MUSIC3_PROFILE=1` alone
+  // must leave the forward exactly what §20 timed, so the perturbation of the
+  // sixteen synchronizes is opt-in and `denoise.dit_device` stays comparable to
+  // §15.7 and §20 value for value.
+  const bool prev_profile = m3profile::EnabledFlag();
+  const bool prev_spans = m3profile::DitSpansFlag();
+  m3profile::EnabledFlag() = true;
+  m3profile::DitSpansFlag() = false;
+  (void)RunOneProfiledDeviceForward();
+  int64_t found = 0;
+  for (const m3profile::Bucket& bucket : m3profile::Buckets()) {
+    if (bucket.name.rfind("dit.", 0) == 0) ++found;
+  }
+  m3profile::EnabledFlag() = prev_profile;
+  m3profile::DitSpansFlag() = prev_spans;
+  CHECK(found == 0);
+
+  // And asking for spans with the instrument OFF is a no-op, not a partial
+  // arming: there is no table for a span to land in.
+  CHECK_FALSE(m3profile::DitSpans());
+}
+
 TEST_CASE("music3 acoustic: the ff_in HALF SWAP is load-bearing, and the gate sees it") {
   // The device arm computes `value * silu(gate)` by handing vt::SiluAndMul — which
   // computes `silu(first) * second` — a projection whose two ROW BLOCKS were
@@ -954,6 +1149,371 @@ TEST_CASE("music3 acoustic: release_host EMPTIES the source, and the staged copy
 }
 
 // ---------------------------------------------------------------------------
+// THE PRODUCTION SWITCH ([#1131](https://github.com/mudler/vllm.cpp/issues/1131))
+//
+// Everything above this line gates the device DiT as a CLASS: `DitForwardDevice`
+// against upstream's goldens, `StageMusic3DitWeights` against its refusals, the
+// spans against their placement. #1131's finding is that none of it gates the
+// device DiT as a CAPABILITY — it measured two mutations on the shipped code and
+// both left every suite green:
+//
+//   * `on_device = false` in `Music3DenoiseChunks`, the production call site,
+//   * `Music3DenoiseDeviceArm::half_set() -> false`, the arm's refusal.
+//
+// A change that silently stopped the DiT reaching the device would have been
+// invisible, and the run would have been correct and thirty hours late.
+//
+// WHY THE OBVIOUS GATE CANNOT EXIST, so the shape below is not a preference. The
+// engine picks the arm on `queue_.device.type != kCPU`, and on a CPU-only build
+// `src/vllm/multimodal/speech_engine.cpp::SpeechEngineDeviceType` REFUSES
+// `--speech-device 1` before a queue is ever made. So `queue_` on a CI
+// runner is kCPU or the engine does not construct, and no gate CI owns can enter
+// a branch written at that line. Two things follow, and this file does both:
+//
+//   1. the RULE moves out of the engine into `Music3SelectDitArm`, which runs on
+//      both sides of the condition and is therefore drivable here — with a CPU
+//      queue, and with a FABRICATED non-CPU one that must engage or refuse BY
+//      NAME, the silent host fallback being the defect;
+//   2. the SELECTED arm is driven through `Music3DenoiseChunks` — the production
+//      function the engine calls, not a hand-built forward — and the gate asks
+//      WHICH ARM RAN rather than whether the numbers agree. They agree by
+//      design; a numeric comparison cannot answer it.
+//
+// `kCUDA` is deliberately absent from the fabricated list. On a CUDA build with
+// no device the staging fails INSIDE the CUDA runtime, and a call designed to
+// fail latches a sticky error that the next unrelated kernel reports as its own.
+// Every entry below takes the identical branch, so the rule is covered and the
+// latch is not armed.
+//
+// WHAT THIS STILL DOES NOT REACH is the engine's own one-line CALL to
+// `Music3SelectDitArm`. It needs the 28.5 GB checkpoint and a real accelerator.
+// `.agents/specs/music3-dit-arm-reachability.md` `## Owed` carries it with the
+// mutation that proves it, and #1131 stays open for it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Deterministic, and NOT a normal draw: the arm question is about which code
+// executed, so the fixture only has to be finite, non-degenerate and the same on
+// every box. A `std::mt19937_64` would put a libstdc++ version in the middle of
+// a reachability gate for nothing.
+float ArmNext(uint32_t* state, float scale) {
+  *state = *state * 1664525u + 1013904223u;
+  const float unit = static_cast<float>((*state >> 8) & 0xFFFFu) / 65535.0f;
+  return (unit - 0.5f) * 2.0f * scale;
+}
+
+std::vector<float> ArmFill(size_t count, uint32_t* state, float scale) {
+  std::vector<float> out(count);
+  for (float& value : out) value = ArmNext(state, scale);
+  return out;
+}
+
+// The reduced denoise geometry. `kArmFrames <= kChunkFrames` so `ChunkStarts`
+// returns one window, and the condition encoder's input and output rates are
+// EQUAL so `ConditionLatentLength` is the identity: the window's latent length
+// is exactly `kArmFrames`, and the two per-forward counts below are arithmetic
+// rather than something a reader has to derive from a rate ratio.
+constexpr int64_t kArmFrames = 4;
+constexpr int64_t kArmCondHidden = 3;
+constexpr int64_t kArmCondLayers = 2;
+constexpr int64_t kArmSteps = 2;
+constexpr int64_t kArmWindows = 1;
+// ONE profile bracket spans BOTH classifier-free-guidance branches, so the
+// `denoise.dit_*` call count is steps x windows and the FORWARD count is twice
+// that. Getting this backwards is the difference between a gate that counts and
+// one that agrees with whatever it found.
+constexpr int64_t kArmBrackets = kArmSteps * kArmWindows;
+constexpr int64_t kArmForwards = 2 * kArmBrackets;
+
+vllm::MiniMaxMusic3Config DenoiseConfig() {
+  vllm::MiniMaxMusic3Config config;
+  config.transformer = DitConfig();
+  config.condition_encoder.condition_hidden_dim = kArmCondHidden;
+  config.condition_encoder.num_condition_layers = kArmCondLayers;
+  // The condition mix FEEDS the DiT, so its output width is not free.
+  config.condition_encoder.out_dim = config.transformer.condition_dim;
+  config.condition_encoder.input_sampling_rate = 24000;
+  config.condition_encoder.input_hop_length = 960;
+  config.condition_encoder.output_sampling_rate = 24000;
+  config.condition_encoder.output_hop_length = 960;
+  return config;
+}
+
+// `vocoder` is left default: `Music3DenoiseChunks` never reads it, and filling
+// it would suggest the decode is part of what this gate examined.
+m3::Music3AcousticWeights DenoiseWeights(uint32_t* state) {
+  const vllm::MiniMaxMusic3Config config = DenoiseConfig();
+  const size_t out_dim = static_cast<size_t>(config.condition_encoder.out_dim);
+  m3::Music3AcousticWeights weights;
+  weights.dit = DitWeights();
+  weights.condition.layer_weight_logits =
+      ArmFill(static_cast<size_t>(kArmCondLayers), state, 1.0f);
+  weights.condition.layer_scale = {1.0f};
+  weights.condition.proj_weight =
+      ArmFill(out_dim * static_cast<size_t>(kArmCondHidden) * 3, state, 0.5f);
+  weights.condition.proj_bias = ArmFill(out_dim, state, 0.25f);
+  return weights;
+}
+
+std::vector<float> ArmFrameHiddens(uint32_t* state) {
+  return ArmFill(static_cast<size_t>(kArmFrames * kArmCondLayers * kArmCondHidden), state, 1.0f);
+}
+
+// A FIXED noise source. The two arms must see the same initial latents or the
+// comparison below is between two trajectories rather than between two
+// implementations of one.
+m3::Music3NoiseSource ArmNoise(uint32_t seed) {
+  return [seed](int64_t channels, int64_t length, int64_t chunk_index) {
+    uint32_t state = seed + static_cast<uint32_t>(chunk_index);
+    return ArmFill(static_cast<size_t>(channels * length), &state, 1.0f);
+  };
+}
+
+}  // namespace
+
+TEST_CASE("music3 acoustic: the DiT arm SELECTION stages on a device queue and never on a CPU one") {
+  const vllm::MiniMaxMusic3TransformerConfig config = DitConfig();
+
+  SUBCASE("a CPU queue stages NOTHING and keeps the host reference arm") {
+    vt::Queue queue{vt::Device{}, nullptr};
+    m3::DitWeights source = DitWeights();
+    const m3::DitWeights reference = DitWeights();
+    m3::Music3DitDeviceWeights staged;
+    const m3::Music3DenoiseDeviceArm arm =
+        m3::Music3SelectDitArm(queue, config, source, /*release_host=*/true, &staged);
+    CHECK_FALSE(arm.engaged());
+    CHECK_FALSE(arm.half_set());
+    CHECK_FALSE(staged.staged());
+    CHECK(staged.layers.empty());
+    // `release_host` was TRUE and NOTHING may have been released, because the
+    // host `DitForward` is what this queue selected and it reads these very
+    // vectors. A selector that staged-then-discarded would pass every assertion
+    // above and leave the host arm reading empty projections.
+    REQUIRE(source.layers.size() == reference.layers.size());
+    size_t intact = 0;
+    for (size_t i = 0; i < source.layers.size(); ++i) {
+      if (source.layers[i].to_q.size() == reference.layers[i].to_q.size()) ++intact;
+      if (source.layers[i].ff_in_weight.size() == reference.layers[i].ff_in_weight.size()) {
+        ++intact;
+      }
+    }
+    CHECK(intact == 2 * source.layers.size());
+    CHECK(source.proj_in_weight.size() == reference.proj_in_weight.size());
+  }
+
+  SUBCASE("EVERY non-CPU device stages or refuses, and never silently falls back") {
+    // THE THIRD OUTCOME IS THE DEFECT, and it is #1131's whole shape: a caller
+    // that asked for the device, was handed the host loops, and was told
+    // nothing.
+    constexpr vt::DeviceType kNonCpuDevices[] = {
+        vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN, vt::DeviceType::kXPU,
+        vt::DeviceType::kROCM, vt::DeviceType::kTENSTORRENT};
+    int engaged_count = 0;
+    int refused_count = 0;
+    for (vt::DeviceType type : kNonCpuDevices) {
+      // `std::string`, not the bare `const char*`: doctest stringifies a raw
+      // pointer as a BOOL, so the capture on a failing device would read `:= 1`
+      // and name nothing.
+      CAPTURE(std::string(vt::DeviceTypeName(type)));
+      vt::Queue queue{vt::Device{type, 0}, nullptr};
+      m3::DitWeights source = DitWeights();
+      m3::Music3DitDeviceWeights staged;
+      bool engaged = false;
+      bool refused = false;
+      try {
+        const m3::Music3DenoiseDeviceArm arm =
+            m3::Music3SelectDitArm(queue, config, source, /*release_host=*/false, &staged);
+        engaged = arm.engaged();
+      } catch (const std::runtime_error&) {
+        refused = true;
+      }
+      engaged_count += engaged ? 1 : 0;
+      refused_count += refused ? 1 : 0;
+      // Named, because doctest cannot decompose a `||` inside a CHECK.
+      const bool selection_fired = engaged || refused;
+      CHECK_MESSAGE(selection_fired, "device '"
+                                         << std::string(vt::DeviceTypeName(type))
+                                         << "' quietly took the HOST arm: the selection did not "
+                                            "fire and nothing said so");
+    }
+    // The loop must have RUN. An emptied list, or a body that threw before the
+    // first CHECK, would leave every assertion above unexecuted while doctest
+    // still reported SUCCESS.
+    const int outcomes = engaged_count + refused_count;
+    CHECK(outcomes == static_cast<int>(sizeof(kNonCpuDevices) / sizeof(kNonCpuDevices[0])));
+    MESSAGE("non-CPU DiT selection: " << engaged_count << " staged, " << refused_count
+                                      << " refused by name");
+  }
+
+  SUBCASE("a null staging slot is refused rather than dereferenced") {
+    vt::Queue queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+    m3::DitWeights source = DitWeights();
+    CHECK_THROWS_AS(m3::Music3SelectDitArm(queue, config, source, /*release_host=*/false, nullptr),
+                    std::runtime_error);
+  }
+}
+
+TEST_CASE("music3 acoustic: HALF a denoise device arm is refused by name, not ignored") {
+  // #1131's second mutation: `half_set() -> false`. With the refusal gone a
+  // queue-only arm is merely not engaged, the loop takes the host path, and the
+  // caller who believes it asked for the GPU gets a correct song hours late.
+  uint32_t state = 0x1131C0DEu;
+  const vllm::MiniMaxMusic3Config config = DenoiseConfig();
+  const m3::Music3AcousticWeights weights = DenoiseWeights(&state);
+  const std::vector<float> frame_hiddens = ArmFrameHiddens(&state);
+  m3::Music3DenoiseOptions options;
+  options.num_inference_steps = kArmSteps;
+
+  vt::Queue queue{vt::Device{}, nullptr};
+  m3::DitWeights host = DitWeights();
+  const m3::Music3DitDeviceWeights staged =
+      m3::StageMusic3DitWeights(queue, config.transformer, host, /*release_host=*/false);
+
+  // The PREDICATE, on both halves.
+  m3::Music3DenoiseDeviceArm queue_only;
+  queue_only.queue = &queue;
+  CHECK(queue_only.half_set());
+  CHECK_FALSE(queue_only.engaged());
+  m3::Music3DenoiseDeviceArm weights_only;
+  weights_only.dit = &staged;
+  CHECK(weights_only.half_set());
+  CHECK_FALSE(weights_only.engaged());
+
+  // And the LOOP acting on it. A predicate nothing consults is not a refusal.
+  CHECK_THROWS_AS(m3::Music3DenoiseChunks(frame_hiddens, kArmFrames, config, weights, options,
+                                          ArmNoise(7u), queue_only),
+                  std::runtime_error);
+  CHECK_THROWS_AS(m3::Music3DenoiseChunks(frame_hiddens, kArmFrames, config, weights, options,
+                                          ArmNoise(7u), weights_only),
+                  std::runtime_error);
+}
+
+TEST_CASE("music3 acoustic: the PRODUCTION denoise loop takes the device arm, and says which ran") {
+  // THE ASSERTION #1131 SAYS IS MISSING, through the production entry point the
+  // engine calls. Not `DitForwardDevice` directly — that is the class gate above
+  // — but `Music3DenoiseChunks`, with an arm produced the way the engine
+  // produces one.
+  //
+  // WHICH ARM RAN is read off TWO instruments, and they answer different
+  // questions. `denoise.dit_{device,host}` is the production bucket the engine's
+  // own `profile::Report` prints, so it says which branch the loop SELECTED.
+  // `dit.pack` lives INSIDE `DitForwardDevice`, so it says the device forward's
+  // body actually executed — a mislabelled bucket cannot fake it. Both are
+  // asserted for an EXACT count, never for movement.
+  const ArmedDitSpans armed;
+  uint32_t state = 0x0DE7C0DEu;
+  const vllm::MiniMaxMusic3Config config = DenoiseConfig();
+  const m3::Music3AcousticWeights weights = DenoiseWeights(&state);
+  const std::vector<float> frame_hiddens = ArmFrameHiddens(&state);
+  m3::Music3DenoiseOptions options;
+  options.num_inference_steps = kArmSteps;
+
+  // ── the HOST arm, default-constructed, which is what every caller written
+  //    before the device arm passes ────────────────────────────────────────────
+  m3profile::Begin();
+  const std::vector<std::vector<float>> host_chunks = m3::Music3DenoiseChunks(
+      frame_hiddens, kArmFrames, config, weights, options, ArmNoise(7u));
+  REQUIRE(host_chunks.size() == static_cast<size_t>(kArmWindows));
+  const size_t latent_count =
+      static_cast<size_t>(config.transformer.in_channels * kArmFrames);
+  REQUIRE(host_chunks[0].size() == latent_count);
+  {
+    const m3profile::Bucket* host_bucket = FindBucket("denoise.dit_host");
+    REQUIRE_MESSAGE(host_bucket != nullptr,
+                    "the default arm emitted NO denoise.dit_host bucket, so the loop this gate "
+                    "believes it drove did not run");
+    CHECK_MESSAGE(host_bucket->calls == kArmBrackets,
+                  "the host arm bracketed " << host_bucket->calls << " steps, expected "
+                                            << kArmBrackets);
+    CHECK_MESSAGE(FindBucket("denoise.dit_device") == nullptr,
+                  "a DEFAULT-constructed arm reached the DEVICE forward");
+    // And nothing inside `DitForwardDevice` ran, with the spans armed. This is
+    // the control that makes the device counts below mean something: without it
+    // a `dit.pack` that fired unconditionally would read as proof either way.
+    CHECK_MESSAGE(FindBucket("dit.pack") == nullptr,
+                  "the host arm emitted an intra-DEVICE-forward span");
+  }
+
+  // ── the DEVICE arm, staged and selected exactly as the engine stages and
+  //    selects it, on a CPU queue because every op this arm uses has a CPU
+  //    provider ─────────────────────────────────────────────────────────────────
+  vt::Queue queue{vt::Device{}, nullptr};
+  m3::DitWeights stage_source = DitWeights();
+  m3::Music3DitDeviceWeights staged;
+  // Hand-built, because `Music3SelectDitArm` declines a CPU queue BY DESIGN —
+  // that rule is the previous case's subject. This case's subject is what
+  // `Music3DenoiseChunks` does once an engaged arm reaches it.
+  staged = m3::StageMusic3DitWeights(queue, config.transformer, stage_source,
+                                     /*release_host=*/false);
+  m3::Music3DenoiseDeviceArm arm;
+  arm.queue = &queue;
+  arm.dit = &staged;
+  REQUIRE(arm.engaged());
+  REQUIRE_FALSE(arm.half_set());
+
+  m3profile::Begin();
+  const std::vector<std::vector<float>> device_chunks = m3::Music3DenoiseChunks(
+      frame_hiddens, kArmFrames, config, weights, options, ArmNoise(7u), arm);
+  REQUIRE(device_chunks.size() == static_cast<size_t>(kArmWindows));
+  REQUIRE(device_chunks[0].size() == latent_count);
+
+  const m3profile::Bucket* device_bucket = FindBucket("denoise.dit_device");
+  REQUIRE_MESSAGE(device_bucket != nullptr,
+                  "an ENGAGED arm reached `Music3DenoiseChunks` and the loop still took the HOST "
+                  "path: this is #1131 exactly");
+  CHECK_MESSAGE(device_bucket->calls == kArmBrackets,
+                "the device arm bracketed " << device_bucket->calls << " steps, expected "
+                                            << kArmBrackets);
+  CHECK_MESSAGE(FindBucket("denoise.dit_host") == nullptr,
+                "the loop ran BOTH arms, so one of the two counts above is not what it looks like");
+  const m3profile::Bucket* pack = FindBucket("dit.pack");
+  REQUIRE_MESSAGE(pack != nullptr,
+                  "nothing inside `DitForwardDevice` ran, so the device bucket is a LABEL and not "
+                  "a measurement");
+  CHECK_MESSAGE(pack->calls == kArmForwards,
+                "the device forward body ran " << pack->calls << " times, expected "
+                                               << kArmForwards
+                                               << " (2 CFG branches x " << kArmBrackets
+                                               << " steps)");
+  const m3profile::Bucket* qkv = FindBucket("dit.qkv");
+  REQUIRE(qkv != nullptr);
+  CHECK_MESSAGE(qkv->calls == kArmForwards * config.transformer.num_layers,
+                "the device forward's layer loop ran " << qkv->calls << " times, expected "
+                                                       << kArmForwards *
+                                                              config.transformer.num_layers);
+  // The window loop itself ran once, so the counts above are one window's and
+  // not a plan that collapsed to zero windows and a lucky default.
+  const m3profile::Bucket* mix = FindBucket("denoise.condition_mix");
+  REQUIRE(mix != nullptr);
+  CHECK(mix->calls == kArmWindows);
+
+  // THE NUMBERS ARE THE CONTROL, NOT THE GATE. The two arms agree by design, so
+  // agreement can never say which ran; what it CAN say is that the arm this gate
+  // proved was taken produced the trajectory rather than throwing halfway and
+  // leaving a plausible tensor behind. `DitForwardDevice`'s correctness is
+  // gated against upstream's own goldens by `CheckDeviceDit` above, and nothing
+  // here relaxes that.
+  double worst = 0.0;
+  double scale = 0.0;
+  size_t nonzero = 0;
+  for (size_t i = 0; i < latent_count; ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(device_chunks[0][i]) -
+                                     static_cast<double>(host_chunks[0][i])));
+    scale = std::max(scale, std::abs(static_cast<double>(host_chunks[0][i])));
+    if (host_chunks[0][i] != 0.0f) ++nonzero;
+  }
+  MESSAGE("denoise arms: " << latent_count << " latents, worst |device-host| = " << worst
+                           << " against a host peak of " << scale);
+  CHECK_MESSAGE(nonzero == latent_count,
+                "the host trajectory is degenerate, so the comparison beside it is worth nothing");
+  CHECK_MESSAGE(worst <= 1e-4 * std::max(scale, 1e-3),
+                "the two denoise arms diverged by " << worst
+                                                    << ", which is a STRUCTURAL difference rather "
+                                                       "than the float32 rounding of §14.3");
+}
+
+// ---------------------------------------------------------------------------
 // W5 — the vocoder
 // ---------------------------------------------------------------------------
 
@@ -992,6 +1552,105 @@ TEST_CASE("music3 acoustic: a residual unit keeps its length at dilation 9") {
               "residual unit");
   MESSAGE("residual unit at dilation " << vllm_test::kMusic3UnitDilation << ": "
                                        << dim * length << " values compared");
+}
+
+TEST_CASE("music3 acoustic: a residual unit is exact ACROSS a time block boundary") {
+  // WHY THIS CASE EXISTS (#1684). The `vt::Conv1d` CPU provider cuts its work
+  // into (time block, output row) pairs (#1664, src/vt/cpu/cpu_conv1d_block.h).
+  // Until this case existed THIS suite reached that provider at SINGLE-BLOCK
+  // shapes only, so a defect confined to the second axis reddened the op's own
+  // suite and nothing else: a sign flip applied only where `blocks > 1` left
+  // eight of the ten consumer suites green. This is MiniMax-Music3's own arm of
+  // that gate. It enters through `m3::VocoderResidualUnit` -- the body
+  // `VocoderBlock` and `VocoderDecode` are built from, which is the vocoder's
+  // hot loop -- at a shape whose block length is shorter than its output length.
+  //
+  // THE GEOMETRY, asserted rather than asserted-about. 8 channels over 16 384
+  // positions is 512 KiB of activation, which is exactly the budget
+  // `kConv1dSliceBytes` gives one unit of work, so BOTH convolutions of the unit
+  // block. The channel count is deliberately the SMALLEST that reaches the
+  // budget, because the convolution's cost is `kernel * dim * (dim * length)`
+  // and only the bracket is fixed by the budget: a wider fixture would cost
+  // proportionally more for exactly the same block count.
+  constexpr int64_t kDim = 8;
+  constexpr int64_t kLength = 16384;
+  constexpr int64_t kDilation = 1;
+  const int64_t block1 =
+      vt::cpu::Conv1dTimeBlock(kDim, /*kernel=*/7, /*stride=*/1, kDilation, kLength);
+  const int64_t block2 =
+      vt::cpu::Conv1dTimeBlock(kDim, /*kernel=*/1, /*stride=*/1, /*dilation=*/1, kLength);
+  INFO("conv1 block=" << block1 << ", conv2 block=" << block2 << ", length=" << kLength);
+  REQUIRE(block1 < kLength);  // TEETH: without this the unit is single-block
+  REQUIRE(block2 < kLength);
+  REQUIRE(block1 % vt::cpu::kConv1dPosTile == 0);
+
+  // THE ARITHMETIC IS CLOSED FORM, so the expectation carries no tolerance and a
+  // one-bit scheduling defect shows as a hard inequality.
+  //
+  // Both snake alphas are ZERO, which makes the activation the IDENTITY exactly:
+  // `x + (b + 1e-9)^-1 * sin^2(a * x)` at `a = b = 0` is `x + 1e9 * 0`, and
+  // `logscale` is false on Music3's Snake1d (vocoder1d::SnakeActivation). The
+  // unit therefore reduces to pad -> conv1 -> conv2 -> residual add, which is
+  // what this case is about; the activation has its own gate two cases above.
+  m3::VocoderResidualUnitWeights weights;
+  weights.snake1_alpha.assign(static_cast<size_t>(kDim), 0.0F);
+  weights.snake2_alpha.assign(static_cast<size_t>(kDim), 0.0F);
+  // conv1 [dim, dim, 7] taps input channel 0 with weight 1 and nothing else;
+  // conv2 [dim, dim, 1] copies channel 0 into every output channel.
+  weights.conv1_weight.assign(static_cast<size_t>(kDim * kDim * 7), 0.0F);
+  weights.conv2_weight.assign(static_cast<size_t>(kDim * kDim), 0.0F);
+  weights.conv1_bias.assign(static_cast<size_t>(kDim), 0.0F);
+  weights.conv2_bias.assign(static_cast<size_t>(kDim), 0.0F);
+  for (int64_t oc = 0; oc < kDim; ++oc) {
+    for (int64_t k = 0; k < 7; ++k) {
+      weights.conv1_weight[static_cast<size_t>((oc * kDim + 0) * 7 + k)] = 1.0F;
+    }
+    weights.conv2_weight[static_cast<size_t>(oc * kDim + 0)] = 1.0F;
+    weights.conv1_bias[static_cast<size_t>(oc)] = 1.0F;
+    weights.conv2_bias[static_cast<size_t>(oc)] = static_cast<float>(oc + 2);
+  }
+
+  // Channel 0 carries `x[0][t] = t`; every other channel is zero. Every partial
+  // sum below is an integer under 2^24, so f32 holds all of them EXACTLY.
+  std::vector<float> in(static_cast<size_t>(kDim * kLength), 0.0F);
+  for (int64_t t = 0; t < kLength; ++t) in[static_cast<size_t>(t)] = static_cast<float>(t);
+
+  int64_t out_len = 0;
+  const std::vector<float> out =
+      m3::VocoderResidualUnit(in, kDim, kLength, kDilation, weights, &out_len);
+  REQUIRE(out_len == kLength);
+  REQUIRE(out.size() == static_cast<size_t>(kDim * kLength));
+
+  // conv1 sums the 7-tap zero-padded window of channel 0 and adds its bias 1;
+  // conv2 copies that row into every output channel and adds `oc + 2`; the unit
+  // then adds the input back, which only channel 0 carries.
+  auto want = [&](int64_t oc, int64_t t) {
+    const int64_t lo = std::max<int64_t>(0, t - 3);
+    const int64_t hi = std::min<int64_t>(kLength - 1, t + 3);
+    const int64_t window = (lo + hi) * (hi - lo + 1) / 2;
+    return static_cast<float>(window + 1 + (oc + 2) + (oc == 0 ? t : 0));
+  };
+  int64_t wrong = 0;
+  int64_t first_wrong = -1;
+  for (int64_t oc = 0; oc < kDim; ++oc) {
+    for (int64_t t = 0; t < kLength; ++t) {
+      if (out[static_cast<size_t>(oc * kLength + t)] != want(oc, t)) {
+        if (first_wrong < 0) first_wrong = oc * kLength + t;
+        ++wrong;
+      }
+    }
+  }
+  INFO("wrong cells=" << wrong << " first at flat index " << first_wrong);
+  CHECK(wrong == 0);
+  // The boundary itself, named so a failure says WHERE: the last position of the
+  // first block and the first of the second are where an off-by-one in the block
+  // decode lands.
+  CHECK(out[static_cast<size_t>(block1 - 1)] == want(0, block1 - 1));
+  CHECK(out[static_cast<size_t>(block1)] == want(0, block1));
+  // The LAST block is the short one; `length` is not a multiple of the block.
+  CHECK(out[static_cast<size_t>(kLength - 1)] == want(0, kLength - 1));
+  MESSAGE("residual unit across a block boundary: " << kDim * kLength
+                                                    << " cells compared exactly");
 }
 
 TEST_CASE("music3 acoustic: the residual dilations are 1, 3, 9 in order") {

@@ -1,7 +1,10 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
+#include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -2791,6 +2794,112 @@ void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
   reinterpret_cast<Conv2dFn>(GetOp(OpId::kConv2d, q.device.type))(q, out, x, weight, bias, args);
 }
 
+// --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) --------------
+// Mirrors torch `nn.Conv3d`'s own shape contract at batch 1, so a caller that
+// passes what `CausalConv3d` passes (Lightricks/LTX-2 @ fd4ded7f2,
+// video_vae/convolution.py:292-302) is accepted verbatim. The rank-5 shapes
+// torch uses are expressed at rank 4 for the reason include/vt/ops.h states at
+// vt::Conv3d; both foldings are CHECKED here rather than assumed.
+void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv3dArgs& args) {
+  VT_CHECK(x.rank == 4 && out.rank == 4,
+           "conv3d: x/out must be rank-4 [C,T,H,W] — this op is BATCH 1, because vt::Tensor caps "
+           "rank at 4; pass one clip per call rather than folding N into a channel axis");
+  VT_CHECK(weight.rank == 4, "conv3d: weight must be rank-4 [Cout*Cin/groups,KT,KH,KW]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv3d: groups must be >= 1");
+  const int64_t cin = x.shape[0], tin = x.shape[1], hin = x.shape[2], win = x.shape[3];
+  const int64_t cout = out.shape[0];
+  const int64_t kt = weight.shape[1], kh = weight.shape[2], kw = weight.shape[3];
+  VT_CHECK(cin > 0 && tin > 0 && hin > 0 && win > 0, "conv3d: x extents must be positive");
+  VT_CHECK(cout > 0 && kt > 0 && kh > 0 && kw > 0,
+           "conv3d: out channels and kernel extents must be positive");
+  VT_CHECK(cin % g == 0 && cout % g == 0, "conv3d: groups must divide both Cin and Cout");
+  const int64_t cin_g = cin / g;
+  VT_CHECK(weight.shape[0] == cout * cin_g,
+           "conv3d: weight dim 0 must be Cout*(Cin/groups) — torch's [Cout,Cin/groups,KT,KH,KW] "
+           "with its two leading axes merged");
+  VT_CHECK(args.stride_t >= 1 && args.stride_h >= 1 && args.stride_w >= 1,
+           "conv3d: stride must be >= 1");
+  VT_CHECK(args.dilation_t >= 1 && args.dilation_h >= 1 && args.dilation_w >= 1,
+           "conv3d: dilation must be >= 1");
+  VT_CHECK(args.pad_t >= 0 && args.pad_h >= 0 && args.pad_w >= 0,
+           "conv3d: padding must be >= 0");
+  // The SPAN is separated from the division, and that is the whole of the
+  // shape contract's agreement with torch (#1007 fresh review F7).
+  //
+  // torch FLOORS `(in + 2*pad - dilation*(k-1) - 1) / stride`; C++ integer
+  // division TRUNCATES TOWARD ZERO. The two agree for a non-negative numerator
+  // and disagree for a negative one whenever stride > 1: at
+  // `tin = 2, k = 3, stride = 2, pad = 0` the numerator is -1, so torch gets
+  // `floor(-1/2) + 1 = 0` and raises "Output size is too small" while truncation
+  // gets `-1/2 + 1 = 1` and ACCEPTS an extent of 1, convolving over taps the
+  // stride skipped. Refusing on a negative span makes the two identical without
+  // a signed-division idiom, and it is the shape `Conv1dOutLength` below already
+  // uses for the same reason.
+  //
+  // UNREACHABLE FROM LTX — `CausalConv3d` materialises a pad of at least the
+  // kernel on every axis (video_vae/convolution.py:305-311), so the padded
+  // extent never falls below the kernel. It is gated because this op is offered
+  // as a SHARED SEAM and the contract at vt::Conv3d claims to mirror nn.Conv3d;
+  // tests/vt/test_ops_conv3d.cpp holds it.
+  const int64_t span_t = tin + 2 * args.pad_t - args.dilation_t * (kt - 1) - 1;
+  const int64_t span_h = hin + 2 * args.pad_h - args.dilation_h * (kh - 1) - 1;
+  const int64_t span_w = win + 2 * args.pad_w - args.dilation_w * (kw - 1) - 1;
+  VT_CHECK(span_t >= 0 && span_h >= 0 && span_w >= 0,
+           "conv3d: kernel/dilation larger than the padded input");
+  const int64_t tout = span_t / args.stride_t + 1;
+  const int64_t hout = span_h / args.stride_h + 1;
+  const int64_t wout = span_w / args.stride_w + 1;
+  VT_CHECK(tout > 0 && hout > 0 && wout > 0, "conv3d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[1] == tout && out.shape[2] == hout && out.shape[3] == wout,
+           "conv3d: out must be [Cout,Tout,Hout,Wout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "conv3d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv3d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv3d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout, "conv3d: bias must be rank-1 [Cout]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "conv3d: bias must be a contiguous float tensor on the queue device");
+  }
+  // #1007 fresh review, non-blocking suggestion. The FIRST non-CPU kConv3d
+  // dispatch in a process announces itself, once, on stderr.
+  //
+  // The CUDA arm of this op has never been compiled and has never been run —
+  // there is no `nvcc` on the authoring host and no GPU runner in CI — and no
+  // gate anywhere in this tree can catch a kernel that compiles and computes the
+  // wrong pixels. This line does not remove that risk; it converts a SILENT
+  // first execution of never-run code into an announced one, so whoever gets a
+  // GPU first sees the moment it happened beside whatever the pixels look like.
+  //
+  // Deliberately on the DEVICE-TYPE rather than on CUDA: the same argument holds
+  // for every accelerator arm this seam gains, and putting it here keeps it in
+  // code that this box compiles and `test_diffusion_device_seam` executes,
+  // rather than in a `.cu` file nothing here can build.
+  if (q.device.type != DeviceType::kCPU) {
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) {
+      // The CUDA arm HAS now been run, so it must not claim otherwise. It was
+      // compiled for sm_121a and executed on a GB10 under #1452, and
+      // tests/vt/test_ops_conv3d.cpp gates it `memcmp`-identical to the CPU
+      // provider over the whole shape table and under catastrophic
+      // cancellation. Every OTHER accelerator type reaching this seam is still
+      // unrun, and the announcement stays for them: that is why this is
+      // narrowed rather than deleted.
+      std::fprintf(stderr, "[vt] first non-CPU vt::Conv3d dispatch (device type %d). %s\n",
+                   static_cast<int>(q.device.type),
+                   q.device.type == DeviceType::kCUDA
+                       ? "The CUDA arm is byte-gated against the CPU provider and was executed "
+                         "on a GB10 (#1452). No SPEED claim attaches to it."
+                       : "This arm has never been run on real hardware; see issue #1452.");
+    }
+  }
+  reinterpret_cast<Conv3dFn>(GetOp(OpId::kConv3d, q.device.type))(q, out, x, weight, bias, args);
+}
+
 void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, const DepthwiseConv1dArgs& args) {
   VT_CHECK(x.rank == 3 && out.rank == 3, "depthwise_conv1d: x/out must be rank-3 [N,C,L]");
@@ -3150,6 +3259,153 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
       args);
 }
 
+void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                       const Tensor& base, const DFlashGroupedConvArgs& args) {
+  VT_CHECK(args.taps >= 1 && args.num_groups >= 1 && args.group_size >= 1,
+           "dflash2-grouped-conv: taps/num_groups/group_size must be >= 1");
+  VT_CHECK(args.block_size >= 1, "dflash2-grouped-conv: block_size must be >= 1 (1 + k)");
+  VT_CHECK(x.rank == 2 && out.rank == 2, "dflash2-grouped-conv: x/out must be rank-2 [T,H]");
+  VT_CHECK(coefficients.rank == 4,
+           "dflash2-grouped-conv: coefficients must be rank-4 [T,sides,taps,num_groups]");
+  VT_CHECK(base.rank == 3, "dflash2-grouped-conv: base must be rank-3 [sides,taps,H]");
+  const int64_t t = x.shape[0];
+  const int64_t h = args.num_groups * args.group_size;
+  const int64_t sides = coefficients.shape[1];
+  VT_CHECK(x.shape[1] == h,
+           "dflash2-grouped-conv: x hidden must be num_groups*group_size");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == h,
+           "dflash2-grouped-conv: out must be [T,H] matching x");
+  VT_CHECK(coefficients.shape[0] == t && coefficients.shape[2] == args.taps &&
+               coefficients.shape[3] == args.num_groups,
+           "dflash2-grouped-conv: coefficients must be [T,sides,taps,num_groups]");
+  VT_CHECK(base.shape[0] == sides && base.shape[1] == args.taps && base.shape[2] == h,
+           "dflash2-grouped-conv: base must be [sides,taps,H] with the coefficients' sides");
+  VT_CHECK(args.side >= 0 && args.side < sides,
+           "dflash2-grouped-conv: side must index the sides dimension "
+           "(0 = prepare, 1 = finish)");
+  // ONE dtype across all four. The rounding after each step is what makes the
+  // CPU reference and the CUDA kernel bit-identical, and a mixed set would make
+  // "the dtype" ambiguous rather than merely inconvenient.
+  VT_CHECK(IsFloat(x.dtype) && coefficients.dtype == x.dtype && base.dtype == x.dtype &&
+               out.dtype == x.dtype,
+           "dflash2-grouped-conv: x/coefficients/base/out must share one float dtype");
+  VT_CHECK(x.IsContiguous() && coefficients.IsContiguous() && base.IsContiguous() &&
+               out.IsContiguous(),
+           "dflash2-grouped-conv: contiguous tensors required");
+  VT_CHECK(x.device == q.device && coefficients.device == q.device &&
+               base.device == q.device && out.device == q.device,
+           "dflash2-grouped-conv: device mismatch (x/coefficients/base/out/queue)");
+  reinterpret_cast<DFlashGroupedConvFn>(GetOp(OpId::kDFlashGroupedConv, q.device.type))(
+      q, out, x, coefficients, base, args);
+}
+
+void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                          const Tensor& succ_codebook, const Tensor& candidate_ids,
+                          const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
+                          const Dflash2SelectorEdgesArgs& args) {
+  VT_CHECK(args.top_k >= 1, "dflash2-selector-edges: top_k must be >= 1");
+  VT_CHECK(pred_codebook.rank == 2 && succ_codebook.rank == 2,
+           "dflash2-selector-edges: codebooks must be rank-2 [vocab, rank]");
+  VT_CHECK(candidate_ids.rank == 3 && unary.rank == 3 && hidden.rank == 3,
+           "dflash2-selector-edges: candidate_ids/unary must be [B,L,K] and hidden [B,L,R]");
+  VT_CHECK(scores.rank == 4, "dflash2-selector-edges: scores must be rank-4 [B,L,K,K]");
+  VT_CHECK(anchors.rank == 1, "dflash2-selector-edges: anchors must be rank-1 [B]");
+  const int64_t b = candidate_ids.shape[0], l = candidate_ids.shape[1];
+  const int64_t k = args.top_k, r = pred_codebook.shape[1];
+  VT_CHECK(candidate_ids.shape[2] == k,
+           "dflash2-selector-edges: candidate_ids last dim must be top_k");
+  VT_CHECK(unary.shape[0] == b && unary.shape[1] == l && unary.shape[2] == k,
+           "dflash2-selector-edges: unary must be [B,L,K] matching candidate_ids");
+  VT_CHECK(hidden.shape[0] == b && hidden.shape[1] == l && hidden.shape[2] == r,
+           "dflash2-selector-edges: hidden must be [B,L,rank]");
+  VT_CHECK(scores.shape[0] == b && scores.shape[1] == l && scores.shape[2] == k &&
+               scores.shape[3] == k,
+           "dflash2-selector-edges: scores must be [B,L,K,K]");
+  VT_CHECK(anchors.shape[0] == b, "dflash2-selector-edges: anchors must be [B]");
+  VT_CHECK(succ_codebook.shape[0] == pred_codebook.shape[0] &&
+               succ_codebook.shape[1] == r,
+           "dflash2-selector-edges: the two codebooks must share [vocab, rank]");
+  // ONE float dtype across the codebooks and the projected hidden — upstream's
+  // params_dtype, the model dtype. `unary` and `scores` are f32 because upstream
+  // makes the candidate values f32 in compute_candidates and torch then promotes
+  // the bf16 einsum output to f32 on the add.
+  VT_CHECK(IsFloat(pred_codebook.dtype) && succ_codebook.dtype == pred_codebook.dtype &&
+               hidden.dtype == pred_codebook.dtype,
+           "dflash2-selector-edges: codebooks and hidden must share one float dtype");
+  VT_CHECK(unary.dtype == DType::kF32 && scores.dtype == DType::kF32,
+           "dflash2-selector-edges: unary and scores must be f32");
+  VT_CHECK(candidate_ids.dtype == DType::kI64 && anchors.dtype == DType::kI64,
+           "dflash2-selector-edges: candidate_ids and anchors must be i64");
+  VT_CHECK(pred_codebook.IsContiguous() && succ_codebook.IsContiguous() &&
+               candidate_ids.IsContiguous() && unary.IsContiguous() &&
+               hidden.IsContiguous() && anchors.IsContiguous() && scores.IsContiguous(),
+           "dflash2-selector-edges: contiguous tensors required");
+  VT_CHECK(pred_codebook.device == q.device && succ_codebook.device == q.device &&
+               candidate_ids.device == q.device && unary.device == q.device &&
+               hidden.device == q.device && anchors.device == q.device &&
+               scores.device == q.device,
+           "dflash2-selector-edges: device mismatch");
+  reinterpret_cast<Dflash2SelectorEdgesFn>(
+      GetOp(OpId::kDflash2SelectorEdges, q.device.type))(
+      q, scores, pred_codebook, succ_codebook, candidate_ids, unary, hidden, anchors, args);
+}
+
+void Dflash2PathWalk(Queue& q, Tensor& tokens, const Tensor& scores,
+                     const Tensor& candidate_ids, const Dflash2PathWalkArgs& args) {
+  VT_CHECK(args.top_k >= 1, "dflash2-path-walk: top_k must be >= 1");
+  VT_CHECK(scores.rank == 4, "dflash2-path-walk: scores must be rank-4 [B,L,K,K]");
+  VT_CHECK(candidate_ids.rank == 3,
+           "dflash2-path-walk: candidate_ids must be rank-3 [B,L,K]");
+  VT_CHECK(tokens.rank == 2, "dflash2-path-walk: tokens must be rank-2 [B,L]");
+  const int64_t b = candidate_ids.shape[0], l = candidate_ids.shape[1];
+  const int64_t k = args.top_k;
+  VT_CHECK(candidate_ids.shape[2] == k,
+           "dflash2-path-walk: candidate_ids last dim must be top_k");
+  // BOTH trailing axes are checked. They are the PREDECESSOR axis and the CHILD
+  // axis and they have the same extent, so checking one and inferring the other
+  // would admit a lattice indexed the wrong way round -- which reads plausible
+  // scores from the wrong rows and moves acceptance without raising.
+  VT_CHECK(scores.shape[0] == b && scores.shape[1] == l && scores.shape[2] == k &&
+               scores.shape[3] == k,
+           "dflash2-path-walk: scores must be [B,L,K,K] matching candidate_ids");
+  VT_CHECK(tokens.shape[0] == b && tokens.shape[1] == l,
+           "dflash2-path-walk: tokens must be [B,L] matching candidate_ids");
+  VT_CHECK(scores.dtype == DType::kF32, "dflash2-path-walk: scores must be f32");
+  VT_CHECK(candidate_ids.dtype == DType::kI64 && tokens.dtype == DType::kI64,
+           "dflash2-path-walk: candidate_ids and tokens must be i64");
+  VT_CHECK(scores.IsContiguous() && candidate_ids.IsContiguous() && tokens.IsContiguous(),
+           "dflash2-path-walk: contiguous tensors required");
+  VT_CHECK(scores.device == q.device && candidate_ids.device == q.device &&
+               tokens.device == q.device,
+           "dflash2-path-walk: device mismatch");
+  reinterpret_cast<Dflash2PathWalkFn>(GetOp(OpId::kDflash2PathWalk, q.device.type))(
+      q, tokens, scores, candidate_ids, args);
+}
+
+void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                       const TopKValuesIndicesArgs& args) {
+  VT_CHECK(logits.rank == 2 && values.rank == 2 && indices.rank == 2,
+           "topk-values-indices: logits/values/indices must be rank-2");
+  const int64_t rows = logits.shape[0], v = logits.shape[1];
+  const int64_t pad = args.num_org_vocab_padding;
+  VT_CHECK(pad >= 0 && pad < v, "topk-values-indices: num_org_vocab_padding must be in [0, V)");
+  VT_CHECK(args.k >= 1 && args.k <= v - pad,
+           "topk-values-indices: k must be in [1, V - num_org_vocab_padding]");
+  VT_CHECK(values.shape[0] == rows && indices.shape[0] == rows &&
+               values.shape[1] == args.k && indices.shape[1] == args.k,
+           "topk-values-indices: values/indices must be [rows, k]");
+  VT_CHECK(logits.dtype == DType::kF32 && values.dtype == DType::kF32,
+           "topk-values-indices: logits and values must be f32");
+  VT_CHECK(indices.dtype == DType::kI64, "topk-values-indices: indices must be i64");
+  VT_CHECK(logits.IsContiguous() && values.IsContiguous() && indices.IsContiguous(),
+           "topk-values-indices: contiguous tensors required");
+  VT_CHECK(logits.device == q.device && values.device == q.device &&
+               indices.device == q.device,
+           "topk-values-indices: device mismatch");
+  reinterpret_cast<TopKValuesIndicesFn>(GetOp(OpId::kTopKValuesIndices, q.device.type))(
+      q, values, indices, logits, args);
+}
+
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3,
@@ -3170,6 +3426,19 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
   // trailing rows (CUDA-graph padding) that are ignored.
   VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
            "reshape_and_cache: num_tokens (k.shape[0]) must be >= slot_mapping length");
+  // KV-FP8 W3 — the loud end of the half-sized-block hazard. A `kI8` cache page
+  // is one byte per element because the KV-cache spec was sized that way; a
+  // float store into it would write two bytes per element at offsets computed
+  // for one, which is wrong tokens rather than an out-of-bounds. Every
+  // attention block that has been routed calls `vt::ReshapeAndCacheFp8` here
+  // instead (`include/vllm/model_executor/models/kv_cache_route.h`), so reaching
+  // this line means THIS architecture's attention block has not been routed —
+  // and the message says so rather than reporting a dtype mismatch.
+  VT_CHECK(k_cache.dtype != DType::kI8 && v_cache.dtype != DType::kI8,
+           "reshape_and_cache: this cache is 1-byte fp8 storage (DType::kI8) but "
+           "this is the float (auto) store; an fp8 KV cache must be written "
+           "through vt::ReshapeAndCacheFp8. This model's attention block is not "
+           "routed for fp8 KV (KV-FP8 W3) — run it on --kv-cache-dtype auto");
   VT_CHECK(IsFloat(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
                v_cache.dtype == k.dtype,
            "reshape_and_cache: k/v/k_cache/v_cache must share one float dtype (auto cache path)");
@@ -3214,8 +3483,8 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(kind != Fp8KVCacheDataType::kAuto,
            "reshape_and_cache_fp8: kind must be an fp8 dtype (use ReshapeAndCache for auto)");
   VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
-           "reshape_and_cache_fp8: only fp8_e4m3 is implemented on CPU in W1 "
-           "(fp8_e5m2 CPU compute is a named later brick)");
+           "reshape_and_cache_fp8: only fp8_e4m3 is implemented "
+           "(fp8_e5m2 compute is a named later brick, spec W5)");
   VT_CHECK(k.rank == 3 && v.rank == 3,
            "reshape_and_cache_fp8: k/v must be rank-3 [num_tokens,num_kv_heads,head_size]");
   VT_CHECK(k_cache.rank == 4 && v_cache.rank == 4,
@@ -3256,9 +3525,11 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
   VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
            "reshape_and_cache_fp8: k_cache/v_cache page must be head-contiguous "
            "(stride[2] == head_size) — the NHD unbind-slice layout");
-  VT_CHECK(q.device.type == DeviceType::kCPU,
-           "reshape_and_cache_fp8: only the CPU fp8-KV store is implemented in W1 "
-           "(the CUDA fp8-KV store kernel is a named later brick)");
+  // NO device-class guard. W1 hard-refused every non-CPU queue here, which is
+  // what kept the CUDA arm unreachable; W2 lands that arm (cuda_cache.cu), so
+  // the op resolves through the provider table like every other op and a device
+  // with no registered fp8-KV store refuses BY NAME in GetOp
+  // (src/vt/op_provider.cpp:563-567) instead of by device class.
   VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
                v_cache.device == q.device && slot_mapping.device == q.device,
            "reshape_and_cache_fp8: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
@@ -3356,6 +3627,22 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
            "(the auto cache path; the fp8 KV-cache branch is out of scope)");
   VT_CHECK(args.scale > 0.0f, "mla_decode_attention: args.scale must be > 0");
   VT_CHECK(args.num_kv_splits >= 0, "mla_decode_attention: args.num_kv_splits must be >= 0");
+  // The sliding-window arm (dots3-note W4b-2, #699). `left` is the inclusive
+  // distance behind the query, so the window WIDTH is `left + 1` and upstream's
+  // `sliding_window_size` 513 arrives as `left == 512`. A zero-width window
+  // would leave a decode row with no keys at all, which upstream cannot
+  // produce (`WINDOW_SIZE` is a positive config field), so it is refused rather
+  // than silently emitting zeros.
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0,
+             "mla_decode_attention: window_size.left must be >= 0 (it is the INCLUSIVE "
+             "distance behind the query; sliding_window 513 is left == 512)");
+    VT_CHECK(args.window_size->right == 0,
+             "mla_decode_attention: window_size.right must be 0 — an MLA decode query IS "
+             "the last position of its own sequence, so a positive right bound could only "
+             "admit keys that do not exist. Upstream's dots3-note window is "
+             "(sliding_window - 1, 0) (attention.py:300 @ bc2d63e650).");
+  }
   // Indexing is stride-driven on the leading dims (a cross-layer cache view has
   // gaps — cf. upstream `_page_stride`, triton_decode_attention.py:59-65), so we
   // require only unit innermost strides.
@@ -3425,6 +3712,25 @@ void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query
   VT_CHECK(args.scale > 0.0f, "mla_prefill_attention: args.scale must be > 0");
   VT_CHECK(args.max_seqlen_q >= 0 && args.max_seqlen_k >= 0,
            "mla_prefill_attention: args.max_seqlen_q/max_seqlen_k must be >= 0");
+  // The sliding-window arm (dots3-note W4b-2, #699). Upstream's only windowed
+  // prefill call is `causal=True, window_size=(sliding_window - 1, 0)`
+  // (attention.py:279-305 @ bc2d63e650). A NON-causal window is refused rather
+  // than approximated: FlashAttention's local mask replaces the causal
+  // specialization entirely, so "all keys forward, windowed backward" would need
+  // an infinite right bound this struct cannot express.
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0,
+             "mla_prefill_attention: window_size.left must be >= 0 (the INCLUSIVE distance "
+             "behind the bottom-right aligned query position)");
+    VT_CHECK(args.window_size->right == 0,
+             "mla_prefill_attention: window_size.right must be 0 — upstream's windowed MLA "
+             "prefill is the causal (sliding_window - 1, 0) pair (attention.py:300)");
+    VT_CHECK(args.causal,
+             "mla_prefill_attention: a window requires causal=true. FlashAttention's local "
+             "mask REPLACES the causal specialization (is_causal = causal && !is_local), so "
+             "a non-causal window cannot be spelled with a finite right bound. Upstream "
+             "never asks for one (attention.py:299-301).");
+  }
   // Stride-driven on the token/head axes (a workspace slice is a strided view);
   // the innermost head_dim must be packed.
   VT_CHECK(query.stride[2] == 1 && key.stride[2] == 1 && value.stride[2] == 1 &&
@@ -3548,6 +3854,16 @@ void MergeAttnStates(Queue& q, Tensor& output, Tensor* output_lse, const Tensor&
       prefill_tokens_with_context);
 }
 
+namespace detail {
+// W10 repair (#1865): the classified-arrival counter behind
+// PagedAttnSpecClassifiedCount(). Function-local static so the count exists
+// exactly once per process regardless of link order.
+std::atomic<uint64_t>& PagedAttnSpecClassified() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+}  // namespace detail
+
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args) {
@@ -3583,15 +3899,25 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
              "paged_attention: k_cache/v_cache must share one float dtype");
   } else {
     VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3,
-             "paged_attention: only fp8_e4m3 KV read is implemented on CPU in W1 "
-             "(fp8_e5m2 CPU read is a named later brick)");
+             "paged_attention: only the fp8_e4m3 KV read is implemented "
+             "(the fp8_e5m2 read is a named later brick, spec W5)");
     VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
              "paged_attention: fp8 KV read requires 1-byte fp8 cache (DType::kI8)");
     VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
              "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
-    VT_CHECK(q.device.type == DeviceType::kCPU,
-             "paged_attention: only the CPU fp8-KV read is implemented in W1 "
-             "(the CUDA fp8-KV paged-attention kernel is a named later brick)");
+    // WHICH BACKENDS HAVE AN fp8 READ. Unlike the fp8 STORE — a separate OpId
+    // that only the CPU and CUDA backends register, so an unimplemented backend
+    // refuses by name inside GetOp — the fp8 read rides ADDITIVE fields on
+    // PagedAttentionArgs of an op that kMETAL and kROCM already register for the
+    // float path (metal_ops.mm, rocm_ops.hip). Nothing in the provider table can
+    // tell those two apart, so without this list an fp8 cache would reach a
+    // kernel that reads the same bytes as floats and returns silent garbage.
+    // AGENTS.md: refuse an unimplemented arm with a message that names the
+    // missing part. CPU landed in W1, CUDA in W2; Metal and ROCm are owed.
+    VT_CHECK(q.device.type == DeviceType::kCPU || q.device.type == DeviceType::kCUDA,
+             "paged_attention: the fp8 KV read is implemented on CPU (KV-FP8 W1) and "
+             "CUDA (KV-FP8 W2) only; this backend has no fp8 dequant on the cache read "
+             "and would read the fp8 bytes as its float dtype");
   }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.
@@ -3622,8 +3948,20 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                seq_lens.device == q.device && query_start_loc.device == q.device,
            "paged_attention: device mismatch (query/out/cache/block_table/seq_lens/"
            "query_start_loc/queue)");
+  // W10 repair (#1865): count a spec-CLASSIFIED arrival (shape-consistent
+  // classification present) at the ONE wrapper every backend's dispatch sits
+  // behind, so the runner→model→args threading is observable on a CPU box.
+  if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len))
+    detail::PagedAttnSpecClassified().fetch_add(1, std::memory_order_relaxed);
   reinterpret_cast<PagedAttentionFn>(GetOp(OpId::kPagedAttention, q.device.type))(
       q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
+}
+
+uint64_t PagedAttnSpecClassifiedCount() {
+  return detail::PagedAttnSpecClassified().load(std::memory_order_relaxed);
+}
+void ResetPagedAttnSpecClassifiedCount() {
+  detail::PagedAttnSpecClassified().store(0, std::memory_order_relaxed);
 }
 
 namespace {
@@ -4071,6 +4409,233 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
            "shared_expert_gate: device mismatch (out/sd/gl/queue)");
   reinterpret_cast<SharedExpertGateFn>(GetOp(OpId::kSharedExpertGate, q.device.type))(q, out, sd,
                                                                                       gl);
+}
+
+
+// ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────
+//
+// Ported from exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT). The
+// contracts, the parity tiers and the dtype decision are in include/vt/ops.h and
+// in `.agents/specs/model-dsv4-exl3.md` `## W2 design`.
+//
+// Every refusal below NAMES the op and the thing it could not represent. That is
+// the standing quant-arm rule: an arm we have not built refuses by name rather
+// than being discovered later as a wrong number.
+
+void Exl3HadR128(Queue& q, Tensor& out, const Tensor& in, const Exl3HadArgs& args) {
+  VT_CHECK(in.rank == 2 && out.rank == 2, "exl3_had_r_128: in/out must be rank-2 [rows, cols]");
+  VT_CHECK(in.shape[0] == out.shape[0] && in.shape[1] == out.shape[1],
+           "exl3_had_r_128: in/out shapes must match");
+  VT_CHECK(in.dtype == out.dtype, "exl3_had_r_128: in/out must share a dtype");
+  VT_CHECK(in.dtype == DType::kF16 || in.dtype == DType::kF32,
+           "exl3_had_r_128: dtype must be f16 or f32 (upstream hadamard.cu:172 "
+           "refuses every other); got " + std::string(Name(in.dtype)));
+  const int64_t cols = in.shape[1];
+  // TORCH_CHECK_DIV(input, 1, 128) (hadamard.cu:102). The transform IS 128-wide;
+  // there is no partial block to fall back to.
+  VT_CHECK(cols % 128 == 0,
+           "exl3_had_r_128: the row length must be a multiple of 128 (the transform "
+           "is blockwise Hadamard-128); got " + std::to_string(cols));
+  VT_CHECK(in.IsContiguous() && out.IsContiguous(), "exl3_had_r_128: contiguous required");
+  VT_CHECK(in.device == q.device && out.device == q.device, "exl3_had_r_128: device mismatch");
+  // hadamard.cu:112-172 instantiates <pre_scale, post_scale> and never with both
+  // true, so "both" is not a mode this port can express.
+  VT_CHECK(!(args.pre_scale != nullptr && args.post_scale != nullptr),
+           "exl3_had_r_128: at most one of pre_scale/post_scale (upstream instantiates "
+           "the kernel as one or the other, never both)");
+  const Tensor* sc = args.pre_scale != nullptr ? args.pre_scale : args.post_scale;
+  if (sc != nullptr) {
+    VT_CHECK(sc->dtype == DType::kF16,
+             "exl3_had_r_128: the scale vector is fp16 (upstream's `const half*` in both "
+             "the half and the float kernels); got " + std::string(Name(sc->dtype)));
+    VT_CHECK(sc->Numel() == cols,
+             "exl3_had_r_128: the scale vector must have one entry per column; got " +
+                 std::to_string(sc->Numel()) + " for " + std::to_string(cols));
+    VT_CHECK(sc->device == q.device, "exl3_had_r_128: scale device mismatch");
+  }
+  reinterpret_cast<Exl3HadR128Fn>(GetOp(OpId::kExl3HadR128, q.device.type))(q, out, in, args);
+}
+
+void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const Tensor& suh,
+              const Tensor& svh, Tensor& a_had, const Exl3GemmArgs& args) {
+  VT_CHECK(args.bits >= 1 && args.bits <= 8,
+           "exl3_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
+  // cb 0 (the 3INST codebook) and cb 2 (mul1) exist upstream and are NOT ported:
+  // this checkpoint is mcg, and an unported arm refuses by name.
+  VT_CHECK(args.codebook == 1,
+           "exl3_gemm: only codebook 1 (mcg) is implemented; codebook " +
+               std::to_string(args.codebook) +
+               " is an upstream arm this row has not ported (MODEL-DSV4-EXL3)");
+  VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_gemm: A and C must be rank-2");
+  // `ldmatrix.sync.aligned.m8n8.x4.shared.b16` + `mma...f16.f16` read fp16
+  // fragments (ptx.cuh:52-74,203-212), so A has no dtype freedom at all.
+  VT_CHECK(a.dtype == DType::kF16,
+           "exl3_gemm: A must be f16 (the tensor-core fragments are fp16); got " +
+               std::string(Name(a.dtype)));
+  VT_CHECK(a_had.dtype == DType::kF16,
+           "exl3_gemm: A_had must be f16 (it holds the transformed A); got " +
+               std::string(Name(a_had.dtype)));
+  VT_CHECK(c.dtype == DType::kF16 || c.dtype == DType::kF32,
+           "exl3_gemm: C must be f16 (the default, exl3.py:72) or f32 (upstream's "
+           "c_fp32 arm, exl3_gemm.cu:134); got " + std::string(Name(c.dtype)));
+  VT_CHECK(trellis.dtype == DType::kI8,
+           "exl3_gemm: the trellis travels as opaque i8 BYTES; got " +
+               std::string(Name(trellis.dtype)));
+  VT_CHECK(trellis.rank == 3, "exl3_gemm: trellis must be rank-3 [k/16, n/16, 32*bits]");
+  const int64_t m = a.shape[0];
+  const int64_t k = a.shape[1];
+  const int64_t n = c.shape[1];
+  VT_CHECK(c.shape[0] == m, "exl3_gemm: C rows must equal A rows");
+  VT_CHECK(a_had.shape[0] == m && a_had.shape[1] == k, "exl3_gemm: A_had must be shaped like A");
+  // Both sides were Hadamard-128 transformed at quantization time
+  // (exl3_lib/quantize.py:15), so both must be multiples of 128 for the runtime
+  // transform to be defined; upstream's own limits are k % 16 and n % 128
+  // (exl3_gemm.cu:34-35) and the tighter k rule comes from the transform, not
+  // the GEMM.
+  VT_CHECK(k % 128 == 0 && n % 128 == 0,
+           "exl3_gemm: k and n must be multiples of 128 (both sides carry a blockwise "
+           "Hadamard-128); got k=" + std::to_string(k) + " n=" + std::to_string(n));
+  VT_CHECK(trellis.shape[0] == k / 16 && trellis.shape[1] == n / 16 &&
+               trellis.shape[2] == 32 * static_cast<int64_t>(args.bits),
+           "exl3_gemm: trellis shape must be [k/16, n/16, 32*bits] bytes for k=" +
+               std::to_string(k) + " n=" + std::to_string(n) +
+               " bits=" + std::to_string(args.bits));
+  VT_CHECK(suh.dtype == DType::kF16 && svh.dtype == DType::kF16,
+           "exl3_gemm: suh/svh are fp16 sign+scale vectors (exl3.py:20-91)");
+  VT_CHECK(suh.Numel() == k, "exl3_gemm: suh must have k entries");
+  VT_CHECK(svh.Numel() == n, "exl3_gemm: svh must have n entries");
+  VT_CHECK(a.IsContiguous() && c.IsContiguous() && a_had.IsContiguous() &&
+               trellis.IsContiguous() && suh.IsContiguous() && svh.IsContiguous(),
+           "exl3_gemm: contiguous required (the kernels read A as contiguous rows, "
+           "exl3.py:129-131)");
+  VT_CHECK(a.device == q.device && c.device == q.device && a_had.device == q.device &&
+               trellis.device == q.device && suh.device == q.device && svh.device == q.device,
+           "exl3_gemm: device mismatch");
+  reinterpret_cast<Exl3GemmFn>(GetOp(OpId::kExl3Gemm, q.device.type))(q, c, a, trellis, suh, svh,
+                                                                     a_had, args);
+}
+
+// ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
+//
+// The checks are `exl3_moe.cu:145-201`, in upstream's own order, with the torch
+// spellings replaced by VT_CHECK so both arms share one set of refusals rather
+// than duplicating them per backend. Every refusal names the op and what it
+// could not represent.
+void Exl3MoeMlp(Queue& q, Tensor& output_state, const Tensor& hidden_state,
+                const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
+                const Exl3MoeTemps& temps, const Exl3MoeArgs& args) {
+  // exl3_moe.cu:142-143: "Nothing for the fused kernel to do". Returning before
+  // the checks is upstream's own order and matters: a caller with no active
+  // expert may legitimately pass buffers it never sized.
+  if (args.num_active == 0) return;
+
+  VT_CHECK(hidden_state.rank == 2, "exl3_moe: hidden_state must be rank-2 [bsz, hidden]");
+  VT_CHECK(hidden_state.dtype == DType::kF16,
+           "exl3_moe: hidden_state must be f16 (the tensor-core fragments are fp16); got " +
+               std::string(Name(hidden_state.dtype)));
+  const int64_t bsz = hidden_state.shape[0];
+  const int64_t hidden_dim = hidden_state.shape[1];
+
+  // exl3_moe.cu:151-152. f32 is UPSTREAM's width for the accumulator, not a
+  // widening: the epilogue atomicAdds one contribution per (token, active
+  // expert) into it.
+  VT_CHECK(output_state.dtype == DType::kF32,
+           "exl3_moe: output_state must be f32 (upstream's own width, exl3_moe.cu:151 — the "
+           "scatter-add accumulates one contribution per active expert into it); got " +
+               std::string(Name(output_state.dtype)));
+  VT_CHECK(output_state.rank == 2 && output_state.shape[0] == bsz &&
+               output_state.shape[1] == hidden_dim,
+           "exl3_moe: output_state must be shaped like hidden_state");
+
+  VT_CHECK(routing.expert_count != nullptr && routing.token_sorted != nullptr &&
+               routing.weight_sorted != nullptr,
+           "exl3_moe: expert_count, token_sorted and weight_sorted are all required");
+  VT_CHECK(routing.expert_count->dtype == DType::kI64 &&
+               routing.token_sorted->dtype == DType::kI64,
+           "exl3_moe: expert_count and token_sorted are i64 (exl3_moe.cu:154,158)");
+  VT_CHECK(routing.weight_sorted->dtype == DType::kF16,
+           "exl3_moe: weight_sorted is f16 (exl3_moe.cu:56)");
+  VT_CHECK(routing.expert_count->rank == 1 && routing.expert_count->Numel() >= 2,
+           "exl3_moe: expert_count is [num_experts + 1]");
+  const int64_t num_experts = routing.expert_count->Numel() - 1;
+  VT_CHECK(routing.token_sorted->Numel() == routing.weight_sorted->Numel(),
+           "exl3_moe: token_sorted and weight_sorted must have the same length");
+  VT_CHECK(bsz > 0 && routing.token_sorted->Numel() % bsz == 0,
+           "exl3_moe: token_sorted must hold a whole number of assignments per token");
+
+  VT_CHECK(temps.state_g != nullptr && temps.state_u != nullptr &&
+               temps.intermediate_g != nullptr && temps.intermediate_u != nullptr,
+           "exl3_moe: all four temp buffers are required");
+  const Tensor* four[4] = {temps.state_g, temps.state_u, temps.intermediate_g,
+                           temps.intermediate_u};
+  for (const Tensor* tt : four) {
+    VT_CHECK(tt->dtype == DType::kF16, "exl3_moe: the temp buffers are f16 (exl3_moe.cu:163-174)");
+    VT_CHECK(tt->rank == 3,
+             "exl3_moe: the temp buffers are [concurrency, max_tokens_per_expert, dim]");
+    VT_CHECK(tt->IsContiguous(), "exl3_moe: the temp buffers must be contiguous");
+    VT_CHECK(tt->device == q.device, "exl3_moe: temp buffer device mismatch");
+  }
+  VT_CHECK(temps.state_g->shape[2] == hidden_dim && temps.state_u->shape[2] == hidden_dim,
+           "exl3_moe: the state buffers' last dim must be hidden_dim (exl3_moe.cu:166)");
+  const int64_t intermediate_dim = temps.intermediate_g->shape[2];
+  VT_CHECK(temps.intermediate_u->shape[2] == intermediate_dim,
+           "exl3_moe: the intermediate buffers must agree on their last dim");
+  const int64_t max_tokens_per_expert = temps.state_g->shape[1];
+  const int64_t concurrency = temps.state_g->shape[0];
+  for (const Tensor* tt : four)
+    VT_CHECK(tt->shape[0] == concurrency && tt->shape[1] == max_tokens_per_expert,
+             "exl3_moe: the four temp buffers must agree on concurrency and "
+             "max_tokens_per_expert");
+  VT_CHECK(concurrency >= 1 && max_tokens_per_expert >= 1,
+           "exl3_moe: concurrency and max_tokens_per_expert must both be at least 1");
+
+  // Both sides carry a blockwise Hadamard-128, the same rule Exl3Gemm states,
+  // and the gather/scatter epilogues are 128-wide per warp
+  // (exl3_moe_kernel.cuh:87,167,239).
+  VT_CHECK(hidden_dim % 128 == 0 && intermediate_dim % 128 == 0,
+           "exl3_moe: hidden and intermediate must be multiples of 128 (both sides carry a "
+           "blockwise Hadamard-128); got hidden=" + std::to_string(hidden_dim) +
+               " intermediate=" + std::to_string(intermediate_dim));
+
+  // exl3_moe.cu:184-185. cb 0 (3INST) and cb 2 (mul1) exist upstream and are
+  // NOT ported: this checkpoint is mcg, and an unported arm refuses by name.
+  VT_CHECK(args.codebook == 1,
+           "exl3_moe: only codebook 1 (mcg) is implemented; codebook " +
+               std::to_string(args.codebook) +
+               " is an upstream arm this row has not ported (MODEL-DSV4-EXL3)");
+  const int bits[3] = {args.bits_gate, args.bits_up, args.bits_down};
+  for (int b : bits)
+    VT_CHECK(b >= 1 && b <= 8,
+             "exl3_moe: every bit width must be in [1, 8]; got " + std::to_string(b));
+
+  const Tensor* nine[9] = {tables.gate_trellis, tables.gate_suh,   tables.gate_svh,
+                           tables.up_trellis,   tables.up_suh,     tables.up_svh,
+                           tables.down_trellis, tables.down_suh,   tables.down_svh};
+  for (const Tensor* tt : nine) {
+    VT_CHECK(tt != nullptr, "exl3_moe: all nine per-expert pointer tables are required");
+    VT_CHECK(tt->dtype == DType::kI64,
+             "exl3_moe: a pointer table is an i64 array of per-expert addresses "
+             "(exl3_moe.cu:118-126 passes tensors of void*); got " +
+                 std::string(Name(tt->dtype)));
+    VT_CHECK(tt->Numel() == num_experts,
+             "exl3_moe: every pointer table must have one entry per expert (" +
+                 std::to_string(num_experts) + "); got " + std::to_string(tt->Numel()));
+    VT_CHECK(tt->IsContiguous(), "exl3_moe: the pointer tables must be contiguous");
+    VT_CHECK(tt->device == q.device, "exl3_moe: pointer table device mismatch");
+  }
+
+  VT_CHECK(hidden_state.IsContiguous() && output_state.IsContiguous() &&
+               routing.expert_count->IsContiguous() && routing.token_sorted->IsContiguous() &&
+               routing.weight_sorted->IsContiguous(),
+           "exl3_moe: contiguous required");
+  VT_CHECK(hidden_state.device == q.device && output_state.device == q.device &&
+               routing.expert_count->device == q.device &&
+               routing.token_sorted->device == q.device &&
+               routing.weight_sorted->device == q.device,
+           "exl3_moe: device mismatch");
+
+  reinterpret_cast<Exl3MoeMlpFn>(GetOp(OpId::kExl3MoeMlp, q.device.type))(
+      q, output_state, hidden_state, tables, routing, temps, args);
 }
 
 }  // namespace vt

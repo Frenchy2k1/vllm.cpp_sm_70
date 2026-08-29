@@ -12,6 +12,7 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "vllm/http_transport_abi.h"
 #include "vllm/transformers_utils/hf_cache.h"
 
 namespace vllm {
@@ -74,71 +75,63 @@ bool IsSafeEntryPath(const std::string& path) {
   return true;
 }
 
-struct ParsedUrl {
-  std::string scheme;
-  std::string host;
-  int port = 0;
-  std::string path;  // always begins with '/'
-};
-
-// Mirrors llama.cpp `common/http.h:33-98 @ b10451`, narrowed to what an
-// endpoint needs: no user information, because a hub endpoint carries none.
-ParsedUrl ParseUrl(const std::string& url) {
-  ParsedUrl parts;
-  const size_t scheme_end = url.find("://");
-  if (scheme_end == std::string::npos) {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
-                             "' has no scheme; expected http:// or https://");
+// RFC 3986 section 3.1: `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+// followed by ':'. A reference that begins with one is absolute and is used as
+// it stands; everything else is resolved against the address that sent it.
+bool HasScheme(const std::string& reference) {
+  if (reference.empty()) return false;
+  const unsigned char first = static_cast<unsigned char>(reference.front());
+  const bool alpha = (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z');
+  if (!alpha) return false;
+  for (size_t i = 1; i < reference.size(); ++i) {
+    const char c = reference[i];
+    if (c == ':') return true;
+    const bool valid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                       (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.';
+    if (!valid) return false;
   }
-  parts.scheme = url.substr(0, scheme_end);
-  std::string rest = url.substr(scheme_end + 3);
-
-  const size_t slash = rest.find('/');
-  if (slash != std::string::npos) {
-    parts.host = rest.substr(0, slash);
-    parts.path = rest.substr(slash);
-  } else {
-    parts.host = rest;
-    parts.path = "/";
-  }
-
-  std::string port_text;
-  if (!parts.host.empty() && parts.host.front() == '[') {
-    const size_t close = parts.host.find(']');
-    if (close == std::string::npos) {
-      throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
-                               "' has an unterminated IPv6 host");
-    }
-    const std::string after = parts.host.substr(close + 1);
-    if (!after.empty() && after.front() == ':') port_text = after.substr(1);
-    parts.host = parts.host.substr(1, close - 1);
-  } else {
-    const size_t colon = parts.host.find(':');
-    if (colon != std::string::npos) {
-      port_text = parts.host.substr(colon + 1);
-      parts.host = parts.host.substr(0, colon);
-    }
-  }
-
-  if (!port_text.empty()) {
-    parts.port = std::stoi(port_text);
-  } else if (parts.scheme == "http") {
-    parts.port = 80;
-  } else if (parts.scheme == "https") {
-    parts.port = 443;
-  } else {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url +
-                             "' uses the unsupported scheme '" + parts.scheme +
-                             "'");
-  }
-  if (parts.host.empty()) {
-    throw std::runtime_error("vllm.cpp: HF_ENDPOINT '" + url + "' has no host");
-  }
-  return parts;
+  return false;
 }
 
-std::string FormatHost(const std::string& host) {
-  return host.find(':') != std::string::npos ? "[" + host + "]" : host;
+// RFC 3986 section 5.2.4, transcribed. `..` walks a segment off the output
+// buffer, which is why the algorithm cannot be written as a single pass over
+// the input: `/a/b/../../c` has to end at `/c` and not at `/a/c`.
+std::string RemoveDotSegments(const std::string& path) {
+  std::string in = path;
+  std::string out;
+  const auto drop_last_segment = [&out]() {
+    const size_t slash = out.rfind('/');
+    out = slash == std::string::npos ? std::string() : out.substr(0, slash);
+  };
+  while (!in.empty()) {
+    if (in.rfind("../", 0) == 0) {
+      in.erase(0, 3);
+    } else if (in.rfind("./", 0) == 0) {
+      in.erase(0, 2);
+    } else if (in.rfind("/./", 0) == 0) {
+      in.replace(0, 3, "/");
+    } else if (in == "/.") {
+      in = "/";
+    } else if (in.rfind("/../", 0) == 0) {
+      in.replace(0, 4, "/");
+      drop_last_segment();
+    } else if (in == "/..") {
+      in = "/";
+      drop_last_segment();
+    } else if (in == "." || in == "..") {
+      in.clear();
+    } else {
+      const size_t next = in.find('/', in.front() == '/' ? 1 : 0);
+      if (next == std::string::npos) {
+        out += in;
+        in.clear();
+      } else {
+        out += in.substr(0, next);
+        in.erase(0, next);
+      }
+    }
+  }
+  return out;
 }
 
 // GET a JSON document from the hub. `repo_id` appears in every refusal, because
@@ -158,21 +151,11 @@ json ApiGet(const HfHubOptions& opts, const std::string& relative_path,
         "holds the repository.");
   }
 
-  const ParsedUrl url = ParseUrl(opts.endpoint);
+  const HfParsedUrl url = HfParseUrl(opts.endpoint, "HF_ENDPOINT");
 
-#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
-  if (url.scheme == "https") {
-    throw std::runtime_error(
-        "vllm.cpp: this build cannot speak HTTPS, so it cannot reach " +
-        opts.endpoint +
-        ". Rebuild with -DVLLM_CPP_HF_DOWNLOAD=ON and one of "
-        "-DVLLM_CPP_OPENSSL=ON (default, needs the OpenSSL development files) "
-        "or -DVLLM_CPP_BUILD_BORINGSSL=ON, or set HF_ENDPOINT to an http:// "
-        "mirror.");
-  }
-#endif
+  HfRefuseHttpsWithoutTls(opts.endpoint);
 
-  httplib::Client client(url.scheme + "://" + FormatHost(url.host) + ":" +
+  httplib::Client client(url.scheme + "://" + HfFormatHost(url.host) + ":" +
                          std::to_string(url.port));
   // NO `set_follow_location(true)`. httplib copies the whole request, headers
   // included, when it follows a redirect (third_party/httplib/httplib.h:7774)
@@ -253,6 +236,136 @@ std::vector<std::pair<std::string, std::string>> CollectRefs(const json& doc) {
 }
 
 }  // namespace
+
+HfParsedUrl HfParseUrl(const std::string& url, const std::string& role) {
+  HfParsedUrl parts;
+  const size_t scheme_end = url.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("vllm.cpp: " + role + " '" + url +
+                             "' has no scheme; expected http:// or https://");
+  }
+  parts.scheme = url.substr(0, scheme_end);
+  std::string rest = url.substr(scheme_end + 3);
+
+  const size_t slash = rest.find('/');
+  if (slash != std::string::npos) {
+    parts.host = rest.substr(0, slash);
+    parts.path = rest.substr(slash);
+  } else {
+    parts.host = rest;
+    parts.path = "/";
+  }
+
+  std::string port_text;
+  if (!parts.host.empty() && parts.host.front() == '[') {
+    const size_t close = parts.host.find(']');
+    if (close == std::string::npos) {
+      throw std::runtime_error("vllm.cpp: " + role + " '" + url +
+                               "' has an unterminated IPv6 host");
+    }
+    const std::string after = parts.host.substr(close + 1);
+    if (!after.empty() && after.front() == ':') port_text = after.substr(1);
+    parts.host = parts.host.substr(1, close - 1);
+  } else {
+    const size_t colon = parts.host.find(':');
+    if (colon != std::string::npos) {
+      port_text = parts.host.substr(colon + 1);
+      parts.host = parts.host.substr(0, colon);
+    }
+  }
+
+  if (!port_text.empty()) {
+    parts.port = std::stoi(port_text);
+  } else if (parts.scheme == "http") {
+    parts.port = 80;
+  } else if (parts.scheme == "https") {
+    parts.port = 443;
+  } else {
+    throw std::runtime_error("vllm.cpp: " + role + " '" + url +
+                             "' uses the unsupported scheme '" + parts.scheme +
+                             "'");
+  }
+  if (parts.host.empty()) {
+    throw std::runtime_error("vllm.cpp: " + role + " '" + url +
+                             "' has no host");
+  }
+  return parts;
+}
+
+std::string HfResolveUrl(const std::string& base, const std::string& location) {
+  // An absolute URL is already resolved. The scheme test is RFC 3986 section
+  // 3.1's grammar rather than a search for "://", so that a `Location` of
+  // `mailto:x` or a Windows-looking `c:/x` is not mistaken for a path.
+  if (HasScheme(location)) return location;
+
+  const size_t scheme_end = base.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("vllm.cpp: cannot resolve the redirect target '" +
+                             location + "' because the address that sent it, '" +
+                             base + "', is not absolute");
+  }
+  const std::string scheme = base.substr(0, scheme_end);
+  const size_t authority_start = scheme_end + 3;
+  size_t authority_end = base.find_first_of("/?#", authority_start);
+  if (authority_end == std::string::npos) authority_end = base.size();
+  // The authority is taken as TEXT rather than re-serialised from a parse, so
+  // an address that named no port keeps naming none and the address in a later
+  // refusal is the one the hub actually sent.
+  const std::string origin =
+      scheme + "://" + base.substr(authority_start, authority_end - authority_start);
+
+  if (location.empty()) return base;
+  // A network-path reference keeps the base's scheme and nothing else.
+  if (location.rfind("//", 0) == 0) return scheme + ":" + location;
+
+  const size_t location_split = location.find_first_of("?#");
+  const std::string location_path = location.substr(0, location_split);
+  const std::string location_tail =
+      location_split == std::string::npos ? std::string()
+                                          : location.substr(location_split);
+
+  // An absolute-path reference replaces the base's path outright. THE FORM
+  // huggingface.co SENDS.
+  if (location.front() == '/') {
+    return origin + RemoveDotSegments(location_path) + location_tail;
+  }
+
+  std::string base_path = base.substr(authority_end);
+  const size_t base_split = base_path.find_first_of("?#");
+  if (base_split != std::string::npos) base_path = base_path.substr(0, base_split);
+  if (base_path.empty()) base_path = "/";
+
+  // A reference with an empty path keeps the base's path and replaces only what
+  // it does carry, per RFC 3986 section 5.3's `defined(R.query)` arm.
+  if (location_path.empty()) return origin + base_path + location_tail;
+
+  // A relative-path reference is merged onto the base's DIRECTORY, which is the
+  // base path up to and including its last slash.
+  const size_t last_slash = base_path.rfind('/');
+  const std::string directory =
+      last_slash == std::string::npos ? std::string("/")
+                                      : base_path.substr(0, last_slash + 1);
+  return origin + RemoveDotSegments(directory + location_path) + location_tail;
+}
+
+std::string HfFormatHost(const std::string& host) {
+  return host.find(':') != std::string::npos ? "[" + host + "]" : host;
+}
+
+void HfRefuseHttpsWithoutTls(const std::string& url) {
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+  if (url.rfind("https://", 0) == 0) {
+    throw std::runtime_error(
+        "vllm.cpp: this build cannot speak HTTPS, so it cannot reach " + url +
+        ". Rebuild with -DVLLM_CPP_HF_DOWNLOAD=ON and one of "
+        "-DVLLM_CPP_OPENSSL=ON (default, needs the OpenSSL development files) "
+        "or -DVLLM_CPP_BUILD_BORINGSSL=ON, or set HF_ENDPOINT to an http:// "
+        "mirror.");
+  }
+#else
+  (void)url;
+#endif
+}
 
 bool IsValidHfRepoId(const std::string& repo_id) {
   // Mirrors llama.cpp `common/hf-cache.cpp:121-142 @ b10451`: base characters
@@ -541,4 +654,21 @@ std::string HubResolveCommitCached(const std::string& repo_id,
 }
 
 }  // namespace transformers_utils
+
+// The FETCHER half of the one-definition-rule instrument declared in
+// `include/vllm/http_transport_abi.h`. It is defined HERE, in the translation
+// unit that actually opens the hub connection, so the reading is that unit's
+// own and not a shared constant compiled once.
+HttpTransportAbi HubHttpTransportAbi() {
+  HttpTransportAbi abi;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  abi.tls = true;
+#else
+  abi.tls = false;
+#endif
+  abi.result_size = sizeof(httplib::Result);
+  abi.client_connection_size = sizeof(httplib::ClientConnection);
+  return abi;
+}
+
 }  // namespace vllm

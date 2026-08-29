@@ -9,7 +9,7 @@ next" without reading a superseded story first.
 Nothing here is load-bearing for live decisions. The current position is
 [NOW.md](../NOW.md), the binding numbers are
 [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md), per-capability state is
-[docs/STATUS.md](../../docs/STATUS.md), and the ordered portfolio is
+[docs/STATUS.md](../../README.md#project-status), and the ordered portfolio is
 [roadmap_v1.md](../roadmap_v1.md). Kept for audit: evidence is moved, never
 deleted.
 
@@ -497,4 +497,3 @@ nested `text_config`/`vision_config`/`quantization_config` descent, the 93-layer
 gate 6/6 (`kimi_k3{,_registry,_weights}.cpp`, `test_kimi_k3_scaffold.cpp`). MXFP4 / KDA delta /
 MoonViT-V2 correctly left NOT-YET-BUILDABLE (shared DeepSeek-V4 MXFP4 row, Kimi-Linear KDA row, W7).
 Row stays SPIKE. NEXT: W1 proxy primitive gate (shares the KDA kernel campaign).
-

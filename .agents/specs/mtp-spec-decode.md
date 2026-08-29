@@ -172,7 +172,7 @@ h = norm(h)                                          # -> lm_head (shared)
 - **NVFP4 gotcha** (`:86-103`): `mtp.fc` is stored BF16 but missing from the
   quant-config exclude list → vLLM forces `fc` unquantized when quant is
   `modelopt_fp4`. Our loader must treat ALL `mtp.*` as bf16-unquantized (our
-  27B loader already declares this: `qwen3_5_dense_weights.cpp:209`).
+  27B loader already declares this: `qwen3_5_dense_weights.cpp:210`).
 - Weight names remap `mtp.` → `model.` (`:282-295`); the draft's KV layer is
   registered as a NEW attention layer (index `num_hidden_layers`, i.e. layer
   64/40) → it gets its **own KV-cache layer** (draft layer names = all minus
@@ -343,6 +343,16 @@ the first-decode-step spec **padding** (placeholder `-1` drafts /
 lookup, the async draft-in-output path
 (`update_draft_token_ids_in_output`, `scheduler.py:1959`), and the
 structured-output grammar validation of proposed drafts.
+
+**2026-08-23 update:** the async draft-in-output path — and with it
+`num_spec_tokens_to_schedule` / `num_invalid_spec_tokens` and the
+AsyncScheduler's `-1` placeholder assignment — LANDED as `SPEC-DFLASH2` W7
+([spec-decode-async-scheduling.md](spec-decode-async-scheduling.md),
+[#1824](https://github.com/mudler/vllm.cpp/issues/1824)); the "configured
+speculator forces sync scheduling" line this section justified is retired
+for the Eagle-type family. The sync scheduler's first-decode-step padding
+(`pad_spec_decode`), the dynamic-SD lookup, and the grammar `validate_tokens`
+arm stay deferred.
 
 ## 3. GDN linear-state rollback — the mechanism (B5's hard problem, answered)
 

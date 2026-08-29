@@ -186,6 +186,19 @@ void LoadDenseLmHead(const TensorResolver& get,
                      const std::string& proj, OwnedTensor& bf16_out,
                      Nvfp4Weight& fp4_out);
 
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628). The ROUTING QUESTION `LoadDenseLmHead`
+// asks — "does this head take the packed arm?" — exported so a SECOND consumer
+// of the same head asks it rather than re-deriving it. `LoadDenseLmHead` is its
+// only other caller, so there is one predicate and not two descriptions of one.
+//
+// The second consumer is the DFlash/DSpark draft, which owns no head and runs
+// the TARGET's (`LoadDflashSharedLmHead`, qwen3_dflash.h). Its shared-head read
+// used to test the STORED DTYPE, which cannot separate a head that was
+// dequantized into something the target does not compute with from a head kept
+// packed and computed with natively.
+bool DenseLmHeadTakesNvfp4(const std::function<bool(const std::string&)>& has,
+                           const std::string& proj);
+
 // True when the checkpoint ships an EXPLICIT head under either naming
 // (`<proj>.weight`, or `<proj>.weight_packed` for compressed-tensors NVFP4);
 // false means `tie_word_embeddings`.
@@ -278,7 +291,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // the forward reads these weights now, so the remaining gap is the kernel and
 // not the wiring. Called from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, so the refusal lands before the first forward and
-// before any graph capture. Milestone M5 deletes it along with the gap.
+// before any graph capture. M5 (`489a9a4c0`) NARROWED this rather than deleting
+// it: the mainloop-scaled CUTLASS kernel covers `VT_CUTLASS_FP8_ARCHS` (12.0a,
+// 12.1a) only, so a CUDA arch outside that cell is still refused here by name.
 void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
                                           vt::DeviceType device);
 

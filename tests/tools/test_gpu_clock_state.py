@@ -16,24 +16,29 @@ ms/step across that pair.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 import tempfile
+import time
 import unittest
 
 from tools.bench.gpu_clock_state import (
     BENIGN_THROTTLE_MASK,
     CLOCK_TIME_TRANSFER,
+    MAX_CROSS_ARM_MEAN_OFFSET_PCT,
     MAX_CROSS_ARM_OFFSET_PCT,
     MAX_WITHIN_RUN_SPREAD_PCT,
     MIN_BUSY_FRACTION,
     MIN_BUSY_SAMPLES,
     build_clock_record,
+    build_spanned_clock_record,
     clock_reasons,
     compare_clock_records,
     merge_clock_records,
     parse_query_row,
     read_boot_id,
+    read_sample_stream,
     run_sampler,
     summarize_sm_clocks,
     validate_clock_record,
@@ -718,6 +723,495 @@ class ThresholdProvenanceTests(unittest.TestCase):
         self.assertGreaterEqual(MIN_BUSY_SAMPLES, 30 * 1)
         self.assertGreater(MIN_BUSY_FRACTION, 0.0)
         self.assertLessEqual(MIN_BUSY_FRACTION, 1.0)
+
+
+# n=155, median 2489 MHz, mean 2460.290323, spread 3.5757% -- UNDER the 5.0%
+# within-run ceiling, no throttle bit, well over MIN_BUSY_SAMPLES. Every existing
+# rule is silent on it, so the cases below measure the cross-arm mean term and
+# nothing else. The shape is the 2026-08-19 excursion population exaggerated
+# until it is worth more than a point of clock: the real legs read 0.12% to
+# 1.04%, and the three real pairings read 0.10 to 0.25 on the term.
+EXCURSION_WINDOW = [2489] * 105 + [2400] * 50
+EXCURSION_MEAN = 2460.290322580645
+EXCURSION_COST_PCT = 1.153462331030721
+# The same burden pointing UP instead of down. Median still 2489, spread still
+# 3.5757%, cost equal in magnitude and opposite in sign.
+LIFTED_WINDOW = [2489] * 105 + [2578] * 50
+FLAT_WINDOW = [2489] * 155
+
+
+def _uneven(values, *, boot_id=BOOT_GOOD, **kwargs):
+    """A record from a window taken VERBATIM, with no repetition to the floor.
+
+    `_record` repeats its pattern to clear `MIN_BUSY_SAMPLES`, which preserves
+    min, median and max -- and preserves the mean too, so it cannot express a
+    window whose excursion population is a specific FRACTION of the samples.
+    These windows are already 140 samples and over, and are used as written.
+    """
+
+    return build_clock_record(_samples(values, **kwargs), boot_id=boot_id)
+
+
+class CrossArmMeanTests(unittest.TestCase):
+    """The cross-arm rule bounded the two arms' MEDIANS and nothing else (#1546).
+
+    On the three recorded Qwen3.8-27B bf16 c1 pairings of 2026-08-19,
+    `median_offset_pct` reads exactly 0.0000% while the arms' MEAN clocks are
+    0.2521 / 0.1530 / 0.1035 points apart. The excursion population is 5.74% of
+    samples and sits almost entirely below the median -- 95 of the 97 labelled
+    samples -- so a median over 155 to 246 samples steps straight over the one
+    part of the distribution that does NOT cancel between the arms. Throughput
+    is an integral over the window, so the mean is what transfers.
+
+    Argument, thresholds, and the two statistics this one was chosen over:
+    `.agents/specs/clock-cross-arm-mean.md`.
+    """
+
+    def test_a_burden_both_arms_pay_cancels_out_of_the_ratio(self) -> None:
+        """The control, and the case that keeps this a CROSS-ARM term.
+
+        Each arm carries a 1.1535% excursion burden -- above the ceiling on its
+        own -- and the term is silent, because a burden both arms pay divides
+        out of the ratio. Bounding the burden per arm is a DIFFERENT rule
+        (Route B's `MAX_EXCURSION_MEAN_COST_PCT`, unimplemented under #1354) and
+        must not be smuggled in here.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(EXCURSION_WINDOW)
+        )
+        self.assertEqual(comparison["reasons"], [])
+        self.assertAlmostEqual(comparison["median_offset_pct"], 0.0)
+        self.assertAlmostEqual(comparison["mean_offset_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["ours_mean_cost_pct"], EXCURSION_COST_PCT, places=9
+        )
+        self.assertAlmostEqual(
+            comparison["vllm_mean_cost_pct"], EXCURSION_COST_PCT, places=9
+        )
+        self.assertAlmostEqual(comparison["excursion_burden_difference_pct"], 0.0)
+
+    def test_a_burden_only_one_arm_pays_refuses_at_a_zero_median_offset(self) -> None:
+        """The defect, in one pairing.
+
+        Identical medians, identical hardware, one boot, both windows inside
+        every existing rule -- and the arms ran 1.15% apart on the mean. Before
+        this term nothing in the module read that quantity, so the pairing
+        compared CLEAN.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(FLAT_WINDOW)
+        )
+        self.assertAlmostEqual(comparison["median_offset_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["mean_offset_pct"], -EXCURSION_COST_PCT, places=9
+        )
+        self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+        reason = comparison["reasons"][0]
+        self.assertIn("MEAN SM clocks", reason)
+        self.assertIn(str(MAX_CROSS_ARM_MEAN_OFFSET_PCT), reason)
+        self.assertIn("ours", reason)
+        self.assertIn("vllm", reason)
+
+    def test_opposing_burdens_add_although_their_magnitudes_cancel(self) -> None:
+        """Why the statistic is the mean OFFSET and not a difference of burdens.
+
+        #1546 quotes the arms' mean-clock COST, which is an absolute value. Here
+        both arms carry 1.1535% of it, so the difference of the two magnitudes
+        is exactly 0.0000 -- and the arms' mean clocks are 2.28% apart, because
+        an upward excursion on one arm and a downward one on the other ADD. A
+        gate on the difference of burdens passes this pairing.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(LIFTED_WINDOW)
+        )
+        self.assertAlmostEqual(comparison["median_offset_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["excursion_burden_difference_pct"], 0.0, places=9
+        )
+        self.assertAlmostEqual(comparison["mean_offset_pct"], -2.280619, places=5)
+        self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+        self.assertIn("MEAN SM clocks", comparison["reasons"][0])
+
+    def test_a_compensating_pair_is_the_median_rules_and_not_this_ones(self) -> None:
+        """And why it is not the SIGNED difference of burdens either.
+
+        This GPU sits in two boost states 26 MHz apart, 2515 and 2489, which are
+        91.07% of the 1690 retained busy samples of 2026-08-19. Two arms half in
+        each, whose medians snap to different states, have a signed cost
+        difference of 1.0325 points -- and IDENTICAL mean clocks, so nothing
+        transfers at all. The existing MEDIAN rule refuses this pairing at
+        1.0338%, and this term must stay silent on it.
+        """
+
+        comparison = compare_clock_records(
+            _uneven([2489] * 78 + [2515] * 77), _uneven([2489] * 77 + [2515] * 78)
+        )
+        self.assertAlmostEqual(comparison["median_offset_pct"], -1.033797, places=5)
+        self.assertLess(abs(comparison["mean_offset_pct"]), 0.01)
+        self.assertAlmostEqual(
+            comparison["ours_mean_cost_pct"] - comparison["vllm_mean_cost_pct"],
+            -1.0325,
+            places=3,
+        )
+        self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+        self.assertIn("median SM-clock offset", comparison["reasons"][0])
+        self.assertNotIn("MEAN SM clocks", comparison["reasons"][0])
+
+    def test_a_record_without_a_mean_refuses_and_names_the_arm(self) -> None:
+        """Unknown is not absence or success.
+
+        Every record written before this term lacks the field, including the
+        nine archived 2026-08-19 windows. Skipping the term on those is the
+        absent hook that looks like an armed instrument, so the record is
+        refused and the reason names the field, the arm, and why.
+        """
+
+        for arm, label in ((0, "ours"), (1, "vllm")):
+            with self.subTest(arm=label):
+                records = [_uneven(FLAT_WINDOW), _uneven(FLAT_WINDOW)]
+                records[arm]["sm_clock_mhz"].pop("mean")
+                comparison = compare_clock_records(*records)
+                self.assertEqual(len(comparison["reasons"]), 1, comparison["reasons"])
+                reason = comparison["reasons"][0]
+                self.assertIn(label, reason)
+                self.assertIn("mean", reason)
+                self.assertIn("predates", reason)
+                self.assertIsNone(comparison["mean_offset_pct"])
+
+    def test_the_merged_mean_is_sample_count_weighted(self) -> None:
+        """An arm's mean is over its whole retained busy series, not per leg.
+
+        The legs differ in length in every recorded campaign -- 155 / 155 / 156
+        at c1 and 245 / 246 / 244 at c8 -- so an unweighted mean of leg means is
+        the wrong number. Here it would be 2444.5 against the true 2463.5714.
+        """
+
+        merged = merge_clock_records([_uneven([2489] * 100), _uneven([2400] * 40)])
+        self.assertEqual(merged["sm_clock_mhz"]["n"], 140)
+        self.assertAlmostEqual(merged["sm_clock_mhz"]["mean"], 2463.5714285714284)
+        self.assertNotAlmostEqual(merged["sm_clock_mhz"]["mean"], 2444.5)
+
+    def test_a_leg_without_a_mean_leaves_the_arm_without_one(self) -> None:
+        """The fold propagates the absence rather than papering over it."""
+
+        legs = [_uneven([2489] * 100), _uneven([2400] * 40)]
+        legs[1]["sm_clock_mhz"].pop("mean")
+        merged = merge_clock_records(legs)
+        self.assertNotIn("mean", merged["sm_clock_mhz"])
+
+    def test_the_means_and_burdens_are_surfaced_next_to_the_ratio(self) -> None:
+        """Reported, and reported PER ARM.
+
+        A refusal that says only "1.15% apart" leaves the reader unable to see
+        which arm's excursion population carried it, which is the whole content
+        of the finding this term encodes.
+        """
+
+        comparison = compare_clock_records(
+            _uneven(EXCURSION_WINDOW), _uneven(FLAT_WINDOW)
+        )
+        self.assertAlmostEqual(comparison["ours_mean_sm_mhz"], EXCURSION_MEAN)
+        self.assertAlmostEqual(comparison["vllm_mean_sm_mhz"], 2489.0)
+        self.assertAlmostEqual(
+            comparison["ours_mean_cost_pct"], EXCURSION_COST_PCT, places=9
+        )
+        self.assertAlmostEqual(comparison["vllm_mean_cost_pct"], 0.0)
+        self.assertAlmostEqual(
+            comparison["excursion_burden_difference_pct"],
+            EXCURSION_COST_PCT,
+            places=9,
+        )
+
+    def test_on_a_flat_window_the_two_cross_arm_terms_coincide(self) -> None:
+        """Which is what makes every pre-existing fixture behave identically.
+
+        Mean equals median on a flat window, so the new term scores exactly what
+        the old one scores, inclusive boundary included. The 2026-08-15 pinned
+        capture -- flat 2184 MHz over n=861 -- is that shape.
+        """
+
+        inside = compare_clock_records(_record([2020] * 3), _record([2000] * 3))
+        self.assertAlmostEqual(inside["mean_offset_pct"], inside["median_offset_pct"])
+        self.assertAlmostEqual(inside["mean_offset_pct"], 1.0)
+        self.assertEqual(inside["reasons"], [])
+        outside = compare_clock_records(_record([2021] * 3), _record([2000] * 3))
+        self.assertAlmostEqual(outside["mean_offset_pct"], outside["median_offset_pct"])
+        self.assertEqual(len(outside["reasons"]), 2, outside["reasons"])
+
+    def test_the_ceiling_is_the_one_the_median_rule_already_carries(self) -> None:
+        """No new number: the same physics ceiling, the same forward criterion.
+
+        A 1.0% mean offset implies at most 1.0% of the ratio, because the
+        transfer is bounded above by one point of kernel time per point of
+        clock, and 1.0 is under the 2.97% smallest deficit this harness has been
+        used to rank. Pinning the equality means a later edit that loosens one
+        of the two cross-arm terms without the other has to say so.
+        """
+
+        self.assertEqual(MAX_CROSS_ARM_MEAN_OFFSET_PCT, MAX_CROSS_ARM_OFFSET_PCT)
+
+
+# --------------------------------------------------------------------------
+# RESTRICTING A WINDOW TO THE SPANS THAT DID THE WORK (#1671).
+#
+# `MIN_BUSY_FRACTION` asks that the retained window DESCRIBE the measured work.
+# A driver that samples across a whole process lifetime does not satisfy it by
+# accident: the DFlash2 our-arm run of 2026-08-22 sampled 3222 seconds, of which
+# 93 were warm generation, and the floor refused it at 18.37% busy. The refusal
+# was right, so the repair cannot be to the floor. It is to the WINDOW: the
+# driver hands over the spans the work actually ran in, and the record is built
+# from the samples inside them.
+#
+# Nothing below relaxes a rule. Every threshold still applies, to a smaller and
+# truer set of samples, and three cases here exist to prove that a span cannot
+# be used to buy a pass.
+# --------------------------------------------------------------------------
+
+#: One second apart, which is the sampler's own default interval.
+_EPOCH = 1_755_000_000.0
+
+
+def _stream(count, *, busy_from=0, start=_EPOCH, step=1.0):
+    """`count` samples one `step` apart, idle until `busy_from`.
+
+    Shaped like the run this exists for: a long idle head (four `vllm-cli`
+    processes reading a 52 GiB checkpoint off CIFS) followed by the generation
+    the number is folded from.
+    """
+
+    samples = []
+    for index in range(count):
+        sample = _samples([2470], utilization=97 if index >= busy_from else 0)[0]
+        stamp = dt.datetime.fromtimestamp(start + index * step, dt.timezone.utc)
+        sample["timestamp_utc"] = stamp.isoformat()
+        sample["elapsed_s"] = index * step
+        samples.append(sample)
+    return samples
+
+
+class SpannedWindowTests(unittest.TestCase):
+    def test_the_whole_stream_FAILS_the_busy_floor_and_the_spans_do_not(self) -> None:
+        """The #1671 shape, both verdicts in one case.
+
+        Without this pair the repair could be read as a threshold change. The
+        SAME samples and the SAME `clock_reasons` produce both verdicts; only
+        the window differs.
+        """
+
+        stream = _stream(120, busy_from=80)
+        whole = build_clock_record(stream, boot_id=BOOT_GOOD)
+        reasons = clock_reasons(whole, label="ours")
+        self.assertTrue(
+            any("below the 50% floor" in reason for reason in reasons), reasons
+        )
+
+        spanned = build_spanned_clock_record(
+            stream, [(_EPOCH + 80.0, _EPOCH + 119.0)], boot_id=BOOT_GOOD
+        )
+        self.assertEqual(clock_reasons(spanned, label="ours"), [])
+        self.assertEqual(spanned["sm_clock_mhz"]["n"], 40)
+        self.assertEqual(spanned["idle_samples_excluded"], 0)
+
+    def test_a_span_the_gpu_was_IDLE_through_is_still_refused(self) -> None:
+        """A span is not a licence. The floor holds inside it."""
+
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH, _EPOCH + 79.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("idle", str(raised.exception))
+
+    def test_a_span_TOO_SHORT_to_observe_still_fails_the_count_floor(self) -> None:
+        """`MIN_BUSY_SAMPLES` is what stops a one-sample window scoring 0.00%."""
+
+        stream = _stream(120, busy_from=80)
+        spanned = build_spanned_clock_record(
+            stream, [(_EPOCH + 80.0, _EPOCH + 84.0)], boot_id=BOOT_GOOD
+        )
+        self.assertEqual(spanned["sm_clock_mhz"]["n"], 5)
+        reasons = clock_reasons(spanned, label="ours")
+        self.assertTrue(
+            any(f"below the {MIN_BUSY_SAMPLES} floor" in reason for reason in reasons),
+            reasons,
+        )
+
+    def test_NO_span_is_a_refusal_and_never_the_whole_window(self) -> None:
+        """The one silent failure that would make this a laxer gate.
+
+        A driver whose markers did not parse hands over an empty list. Falling
+        back to the whole stream would restore exactly the window #1671 refused,
+        under a record that CLAIMS to be spanned.
+        """
+
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(stream, [], boot_id=BOOT_GOOD)
+        self.assertIn("no span", str(raised.exception))
+
+    def test_a_span_that_ENDS_BEFORE_it_starts_is_a_refusal(self) -> None:
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH + 100.0, _EPOCH + 90.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("ends before it starts", str(raised.exception))
+
+    def test_a_span_that_RETAINED_NOTHING_names_what_it_asked_for(self) -> None:
+        """A span outside the stream is a driver defect, not a fast window."""
+
+        stream = _stream(120, busy_from=80)
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH + 500.0, _EPOCH + 600.0)], boot_id=BOOT_GOOD
+            )
+        message = str(raised.exception)
+        self.assertIn("retained none", message)
+        self.assertIn("120", message)
+
+    def test_the_record_SAYS_what_it_kept_and_what_it_dropped(self) -> None:
+        stream = _stream(120, busy_from=80)
+        spanned = build_spanned_clock_record(
+            stream,
+            [(_EPOCH + 80.0, _EPOCH + 89.0), (_EPOCH + 100.0, _EPOCH + 119.0)],
+            boot_id=BOOT_GOOD,
+        )
+        window = spanned["window"]
+        self.assertEqual(window["stream_samples"], 120)
+        self.assertEqual(window["retained_samples"], 30)
+        self.assertEqual(window["spans"], 2)
+        self.assertAlmostEqual(window["spanned_s"], 9.0 + 19.0, places=9)
+        # And it still validates as an ordinary record, so every downstream
+        # rule -- merge, compare, the pairing block -- reads it unchanged.
+        validate_clock_record(spanned, label="ours")
+
+    def test_a_sample_with_NO_timestamp_cannot_be_placed_in_a_span(self) -> None:
+        stream = _stream(40, busy_from=0)
+        del stream[7]["timestamp_utc"]
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH, _EPOCH + 39.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("timestamp_utc", str(raised.exception))
+
+    def test_a_NAIVE_timestamp_is_a_refusal_because_an_unknown_zone_is_not_UTC(
+        self,
+    ) -> None:
+        """`elapsed_s` and a local stamp both look plausible and both misplace.
+
+        The sampler writes an aware stamp. A record that silently accepted a
+        naive one would shift every span by the host's offset, which on this
+        fleet is a whole hour of a window nobody would notice was wrong.
+        """
+
+        stream = _stream(40, busy_from=0)
+        stream[3]["timestamp_utc"] = "2026-08-22T13:04:05.123456"
+        with self.assertRaises(HarnessError) as raised:
+            build_spanned_clock_record(
+                stream, [(_EPOCH, _EPOCH + 39.0)], boot_id=BOOT_GOOD
+            )
+        self.assertIn("time zone", str(raised.exception))
+
+    def test_the_sampler_s_OWN_stream_reads_back(self) -> None:
+        """The producer is `run_sampler`, so the reader is held to its format.
+
+        A hand-written fixture would pass while the two disagreed. This writes
+        the stream the way the sampler writes it and reads it the way the arm
+        reads it.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "clock-ours-samples.jsonl"
+            stream = _stream(40, busy_from=0)
+            path.write_text(
+                "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in stream),
+                encoding="utf-8",
+            )
+            read = read_sample_stream(path)
+            self.assertEqual(len(read), 40)
+            spanned = build_spanned_clock_record(
+                read, [(_EPOCH, _EPOCH + 39.0)], boot_id=BOOT_GOOD
+            )
+            self.assertEqual(spanned["sm_clock_mhz"]["n"], 40)
+
+    def test_a_TAIL_still_being_written_is_dropped_and_nothing_else_is(self) -> None:
+        """The arm reads the file while the sampler is still appending to it.
+
+        Refusing the partial tail would end a two-hour leased run on the newest
+        sample in the file, which is after the last leg and outside every span.
+        A hole in the MIDDLE is a different thing and still refuses.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "clock-ours-samples.jsonl"
+            whole = "".join(
+                json.dumps(s, sort_keys=True) + "\n" for s in _stream(4, busy_from=0)
+            )
+            path.write_text(whole + '{"sm_clock_mhz": 24', encoding="utf-8")
+            self.assertEqual(len(read_sample_stream(path)), 4)
+
+            path.write_text(
+                whole.replace(whole.splitlines()[1], '{"sm_clock', 1) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(HarnessError) as raised:
+                read_sample_stream(path)
+            self.assertIn("line 2", str(raised.exception))
+
+    def test_the_REAL_sampler_s_stream_spans_against_a_REAL_wall_clock(self) -> None:
+        """Producer and consumer in one case, with neither side hand-written.
+
+        Every other case here supplies the stream itself, so the two would agree
+        on a `timestamp_utc` shape the sampler does not write. `run_sampler` is
+        the producer, `time.time()` is the base a marking driver reads, and the
+        span below is taken across the sampler's own run.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = pathlib.Path(raw)
+            stub = directory / "nvidia-smi-stub"
+            stub.write_text(
+                "#!/bin/sh\necho '0, NVIDIA GB10, 580.159.03, 2470, 3003, 2418, "
+                "0x0000000000000000, Enabled, 97'\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            boot = directory / "boot_id"
+            boot.write_text(BOOT_GOOD + "\n", encoding="utf-8")
+            opened = time.time()
+            run_sampler(
+                samples_output=directory / "r1.samples.jsonl",
+                summary_output=directory / "r1.summary.json",
+                interval_s=0.001,
+                max_duration_s=1.0,
+                smi=str(stub),
+                boot_id_path=boot,
+            )
+            closed = time.time()
+            stream = read_sample_stream(directory / "r1.samples.jsonl")
+            spanned = build_spanned_clock_record(
+                stream, [(opened, closed)], boot_id=BOOT_GOOD
+            )
+            # EVERY sample the sampler wrote is inside the window it ran in. A
+            # timestamp the reader mis-parses lands outside and drops out here.
+            self.assertEqual(spanned["window"]["retained_samples"], len(stream))
+            self.assertEqual(clock_reasons(spanned, label="ours"), [])
+            # And a span that ENDS before the sampler started retains nothing.
+            with self.assertRaises(HarnessError):
+                build_spanned_clock_record(
+                    stream, [(opened - 600.0, opened - 300.0)], boot_id=BOOT_GOOD
+                )
+
+    def test_a_stream_that_is_ONLY_a_partial_tail_is_still_a_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "clock-ours-samples.jsonl"
+            path.write_text('{"sm_clock_mhz": 24', encoding="utf-8")
+            with self.assertRaises(HarnessError) as raised:
+                read_sample_stream(path)
+            self.assertIn("holds no sample", str(raised.exception))
 
 
 if __name__ == "__main__":

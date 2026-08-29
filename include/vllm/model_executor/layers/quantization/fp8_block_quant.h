@@ -31,11 +31,11 @@
 // `[128, 128]` `dynamic` checkpoint now LOADS, and only the shapes and schemes
 // nothing here can execute are still refused.
 //
-// SCOPE. Reading the config and refusing what M3 does not cover. The loader
-// rung lives in `qwen3_5_dense_weights.cpp`, the weight in
-// `models/qwen3_5_weights.h`, and the linear method does not exist yet — #1189
-// milestone M4 owns it, and `PrepareQwen3_5Dense` refuses a loaded-but-unread
-// block weight by name rather than letting the forward produce a number.
+// SCOPE. Reading the config and refusing what this file does not cover. The
+// loader rung lives in `qwen3_5_dense_weights.cpp` and the weight in
+// `models/qwen3_5_weights.h`. The linear method landed in #1189 milestone M4
+// (`281b4bc76`), so `PrepareQwen3_5Dense` no longer refuses a loaded-but-unread
+// block weight: it refuses a device with no block-scaled GEMM.
 #pragma once
 
 #include "vt/device.h"  // vt::DeviceType
@@ -59,8 +59,9 @@ struct Fp8BlockQuantConfig {
   // `dynamic` whenever `block_quant` is true; the reader refuses anything else.
   std::string activation_scheme;
   // `modules_to_not_convert`, or `ignored_layers` when the checkpoint spells it
-  // that way. `Qwen/Qwen3.8-27B-FP8` ships ~400 entries here, which is why the
-  // loader reads this list rather than inferring exclusion from a dtype probe.
+  // that way. `Qwen/Qwen3.8-27B-FP8` @`017b9c7a` ships 882 entries here, 636 of
+  // them outside the vision tower, which is why the loader reads this list
+  // rather than inferring exclusion from a dtype probe (#1614).
   std::vector<std::string> modules_to_not_convert;
 
   // Exact-membership test on the MODULE prefix — the tensor name with its

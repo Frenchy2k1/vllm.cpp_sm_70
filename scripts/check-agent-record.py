@@ -130,7 +130,23 @@ MATRICES = {
     # vllm#51255, still being patched), carries no pinned-registry target, and
     # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
     # because two rows EXIST, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 377),
+    # 378 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
+    # forward: +1 for `MODEL-MM-qwen4-exp-qwen4-exp-for-conditional-generation`
+    # (`Qwen4ExpForConditionalGeneration`, `Qwen/Qwen3.8-Flash-Next`), landing
+    # `READY` with its spec committed (#1978). ONE row and not two: the MTP head
+    # is a `mtp` block inside the same text config, not a separately registered
+    # architecture, so this is not the IndexTTS-2.5 / dots3-note shape that moved
+    # this pin by two. Beyond-pin in the strongest sense yet recorded here -- the
+    # Muse Glimmer, Qwen3.5-text-only and dots3-note entries above are all
+    # architectures vLLM registers on `main` AFTER `555967922`, whereas this one
+    # vLLM does not implement at ANY revision: read live 2026-08-26 at
+    # `origin/main` = `6a5e8f5979`, there is no `qwen4*` path, no `registry.py`
+    # entry, and a repository-wide search for `qwen4` returns zero results. Its
+    # Upstream cell therefore carries no pinned module/class target and its
+    # algorithm source is transformers#48337, so the at-the-pin static invariants
+    # (324/373/356/310/261) are UNCHANGED. Bumped because one row EXISTS, never to
+    # make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 378),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -283,7 +299,71 @@ MATRICES = {
     # of rank-1 factors) rather than how one step is tiled, and it adds three cache
     # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
     # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
+    # 53 since 2026-08-19 (#1314): +`KERNEL-DFLASH2-GROUPED-CONV`, the DFlash2
+    # draft's grouped DYNAMIC depthwise convolution. A genuinely new family and
+    # not a variant of `KERNEL-DEPTHWISE-CONV1D`, on all three axes that decide
+    # a kernel's shape: the weights are DYNAMIC (a per-position delta projected
+    # from the sublayer input, added to a static per-channel base) rather than
+    # static, they are GROUPED (one delta per group of channels against one base
+    # per channel) rather than per-channel, and the tap mask is over the QUERY
+    # BLOCK (`i mod (1+k)`) rather than causal over the sequence. It also carries
+    # a SIDE axis no other convolution here has: one projection of the sublayer
+    # input produces both the prepare-side and the finish-side coefficients.
+    # Bumped because the row EXISTS, never to make a state transition pass; the
+    # row is `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # (spec `## Owed` O6, no `nvcc` on the authoring host).
+    # 54 since 2026-08-20 (#1007): +`KERNEL-CONV3D`, the general 3-D convolution
+    # `vt` had on NO device. It is not a variant of `KERNEL-CPU-CONV2D-SUBSAMPLE`:
+    # the ACCUMULATION ORDER differs and is part of the contract (one f32 partial
+    # per input channel with the bias seeded first, against kConv2d's single flat
+    # accumulator with the bias last), which is the same sibling relationship
+    # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
+    # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
+    # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
+    # 56 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
+    # +`KERNEL-TOPK-PAIRS`, the DFlash2 candidate selector's two kernels. TWO
+    # rows and not one because they are two kernels with different shapes and
+    # different gates: the first is a small dense contraction over two
+    # per-token codebooks, whose difficulty is the PREDECESSOR indexing (step 0
+    # is the verified anchor, every later step is the previous step's candidate)
+    # and the bf16 ROUNDING PLACEMENT; the second is a sort-free selection over a
+    # 248320 vocabulary, whose difficulty is the TIE-BREAK, because the
+    # pivot-bracket search converges to an exact array VALUE and therefore keeps
+    # whole tie groups. `KERNEL-TOPK-PAIRS` is also a distinct family from the
+    # shipped sampling threshold search rather than a variant of it: that kernel
+    # masks below the k-th largest IN PLACE and returns no indices, this one
+    # compacts the survivors, orders them and emits (id, value) pairs. Bumped
+    # because the rows EXIST, never to make a state transition pass; both are
+    # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
+    # (spec `## Owed` O10, no `nvcc` on the authoring host).
+    # 57 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-PATH-WALK`, the DFlash2
+    # candidate selector's PATH WALK. A separate family from
+    # `KERNEL-DFLASH2-SELECTOR-EDGES` rather than a second entry point into it,
+    # on the axis that decides kernel families here: the lattice op is a dense
+    # CONTRACTION whose difficulty is a reduction (and which is therefore gated
+    # within an f32 envelope), while the walk performs no arithmetic at all --
+    # only comparisons and one gather -- and is specified BIT-EXACT across
+    # backends. Their grids follow from that: one block per (request, step,
+    # predecessor slot) against one block per REQUEST with the step loop INSIDE
+    # it, which is spec `## Risks/decisions` D3's requirement and upstream's own
+    # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
+    # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
+    # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
+    # 58 since 2026-08-25 (#1451): +`KERNEL-LTX2-VAE`, the ten stages of the
+    # LTX-2.5 conv video VAE decode that sit BETWEEN its convolutions, as one
+    # `vt::OpId::kLtx2Vae` provider payload. A separate family from
+    # `KERNEL-CONV3D` rather than more entries on it, on the same axis that
+    # separates the rows above: `KERNEL-CONV3D` is a dense CONTRACTION whose
+    # difficulty is a reduction and whose accumulation order is its contract,
+    # while these ten are elementwise affines, normalisations and pure GATHERS
+    # whose contract is an index expression -- and the two are gated differently
+    # in consequence, the convolution against an independent scalar reference and
+    # these against the committed decode goldens they were transcribed from.
+    # Bumped because the row EXISTS, never to make a state transition pass; it is
+    # `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # anywhere in this project's reach (spec `## Owed`, inheriting #1452) and
+    # because `AttnBlock3d` remains the declared staged remainder.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 58),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -335,7 +415,11 @@ MATRICES = {
      # row decomposing the host-free decode forward (R1 RmsNorm+RoPE, R2
      # QkvSplit+RAC, R3 PA decode, R4 capture wire) that the trace-runner
      # spike revealed as the real prerequisite for decode capture.
-    "BACKEND": (AGENTS / "backend-matrix.md", 85),
+     # 86 since 2026-08-22: +`BACKEND-TENSTORRENT-GDN` (#1715), the GDN
+     # linear-attention op chain as native TT kernels — the hard prerequisite
+     # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
+     # implementation yet.
+    "BACKEND": (AGENTS / "backend-matrix.md", 87),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -610,8 +694,79 @@ ENGINE_PREFIXES = (
 # implementation, `model_loader.cpp:279-303`, reads an existing cache for the
 # DFlash draft alone and never downloads. `READY`, spec
 # `specs/hf-model-download.md`, issue #1280.
+# 168 since 2026-08-19: +`SPEC-BPE-QUADRATIC-MERGE` (the BPE merge loop is O(n^2)
+# in pretoken length, on the request path, before `ValidatePromptLen`). Genuinely
+# new and not expressible by the two tokenizer rows beside it: `LOAD-HF-BPE` and
+# `LOAD-SENTENCEPIECE` both own a FORMAT -- which `tokenizer.json` shapes parse and
+# which token identifiers come out -- and both are token-exact against HF goldens
+# today and stay that way. This row changes no identifier at all. It replaces the
+# algorithm underneath both of them, and its gate is a COST bound, which is the one
+# thing a token gate provably cannot see. It is also not a benchmark row: the encode
+# runs synchronously on the HTTP worker five lines before the only length check, so
+# `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
+# MEASURED, and stated as the two SESSION-INVARIANT quantities only: over 1 KB to
+# 64 KB of ordinary English prose the fit through the committed Mistral golden has
+# exponent 2.01, and at 64 KB our cost is 2,507x HF `tokenizers` 0.22.2's on the
+# same file for byte-identical identifiers. Both are ratios taken inside one
+# session, so contention cancels. The ABSOLUTE milliseconds are deliberately not
+# repeated here: they moved 54% between two runs of one binary on one input, so a
+# constant copied into this comment would be a fourth place for a number nobody
+# can reproduce to drift. They live in the spec's tables, each beside its own load
+# average, and `## Gates` owes the idle-host re-measure. The exponent, not the
+# constant, is what makes this a row.
+# `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
+# 169 since 2026-08-21: +`SPEC-DRAFTER-CHAIN` (a preference-ordered chain of
+# speculators: try the first, and if it yields no draft for a sequence, try the
+# next). Genuinely new and not expressible by the per-method rows beside it: each
+# of `SPEC-MTP`, `SPEC-DFLASH`, `SPEC-DSPARK` and `SPEC-NGRAM` owns ONE
+# speculator's mechanism, and every one of them assumes it is the only speculator
+# resolved for a step. This row owns the composition -- a new optional field on
+# `--speculative-config` that is inert when absent, per-sequence resolution, and
+# the per-drafter attribution none of those rows has any reason to carry. vLLM
+# implements no composition at all (`SpeculativeMethod` is a single `Literal` at
+# the pin AND at `origin/main` `c20572610`), so this is a DIVERGENCE with
+# llama.cpp as a secondary oracle for semantics only, not a port. `READY`, spec
+# `specs/drafter-chain.md`, issue #1522.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 167
+# 170 since 2026-08-22: +`SERVE-REQUEST-LENGTH-GUARD` (the REFUSING byte bound at
+# the request boundary, #1541). A genuinely-new serving capability rather than a
+# state move: `67823aee2` removed the quadratic term from the BPE merge loop and
+# added no bound, and nothing between an unauthenticated body and the tokenizer
+# limited its size except httplib's 100 MB default. `GATING`, spec
+# `specs/serve-request-length-guard.md`. Bumped for a real new row, never to make
+# a failing state transition pass.
+# 171 since 2026-08-24: +`ENG-UPSTREAM-LTX2-PIN` (pin `Lightricks/LTX-2`, the
+# LTX-2.5 lane's actual reference and a third repository, #1433). A genuinely-new
+# row rather than a state move: the oracle registry named nine upstreams and this
+# lane's own was not one of them, so `check-oracle-pins.py` reported
+# `oracle-pins ok (9 oracles pinned)` while the repository every LTX anchor
+# resolves in had no file, no table row and no pin. `READY`, spec
+# `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
+# state transition pass.
+# 172 since 2026-08-25: +`KV-DSV4-MULTICACHE` (DeepSeek-V4's real KV topology,
+# #1925). A genuinely-new row rather than a state move: no KV-* row and no
+# DeepSeek-V4 row owned the cache topology, `MODEL-TEXT-deepseek-v4-...` promises
+# "paged attention/KV" in its scope string while both its forwards discard
+# `attn_kv`, and the work was tracked only as prose calling itself
+# multi-Spark-blocked. `READY`, spec `specs/kv-dsv4-multicache.md`. Bumped for a
+# real new row, never to make a failing state transition pass.
+# 173 since 2026-08-26: +`ENG-POOL-BEST-FIT` (the shared device scratch pool
+# could only hand a freed block back to a request in the block's OWN size class,
+# so retention was a function of how many distinct shapes the traffic had shown
+# rather than of how much one step concurrently needs, #1922). A genuinely-new
+# row rather than a state move: `POOL-DEVICE-KEY` is `DONE` and owned the pool's
+# DEVICE key, nothing owned its REUSE policy, and no engine row covered
+# per-request memory growth at all. `ACTIVE`, spec
+# `specs/pool-best-fit-retention.md`.
+#
+# 172 AND 173 ARE THE SAME NIGHT, and the pair is why this is 173 and not 172.
+# #1925 and #1922 each added ONE engine row and each bumped this pin 171 -> 172
+# on its own branch, so the two sides carry an IDENTICAL `ENGINE_ROWS = 172`
+# line. A three-way merge sees no conflict on that line and keeps 172, which
+# counts one of the two new rows and silently drops the other. The counter is
+# the union, so it is 173. Bumped for real new rows, never to make a failing
+# state transition pass.
+ENGINE_ROWS = 173
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

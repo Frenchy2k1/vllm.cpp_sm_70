@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include "vllm/config/multimodal.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
@@ -34,6 +35,10 @@ struct ForwardLogits;
 struct TensorParallel;
 struct GdnStateCache;
 struct PagedKvCache;
+// One owned host tensor (qwen3_5_weights.h). Forward-declared for the same
+// reason every other weights type here is: `LoadedModel::shared_embed_tokens`
+// hands out a BORROWED pointer to one and never needs its layout (#1946).
+struct OwnedTensor;
 struct Qwen3_5DenseWeights;
 struct Qwen3_5MoeWeights;
 // SPEC-MTP I5d-pre: the checkpoint-owned MTP draft weights, the drafter's
@@ -99,6 +104,25 @@ struct ModelSource {
   // Non-owning queue selected by the entrypoint. Dense plain-BF16 loaders may
   // stage completed layers here and the runner then reuses the same queue.
   vt::Queue* load_queue = nullptr;
+  // ENG-MM-INPUT-PIPELINE wave L3 (#607): the engine's multimodal input limits,
+  // BORROWED for the duration of one load. A loader that owns a tower asks
+  // `SkipTowerForModalities` (models/interfaces.h, the mirror of
+  // interfaces.py:293) whether to read that tower's tensors at all.
+  //
+  // Upstream reaches the same value through `vllm_config.model_config
+  // .multimodal_config` inside the model's own `__init__`. Our loader seam
+  // (ModelWeightLoader below) carries no vllm_config, and ModelSource is
+  // already the per-load CONTEXT rather than only the checkpoint — `load_queue`
+  // beside it is an engine-selected execution resource, not a property of the
+  // file — so this is where the borrow belongs. The two alternatives are
+  // recorded in specs/multimodal-track.md §1.5 L3 with the reason each was
+  // rejected: a third ModelWeightLoader parameter rewrites every architecture's
+  // signature to thread a value nearly all of them ignore, and a process-global
+  // (WeightOffloader's shape) has no upstream analogue for this config.
+  //
+  // NULL means "no limits configured for this load": load everything, which is
+  // byte-identical to pre-L3 and is what every non-engine caller gets.
+  const MultiModalConfig* multimodal = nullptr;
 };
 
 struct ModelFactory;
@@ -119,6 +143,20 @@ class LoadedModel {
   // Runtime capability rather than architecture metadata: GGUF/synthetic
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
+
+  // ENG-MM-INPUT-PIPELINE wave L3 (#607): the mirror of
+  // `SupportsMultiModal._tower_model_names` (interfaces.py:141,298) together
+  // with the `stage_name` each skipped stage carries (`:279-282`). The stage
+  // names of the towers this model CONSTRUCTED WITHOUT LOADING because every
+  // modality they serve had limit 0 — upstream's
+  // `isinstance(model.visual, StageMissingLayer)`, expressed on a type-erased
+  // base.
+  //
+  // EMPTY on every text model, and on every multimodal model loaded with a
+  // non-zero limit. It exists so the skip is observable from a PRODUCTION entry
+  // point (LoadedEngine::skipped_towers) rather than only by downcasting to a
+  // concrete model class inside a test.
+  virtual std::vector<std::string> skipped_towers() const { return {}; }
 
   // ARCH-ONE-SURFACE ROW 6: the model-owned Pooler of a POOLING model — the
   // mirror of upstream `VllmModelForPooling.pooler` (as_embedding_model wires
@@ -151,6 +189,39 @@ class LoadedModel {
   // which has no tap, and the engine threw on the first propose. Default false;
   // the Qwen3.5/3.6 dense + MoE forwards override it.
   virtual bool supports_aux_multi_tap() const { return false; }
+
+  // This target's embedding table, for a block drafter that SHARES it rather
+  // than owning one (#1946).
+  //
+  // WHY THE BASE CARRIES THIS. A DFlash/DFlash2 draft ships no embed_tokens; it
+  // runs the target's table over its own hidden states, which is why upstream
+  // rebinds the MODULE by reference — `del draft_inner.embed_tokens;
+  // draft_inner.embed_tokens = target_embed`
+  // (vllm/v1/worker/gpu/spec_decode/dflash/utils.py:64-74 @ b389ac29465b33f9e9c534df221ea3c129e9793f).
+  // Our loader read the target's tensor a SECOND time into the draft's own
+  // OwnedTensor instead, and `ResidentWeight` caches its device upload on the
+  // OwnedTensor (dense_attn_block.h `if (!w.d_dev)`), so the 27B's BF16
+  // [248320, 5120] table — 2,542,796,800 B — was uploaded twice. On GB10 a
+  // device allocation IS host RAM, so that is 2.543 GB the KV pool cannot have.
+  //
+  // Null on every model that has no table to lend, which is every default. The
+  // two Qwen3.5/3.6 forwards override it, and they are exactly the targets the
+  // DFlash loader admits (it refuses anything without `supports_aux_multi_tap`
+  // by name). BORROWED: it points into the model's own weights, so a holder must
+  // not outlive them — which is why LoadedEngine declares `model_` ahead of
+  // `dflash_draft_`.
+  //
+  // "THE MODEL'S OWN WEIGHTS" IS NOT ALWAYS THE MODEL'S OWN STORAGE, and the
+  // ordering argument above only covers the case where it is. A model built
+  // through a `BorrowedWeightsTag` constructor (qwen3_5_dense.cpp,
+  // qwen3_5_moe.cpp; reached from GPUModelRunner's borrowing constructors,
+  // src/vllm/v1/worker/gpu/runner.cpp) points at weights some CALLER owns, and
+  // outliving the LoadedModel then says nothing about outliving the table. No
+  // path constructs a DFlash draft over a borrowed target today — the engine
+  // owns its model — so this is a constraint on a future caller rather than a
+  // live defect: a borrowing target must keep its weights alive for as long as
+  // any draft rebound onto them.
+  virtual const OwnedTensor* shared_embed_tokens() const { return nullptr; }
 
   // Retain the checkpoint's loaded `mtp.*` draft weights (the 15/19 BF16 tensors
   // LoadQwen3_5MTP produced) inside the concrete model so the draft can be built

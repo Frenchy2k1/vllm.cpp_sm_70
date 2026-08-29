@@ -12,8 +12,10 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,6 +23,8 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+#include "vllm/http_transport_abi.h"
+#include "vllm/entrypoints/chat_template.h"  // ChatTemplateError -> HTTP 400
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -53,6 +57,15 @@ size_t HttpWorkerCount(size_t max_concurrent_streams,
 
 }  // namespace
 
+// The listener type this server constructs, named ONCE so that
+// `vllm::ApiServerListenerIsTls()` below and the member two dozen lines down
+// cannot disagree. The same `CPPHTTPLIB_OPENSSL_SUPPORT` define that gives the
+// HuggingFace fetcher `https` also makes `httplib::SSLServer` compilable, and
+// ENG-HF-MODEL-DOWNLOAD W5 deliberately does NOT enable a listener: that is a
+// separate decision with its own certificate, key, flags and documentation.
+// Changing this alias changes the listener AND the reported value together.
+using ApiServerListener = httplib::Server;
+
 // Opaque httplib::Server (pimpl — keeps httplib.h out of api_server.h).
 struct ApiServer::Impl {
   Impl(size_t max_concurrent_streams, HttpWorkerPoolMode mode)
@@ -80,7 +93,7 @@ struct ApiServer::Impl {
     server.set_tcp_nodelay(true);
   }
 
-  httplib::Server server;
+  ApiServerListener server;
   size_t http_worker_count;
   // The legacy LLMEngine serving constructors remain for small synthetic
   // tests and embedding compatibility. Unlike AsyncLLM, that engine is driven
@@ -144,6 +157,75 @@ ApiServer::~ApiServer() {
   }
 }
 
+// ── SERVE-REQUEST-LENGTH-GUARD (#1541) ──────────────────────────────────────
+// A REFUSING byte bound at the request boundary, checked BEFORE any
+// tokenization. Its two constraints come from
+// .agents/specs/bpe-quadratic-merge.md `## Defence in depth`:
+//
+//   1. It refuses and NEVER truncates. Shortening a prompt returns model output
+//      for text the caller did not send.
+//   2. It is here, at the boundary, and not in
+//      vllm::v1::InputProcessor::ValidatePromptLen, which needs the token count
+//      the expensive step produces and so cannot run before that step.
+//
+// vLLM HAS NO EQUIVALENT for a prompt BYTE bound, and this is checked rather
+// than assumed at pin 555967922:
+//   - vllm/entrypoints/openai/cli_args.py:292-294 `h11_max_incomplete_event_size`
+//     (default 4 MB, vllm/entrypoints/serve/utils/constants.py:9) is an h11
+//     PARSER limit. Its own docstring says "header or body", but h11 applies it
+//     to the undrained receive buffer only (h11/_connection.py:485, whose
+//     comment reads "431 is Request header fields too large which is pretty
+//     much the only situation where we can get here"), so a body is not bounded
+//     by it.
+//   - vllm/entrypoints/openai/completion/protocol.py:536-553
+//     `validate_prompt_list_length` bounds the COUNT of prompts in a list
+//     (VLLM_MAX_COMPLETION_PROMPTS, default 1024, vllm/envs.py:110), not their
+//     bytes. It is the REGISTER this refusal mirrors: refused during request
+//     validation, ahead of the router, with the limit named in the message.
+//   - vllm/entrypoints/speech_to_text/base/utils.py:38-46
+//     `read_upload_with_limit` IS a refusing byte bound at the request boundary
+//     (VLLM_MAX_AUDIO_CLIP_FILESIZE_MB, default 25, vllm/envs.py:79) -- on the
+//     audio-upload surface, not on a text prompt.
+// So the shape is mirrored and the number is ours, which is why it is derived
+// below rather than picked.
+std::optional<ApiServer::DispatchResult> ApiServer::refuse_oversized_prompt(
+    size_t prompt_bytes) const {
+  if (max_prompt_bytes_ == 0 || prompt_bytes <= max_prompt_bytes_) {
+    return std::nullopt;
+  }
+  return MakeError(
+      400, "BadRequestError",
+      "prompt length " + std::to_string(prompt_bytes) +
+          " bytes exceeds the maximum allowed prompt length of " +
+          std::to_string(max_prompt_bytes_) + " bytes (max_model_len " +
+          std::to_string(max_model_len_) + " x " +
+          std::to_string(max_token_bytes_) +
+          " bytes, the longest token in this tokenizer's vocabulary). A prompt "
+          "this long cannot fit in " +
+          std::to_string(max_model_len_) +
+          " tokens, so it is refused here rather than tokenized first. The "
+          "request is refused, not truncated.");
+}
+
+void ApiServer::set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
+                              int64_t max_model_len) {
+  tokenizer_ = tokenizer;
+  max_model_len_ = max_model_len;
+  // The bound is exactly `max_model_len * MaxTokenBytes()` -- see
+  // max_prompt_bytes(). Unset (0 == unbounded) whenever either factor is
+  // unknown, and clamped rather than wrapped on the overflow a hostile
+  // max_model_len could otherwise produce.
+  max_token_bytes_ = tokenizer != nullptr ? tokenizer->MaxTokenBytes() : 0;
+  if (tokenizer == nullptr || max_model_len <= 0 || max_token_bytes_ == 0) {
+    max_prompt_bytes_ = 0;
+    return;
+  }
+  const size_t len = static_cast<size_t>(max_model_len);
+  max_prompt_bytes_ = len > std::numeric_limits<size_t>::max() / max_token_bytes_
+                          ? std::numeric_limits<size_t>::max()
+                          : len * max_token_bytes_;
+}
+
 ApiServer::DispatchResult ApiServer::handle_completions(
     const std::string& request_body) {
   if (completion_ == nullptr) {
@@ -169,6 +251,15 @@ ApiServer::DispatchResult ApiServer::handle_completions(
   } catch (const std::exception& e) {
     return MakeError(400, "BadRequestError",
                      std::string("Invalid request: ") + e.what());
+  }
+  // SERVE-REQUEST-LENGTH-GUARD (#1541): before check_model and before the
+  // encode inside create_completion. Ahead of the model lookup because the
+  // bound is a property of the REQUEST, which is where vLLM decides its own
+  // analogue too -- validate_prompt_list_length is a pydantic model_validator
+  // (completion/protocol.py:536), so it runs at body validation, ahead of the
+  // router's check_model.
+  if (auto refusal = refuse_oversized_prompt(request.prompt.size())) {
+    return *refusal;
   }
   if (!models_.check_model(request.model)) {
     return MakeError(404, "NotFoundError",
@@ -237,6 +328,20 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     return MakeError(400, "BadRequestError",
                      std::string("Invalid request: ") + e.what());
   }
+  // SERVE-REQUEST-LENGTH-GUARD (#1541). The measured quantity is the SUM of the
+  // message texts, because that is what the chat template concatenates into the
+  // one prompt the tokenizer then sees. `content` carries the joined text spans
+  // even when the wire form was a content-part ARRAY (protocol.h ChatMessage),
+  // so inline base64 media -- which lives in `content_parts`, is never
+  // tokenized as text, and would make a raw body-byte bound refuse legitimate
+  // multimodal requests -- is correctly not counted here.
+  size_t prompt_bytes = 0;
+  for (const ChatMessage& m : request.messages) {
+    if (m.content.has_value()) prompt_bytes += m.content->size();
+  }
+  if (auto refusal = refuse_oversized_prompt(prompt_bytes)) {
+    return *refusal;
+  }
   if (!models_.check_model(request.model)) {
     return MakeError(404, "NotFoundError",
                      "The model `" + request.model.value_or("") +
@@ -251,6 +356,18 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     result = chat_->create_chat_completion(request);
   } catch (const vllm::v1::InputValidationError& e) {
     // Same mapping as /v1/completions above (error_response.py:62-65).
+    LogRequestError("", "/v1/chat/completions", e.what());
+    return MakeError(400, "BadRequestError", e.what());
+  } catch (const vllm::entrypoints::ChatTemplateError& e) {
+    // A render failure is a CLIENT error, because the conversation and the
+    // chat_template_kwargs that reached the template are the request's. Upstream
+    // reaches 400 twice over: safe_apply_chat_template wraps ANY exception out
+    // of apply_chat_template into a ValueError (vllm/renderers/hf.py:785-789 @
+    // 555967922), and create_error_response maps ValueError/TypeError
+    // (error_response.py:48-52) AND jinja2.TemplateError and its subclasses
+    // (error_response.py:61-65) to BadRequestError. Without this arm the render
+    // fell through to the generic 500 below, and /tokenize -- which already
+    // answers 400 for the identical body -- disagreed with this endpoint.
     LogRequestError("", "/v1/chat/completions", e.what());
     return MakeError(400, "BadRequestError", e.what());
   } catch (const std::exception& e) {
@@ -744,7 +861,16 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
                          "tokenize: the chat form needs the chat template of a "
                          "text-generation server (transcription-only server)");
       }
-      prompt = chat_->prompt_fn()(messages, render_generation_prompt, tools);
+      // chat_template_kwargs: the tokenize chat form carries it too
+      // (serve/tokenize/protocol.py:97,138), and it must render through the
+      // same kwargs create_chat_completion would use or the two disagree.
+      nlohmann::ordered_json template_kwargs = nlohmann::ordered_json::object();
+      if (auto it = body.find("chat_template_kwargs");
+          it != body.end() && it->is_object()) {
+        template_kwargs = nlohmann::ordered_json::parse(it->dump());
+      }
+      prompt = chat_->prompt_fn()(messages, render_generation_prompt, tools,
+                                  template_kwargs);
     } catch (const std::exception& e) {
       return MakeError(400, "BadRequestError",
                        std::string("Chat template render failed: ") + e.what());
@@ -759,6 +885,15 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
     add_special_tokens = body.value("add_special_tokens", true);
   }
 
+  // SERVE-REQUEST-LENGTH-GUARD (#1541). THE surface this row exists for:
+  // /tokenize needs no engine and no model, and there is no authentication
+  // anywhere in src/vllm/entrypoints/, so an anonymous caller reaches the
+  // tokenizer here more cheaply than anywhere else. Measured on the FINAL
+  // prompt, after the chat form's template render, because that string is
+  // exactly what the encode below is handed.
+  if (auto refusal = refuse_oversized_prompt(prompt.size())) {
+    return *refusal;
+  }
   std::vector<int32_t> ids = add_special_tokens
                                  ? tokenizer_->EncodeWithSpecialTokens(prompt)
                                  : tokenizer_->Encode(prompt);
@@ -1270,3 +1405,30 @@ void ConfigureUtilityEndpoints(ApiServer& server,
 }
 
 }  // namespace vllm::entrypoints::openai
+
+namespace vllm {
+
+// The SERVER half of the one-definition-rule instrument declared in
+// `include/vllm/http_transport_abi.h`. It is defined HERE, in the translation
+// unit that owns the listener, so the reading is that unit's own.
+HttpTransportAbi ApiServerHttpTransportAbi() {
+  HttpTransportAbi abi;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+  abi.tls = true;
+#else
+  abi.tls = false;
+#endif
+  abi.result_size = sizeof(httplib::Result);
+  abi.client_connection_size = sizeof(httplib::ClientConnection);
+  return abi;
+}
+
+// Read from the TYPE of the listener this file constructs, not from a constant
+// beside it, so replacing that member with `httplib::SSLServer` flips this to
+// true and the case that asserts it false turns red.
+bool ApiServerListenerIsTls() {
+  return !std::is_same_v<entrypoints::openai::ApiServerListener,
+                         httplib::Server>;
+}
+
+}  // namespace vllm

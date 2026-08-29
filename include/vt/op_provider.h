@@ -145,8 +145,24 @@ void* GetOp(OpId op, DeviceType device);
 // forwards to it. This is the second fallback axis of the tactic registry
 // (`ArchTacticLaunchFn` returning false) expressed where a shape is actually
 // visible — inside the kernel — which is what keeps the ~70 op entry points
-// edit-free. Counted in `OpProviderStats::declines`. Throws if nothing is below.
+// edit-free. Counts ONE decline in `OpProviderStats::declines` -- including a
+// decline that finds nothing below it and throws. Throws if nothing is below.
 void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider);
+
+// The same resolution, counting NOTHING. Exists for exactly one shape: a
+// SHAPE-GATED provider that declines on the hot path and therefore hoists the
+// lookup into a function-local static, then counts each decline with
+// `NoteOpDecline`. Hoisting a COUNTING resolver silently hoists the accounting
+// with it, and the static's one-time initialisation then adds a second
+// increment to the first decline of the process -- which is what this header
+// used to prescribe, and what
+// [#1584](https://github.com/mudler/vllm.cpp/issues/1584) measured.
+//
+// Reach for it only WITH `NoteOpDecline` beside it. A caller that uses it and
+// counts nothing reports a forwarded call as a served one, and no gate in this
+// tree can see the difference. `GetOpFallback` stays the ordinary spelling and
+// stays correct by default; this one is the opt-out and says so in its name.
+void* GetOpFallbackUncounted(OpId op, DeviceType device, const char* declining_provider);
 
 // Non-throwing probes. `OpRegistered` keeps its exact prior meaning: is ANY
 // kernel realized for (op, device) — the fused-recipe fast-realization ladder
@@ -177,10 +193,13 @@ OpProviderStats GetOpProviderStats(OpId op, DeviceType device);
 void EnableOpProviderCallStats(bool on);
 // Counts one decline WITHOUT re-resolving the fallback. `GetOpFallback` walks the
 // provider stack and re-reads device caps, which is fine when declines are rare
-// but not when a SHAPE-GATED provider declines on the hot path — a decode run
-// declines ~21,500 times. Such a provider caches the fallback pointer once and
-// calls this per decline, so `OpProviderStats::declines` stays exact while the
-// lookup cost disappears.
+// but not when a SHAPE-GATED provider declines on the hot path -- a decode run
+// declines ~21,500 times. Such a provider caches `GetOpFallbackUncounted` once
+// and calls this per decline, and `OpProviderStats::declines` is then exact from
+// the FIRST decline while the lookup cost disappears. Pairing it with the
+// COUNTING `GetOpFallback` instead is the #1584 defect: the count reads N+1 over
+// N declines, and a routing gate asserting an exact count then passes or fails
+// on whether something else in the same binary already warmed the static.
 void NoteOpDecline(OpId op, DeviceType device);
 
 void ResetOpProviderStats(OpId op, DeviceType device);
@@ -203,11 +222,19 @@ bool OpProviderDisabled(const char* name);
 // provider on a UNIFIED-MEMORY device, so an op the device lacks a native kernel
 // for falls back to the CPU reference instead of throwing.
 //
-// SAFETY (the load-bearing invariant). A CPU kernel dereferences host pointers.
-// That is correct ONLY where host and device memory alias (Metal StorageMode-
-// Shared, GB10 / integrated Vulkan, CPU) — `Backend::UnifiedMemory()`. On a
-// DISCRETE GPU a CPU kernel reading a device pointer is memory corruption, so the
-// tier is gated on the unified-memory property, never on DeviceType blindly.
+// SAFETY (the load-bearing invariant). A CPU kernel dereferences the pointers it
+// is given. That is correct ONLY where the HOST MAY DEREFERENCE what
+// `Backend::Alloc` returned — `Backend::DeviceMemoryIsHostAddressable()`. The
+// tier is gated on that property, never on DeviceType blindly.
+//
+// IT IS NOT `Backend::UnifiedMemory()`, and the difference is two crashes
+// (#844, #1435). Unified memory says host and device address the same physical
+// RAM; it does NOT say a device allocation is host-dereferenceable. CUDA on GB10
+// reports unified memory and allocates with `cudaMalloc`, which the host may not
+// touch, so gating on the wide property ran host kernels over device pointers
+// and the process took SIGSEGV under a banner claiming a correct fallback.
+// include/vt/backend.h carries the same distinction beside the narrow predicate,
+// including why its default is `false`.
 //
 // DETERMINISM / no-change-on-native. The fallback registers at
 // kReferenceTierPriority (strictly below every native kernel's priority >= 0), so
@@ -220,8 +247,9 @@ inline constexpr int kReferenceTierPriority = -1000;  // strictly below any nati
 
 // THE SAFETY GATE. True iff `device` may host the CPU reference tier: it is not
 // the CPU source device itself, a backend is registered for it, and that backend
-// reports UnifiedMemory() == true. Consulted at registration time; a device that
-// answers false NEVER gets a CPU fallback installed.
+// reports DeviceMemoryIsHostAddressable() == true. Consulted at registration
+// time; a device that answers false NEVER gets a CPU fallback installed, and
+// GetOp refuses it by name instead, naming which precondition it failed.
 bool ReferenceTierEligible(DeviceType device);
 
 // Eagerly install the reference tier for `target`: for every op that has a CPU

@@ -8,22 +8,26 @@
 #ifndef VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 #define VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 
+#include <algorithm>  // std::find — skipped_towers() dedup (#607 L3)
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 kVisionTowerStageName
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_vl_vision.h"  // LOAD-GGUF-MMPROJ tower
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft bundle
 #include "vllm/tokenizer/tokenizer.h"
@@ -65,6 +69,43 @@ struct DflashDraft {
   vllm::HfConfig config;
   int k = 0;
 };
+
+// REBIND the draft's embedding lookup onto the TARGET's table, so the two share
+// one OwnedTensor and therefore one device upload (#1946).
+//
+// THE DEFECT. The draft owns no table; the loader read the target's a second
+// time into `draft.weights.embed_tokens`. `ResidentWeight` caches its
+// host->device upload on the OwnedTensor (the `if (!w.d_dev)` guard in
+// `include/vllm/model_executor/models/dense_attn_block.h::ResidentWeight`),
+// so two tensors are two allocations of identical
+// bytes no matter how the HOST bytes are shared — which is why W9's (#1849)
+// borrow-first host read did not close this. On the 27B that is BF16
+// [248320, 5120] = 2,542,796,800 B held twice, out of GB10's unified pool.
+//
+// UPSTREAM does the same rebind by reference, at
+// vllm/v1/worker/gpu/spec_decode/dflash/utils.py:64-74 @
+// b389ac29465b33f9e9c534df221ea3c129e9793f: `del draft_inner.embed_tokens;
+// draft_inner.embed_tokens = target_embed`. `_should_share`
+// (eagle/utils.py:12-25 @ the same head) shares UNCONDITIONALLY when the draft
+// declares no own table, which is this lane, and only compares bytes when it
+// does. So no byte comparison here either — provenance already says these are
+// the same tensor of the same file, and comparing 2.5 GB at load would fault in
+// every page of a table the load has otherwise never read.
+//
+// WHAT IT REFUSES TO BIND, and why the check is not decorative. A GGUF target
+// may KEEP its table F16 in place (`LoadEmbedAndHead`'s kKeepF16 arm) while the
+// draft's shared read always produces BF16. Those are different bytes and must
+// never be aliased, so a dtype/rank/shape disagreement leaves both tables
+// standing — today's behaviour, correct tokens, no dedup — and says so on
+// stderr rather than failing the load. A DSpark draft is skipped outright: its
+// backbone owns its table by value and is a separate lane.
+//
+// EXPORTED, not file-local, for the reason W9 gave when it exported
+// `LoadDflashSharedEmbedBf16`: a deletion mutation can remove this lever
+// silently, so the gate has to reach the exact function production calls.
+// Returns true when it rebound. Called from the ONE LoadedEngine constructor
+// that every draft loader funnels into.
+bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target);
 
 // vLLM CacheConfig.gpu_memory_utilization's own default (vllm/config/cache.py:68
 // @ 555967922). Named because EngineParams carries the knob as an optional, so
@@ -108,6 +149,19 @@ struct EngineParams {
   // count directly and IGNORES gpu_memory_utilization, mirroring vLLM
   // CacheConfig.kv_cache_memory_bytes (cache.py:182,189).
   int64_t kv_cache_memory_bytes = 0;
+  // KV-cache STORAGE dtype, mirroring vLLM CacheConfig.cache_dtype
+  // (config/cache.py:19-36,76) and its `--kv-cache-dtype` flag. "auto" (the
+  // default) uses the model dtype and is byte-identical to before this field
+  // existed; "fp8"/"fp8_e4m3" stores 1-byte fp8 K/V, which HALVES the bytes per
+  // KV block and therefore doubles the pool at a fixed --kv-cache-memory.
+  //
+  // TWO-STAGE, exactly as upstream. `FromModelDir` RESOLVES this string once
+  // against the checkpoint's own `kv_cache_quant_algo` before anything reads it
+  // (`vllm::ResolveKvCacheDTypeString`, mirroring `arg_utils.py:1915-1918`), so
+  // every consumer downstream sees an already-resolved value and "auto" there
+  // means "nothing declared it either". An explicit value is never overridden by
+  // the checkpoint (`torch_utils.py:380-381`).
+  std::string kv_cache_dtype = "auto";
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
   // max concurrent sequences. vLLM's default is 1024 (EngineArgs.max_num_seqs);
   // ours was 8, which put c8 EXACTLY on the batch ceiling so the 8th stream
@@ -226,6 +280,32 @@ struct EngineParams {
   // byte-identical tp1. Threaded to the runner's per-rank lane construction;
   // N>1 is refused loudly (G1) until the per-rank forward (W5) lands.
   int tensor_parallel_size = 1;
+
+  // ── The SECOND GGUF file: a `clip` multimodal projector (row
+  // `LOAD-GGUF-MMPROJ`, issue #821) ─────────────────────────────────────────
+  //
+  // A GGUF multimodal model ships as TWO files, and until this field existed
+  // the projector had nowhere to arrive: `ModelSource` carries a VECTOR of
+  // safetensors shards and exactly one `GgufFile*`, and `GgufFile::Open`'s
+  // shard merge (`DetectSplit`) is about shards of ONE split, not a second,
+  // differently-architected file.
+  //
+  // The spelling is llama.cpp's user-facing one (`--mmproj`), because that is
+  // the flag every user of these artifacts already types, and it is EXPLICIT on
+  // purpose. Auto-discovery of a sibling `mmproj*.gguf` is deliberately NOT
+  // implemented: a directory holding two unrelated models would then silently
+  // fuse them, and the failure would be a wrong-shaped model rather than an
+  // error.
+  //
+  // Empty (the default) is byte-identical to the pre-row behaviour: no second
+  // file is opened and no vision tower is built. NON-EMPTY against anything
+  // that is not a `.gguf` FILE is REFUSED BY NAME, not ignored: a safetensors
+  // checkpoint carries its vision tower in its own shards, so accepting the
+  // flag there and dropping it would load a tower the user did not ask for and
+  // silently discard the one they named. The refusal fires in `FromModelDir`
+  // before any path or config I/O, and its message begins `--mmproj: a
+  // multimodal projector attaches to a .gguf language file`.
+  std::string mmproj_path;
 };
 
 // The shared queue-selection seam used by every LoadedEngine construction
@@ -294,6 +374,27 @@ class LoadedEngine {
                tok::Tokenizer tokenizer, const EngineParams& params,
                std::optional<Qwen3_5MTPWeights> mtp_weights = std::nullopt);
 
+  // SPEC-DFLASH2 W3 (#1314): the DFLASH counterpart of the `mtp_weights`
+  // overload above, and it exists for the identical reason that one gives. A
+  // caller holding weights in memory had no way to supply a DFlash/DFlash2
+  // draft, so `dflash_draft_` was null on every synthetic engine, the runner's
+  // `set_dflash_draft` was never called, and `propose_drafts_block` -- the
+  // PRODUCTION site where the grouped convolution, the candidate selector and
+  // the refusal all live -- was unreachable from any test in this repository.
+  // That is what spec `## Owed` O5 and O7 record for W1 and W2: their production
+  // call sites were mutation-proven UNGATED, and the stated reason was that a
+  // gate would need an on-disk target plus draft driven through the loader. It
+  // does not: it needs this overload, which is the same seam FromModelDir uses
+  // (it builds a DflashDraft and hands it to the private constructor below).
+  //
+  // The draft is loaded by the CALLER, exactly as `mtp_weights` is, and
+  // everything downstream -- ResolveSpecConfig, the aux-multi-tap refusal, the
+  // set_dflash_draft wiring, the whole propose loop -- is the production code
+  // path unchanged.
+  LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               std::unique_ptr<DflashDraft> dflash_draft);
+
   LoadedEngine(const LoadedEngine&) = delete;
   LoadedEngine& operator=(const LoadedEngine&) = delete;
   LoadedEngine(LoadedEngine&&) = delete;
@@ -302,8 +403,49 @@ class LoadedEngine {
   // Load config.json + tokenizer.json + *.safetensors from `model_dir` and build
   // the stack. Throws std::runtime_error on any load failure (bad path, missing
   // shards, unparseable config).
-  static std::unique_ptr<LoadedEngine> FromModelDir(const std::string& model_dir,
-                                                    const EngineParams& params);
+  //
+  // KV-FP8 W3: this is where `params.kv_cache_dtype` is RESOLVED against the
+  // checkpoint's own `kv_cache_quant_algo` (mirroring `arg_utils.py:1915-1918`);
+  // the direct constructors below take the field verbatim because they are
+  // handed in-memory weights and have no checkpoint directory to ask.
+  static std::unique_ptr<LoadedEngine> FromModelDir(
+      const std::string& model_dir, const EngineParams& params_in);
+
+  // ── The `clip` mmproj vision tower (row `LOAD-GGUF-MMPROJ`, issue #821) ───
+  //
+  // Non-null exactly when `EngineParams::mmproj_path` named a loadable
+  // `qwen3vl_merger` projector beside a `.gguf` language file AND at least one
+  // of {image, video} was above limit 0. Since #607 L3 a perfectly loadable
+  // projector under `--language-model-only`, or under
+  // `--limit-mm-per-prompt '{"image":0,"video":0}'`, leaves this NULL: the read
+  // is what the skip removes. Null therefore no longer distinguishes "no
+  // projector was named" from "the projector was deliberately not read" —
+  // `mmproj_tower_skipped_` is what carries that difference, and it is why the
+  // flag exists (model_loader.cpp, the `SkipTowerForModalities` guard).
+  //
+  // The tower is
+  // host-side f32, the shared `multimodal::Qwen3VLVisionWeights` that
+  // `multimodal::Qwen3VLVisionForward` consumes and that the safetensors
+  // reader (`LoadQwen3VLVisionWeights`) and the MiniMax-H3 encoder reader
+  // (`LoadQwen3VLVisionFromGguf`) also fill.
+  //
+  // It lives on the ENGINE rather than inside an architecture's weights struct
+  // because that is where the tower already lives on the safetensors side —
+  // `LoadQwen3_5MoeVision` is a separate reader over the same shards, and no
+  // `Qwen3_5*Weights` has a vision member — and because the projector is a
+  // separate FILE the engine was handed, not part of the model checkpoint.
+  const multimodal::Qwen3VLVisionWeights* vision_tower() const {
+    return vision_tower_.has_value() ? &*vision_tower_ : nullptr;
+  }
+  // The geometry read from the projector's own `clip.*` metadata. Populated
+  // whenever a projector file was named and accepted, INCLUDING the zero-limit
+  // load that leaves `vision_tower()` null: `ClipMmprojVisionConfig` runs above
+  // the skip, which is the construct half of construct-without-initialise and
+  // is what lets a refusal still name what is missing. Default-constructed, and
+  // meaningless, only when no `--mmproj` was given or the file was refused.
+  const multimodal::Qwen3VLVisionConfig& vision_config() const {
+    return vision_config_;
+  }
 
   // Resolve the per-step token budget (max_num_batched_tokens) for chunked
   // prefill. An explicit EngineParams override wins; otherwise a PER-ARCH
@@ -341,6 +483,26 @@ class LoadedEngine {
                                 const HfConfig& config,
                                 const vllm::v1::KVCacheConfig& kv_cfg,
                                 int block_size);
+  // The serving `max_num_seqs`, resolved AGAINST the recurrent-state budget the
+  // KV pool affords (issue #1983). `max_num_seqs` sizes no allocation anywhere
+  // in vLLM; here it multiplied the GDN state pool
+  // (`gdn_state_slots_ = max_num_reqs * (num_spec + 1)`, one conv and one SSM
+  // buffer per GDN layer, zeroed at construction) on an axis no memory flag
+  // bounded. Upstream unifies the mamba page with the attention page and draws
+  // both from ONE budgeted pool, so its recurrent allocation is a function of
+  // available memory and never of the concurrency cap; this resolves the same
+  // property through `vllm::v1::ComputeHybridKvBudget`.
+  //
+  // Attention-only models and pure-recurrent models both pass the configured
+  // value through unchanged (the budget reports `kStateSeqsUnbounded`), so every
+  // non-hybrid engine is byte-identical to before this existed. A reduction is
+  // LOGGED, never silent, and never refuses: refusing belongs to the #371 state
+  // guard, which still runs afterwards against this resolved value.
+  //
+  // Exposed, like the two resolvers above, so the policy is gateable without a
+  // disk load.
+  static int ResolveMaxNumSeqs(const EngineParams& params,
+                               const vllm::v1::KVCacheConfig& kv_cfg);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
   // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
@@ -371,6 +533,27 @@ class LoadedEngine {
   // differently. It outlives every consumer that borrows it (declared before
   // input_processor_), which is what lets the OpenAI chat seam hold a reference.
   const vllm::MultiModalConfig& mm_config() const { return mm_config_; }
+  // #607 L3, the TOWER SKIP made observable from a production entry point. The
+  // stage names of the towers this engine's model constructed WITHOUT loading,
+  // because every modality they serve was at limit 0 — upstream's
+  // `_tower_model_names` + `StageMissingLayer(stage_name, ...)`
+  // (interfaces.py:141,279-282,298). EMPTY on every text model and on every
+  // multimodal model loaded with a non-zero limit, so a caller can tell
+  // "--language-model-only actually freed the tower" from "the flag was
+  // accepted and did nothing", which is the distinction L2 could not make.
+  // The `--mmproj` projector is NOT part of `model_` — it is a second file the
+  // engine was handed — so its skip is added here rather than inside the model.
+  // Deduplicated: both would report the same stage name, and a caller counting
+  // freed towers must not see one tower twice.
+  std::vector<std::string> skipped_towers() const {
+    std::vector<std::string> names = model_->skipped_towers();
+    if (mmproj_tower_skipped_) {
+      const std::string stage(vllm::kVisionTowerStageName);
+      if (std::find(names.begin(), names.end(), stage) == names.end())
+        names.push_back(stage);
+    }
+    return names;
+  }
   // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
   // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
   // this — text-generation refuses on a pooling engine (naming vllm_embed /
@@ -393,6 +576,15 @@ class LoadedEngine {
   // the enablement gate can assert the C-ABI/C++/flag toggle took effect.
   bool jump_forward_enabled() const { return jump_forward_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
+  // KV-FP8 W3: the RESOLVED KV-cache config — the block count the sizing knobs
+  // produced and the group specs carrying the storage dtype `--kv-cache-dtype`
+  // selected. Exposed so a gate reads what the loader actually sized instead of
+  // re-deriving the arithmetic it is supposed to be checking.
+  const vllm::v1::KVCacheConfig& kv_cache_config() const { return kv_cfg_; }
+  // The RESOLVED serving concurrency: `--max-num-seqs` after the recurrent-state
+  // budget clamp (issue #1983). Equal to the configured value on every
+  // attention-only model.
+  int max_num_seqs() const { return max_num_seqs_; }
 
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
   // none was configured. Exposed so the output-invariance gate can read the
@@ -426,10 +618,15 @@ class LoadedEngine {
   // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
   // `is_pooling_model` (ARCH-ONE-SURFACE ROW 6) resolves async OFF for pooling
   // models (mirror of vllm/config/vllm.py:1068-1073); default false is the
-  // byte-identical text path.
+  // byte-identical text path. `spec_decode_incompatible` (SPEC-DFLASH2 W7,
+  // #1824) resolves async OFF for a speculative method upstream refuses
+  // (vllm/config/vllm.py:1076-1087 — anything outside the Eagle-type family /
+  // ngram_gpu / dspark); an Eagle-type speculator passes false and keeps
+  // async scheduling ON, exactly as upstream.
   static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
                                   bool runner_supports_async,
-                                  bool is_pooling_model = false);
+                                  bool is_pooling_model = false,
+                                  bool spec_decode_incompatible = false);
   // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
   // checkpoint. params.speculative_config carries the CLI method + optional user
   // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
@@ -455,7 +652,16 @@ class LoadedEngine {
   LoadedEngine(HfConfig config, std::unique_ptr<LoadedModel> model,
                tok::Tokenizer tokenizer, const EngineParams& params,
                vt::Queue* preselected_queue = nullptr,
-               std::unique_ptr<DflashDraft> dflash_draft = nullptr);
+               std::unique_ptr<DflashDraft> dflash_draft = nullptr,
+               std::optional<multimodal::Qwen3VLVisionWeights> vision_tower =
+                   std::nullopt,
+               multimodal::Qwen3VLVisionConfig vision_config = {},
+               // #607 L3: the `--mmproj` projector was constructed (geometry
+               // resolved, file validated) and deliberately NOT read, because
+               // every modality it serves was at limit 0. Passed rather than
+               // re-derived here: a second evaluation of the predicate would
+               // report the skip even if the loader had stopped honouring it.
+               bool mmproj_tower_skipped = false);
 
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
@@ -502,6 +708,15 @@ class LoadedEngine {
       const LoadedModel& model, const HfConfig& config, int block_size,
       const EngineParams& params,
       const std::optional<vllm::SpeculativeConfig>& spec);
+  // KV-FP8 W3: turn the (already checkpoint-resolved) `params.kv_cache_dtype`
+  // into the KV specs' storage dtype, fp8 interpretation and per-tensor scales.
+  // Runs on the PROBE config before ResolveNumBlocks reads its geometry, which
+  // is what makes an fp8 cache double the block count rather than halve the
+  // pool. A no-op on the "auto"/bf16 default.
+  static void ApplyResolvedCacheDType(const EngineParams& params,
+                                      vllm::v1::KVCacheConfig& cfg);
+  // The `kv_cache.py:150-156` uncalibrated-scale warning, once per LOAD.
+  static void WarnUncalibratedKvScales(const EngineParams& params);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
@@ -512,19 +727,45 @@ class LoadedEngine {
 
   bool hash_ready_;  // declared first: forces EnsureNoneHash() ahead of the rest.
   HfConfig config_;
+  // LOAD-GGUF-MMPROJ: the `clip` projector's tower + its geometry. Empty on
+  // every load that named no --mmproj, which is every load that existed before
+  // this row. Nothing below borrows them, so their declaration position is
+  // free; they sit beside config_ because they are, like it, checkpoint
+  // metadata resolved once at load.
+  std::optional<multimodal::Qwen3VLVisionWeights> vision_tower_;
+  multimodal::Qwen3VLVisionConfig vision_config_;
+  // #607 L3: the projector above was skipped rather than absent. Read by
+  // skipped_towers(), which is why the engine-held tower needs its own flag: it
+  // is not part of `model_`, so `model_->skipped_towers()` cannot see it.
+  bool mmproj_tower_skipped_ = false;
   // SPEC-MTP I5d: the finalized speculative config (method/k/n_predict), or
   // nullopt on the production default path. Declared before model_/kv_cfg_/runner_
   // because the KV-cache widening, the draft build, the scheduler lookahead, and
   // the engine-core draft pull all read it. nullopt ⇒ every spec path is inert
   // and the engine is byte-identical to the pre-spec engine.
   std::optional<vllm::SpeculativeConfig> resolved_spec_config_;
+  // Concrete weights and model-specific runtime state behind the central
+  // registry contract. Declared before runner_ so its borrow remains live.
+  //
+  // #1946 moved it AHEAD of dflash_draft_, and the order is now load-bearing in
+  // both directions. Construction: the draft's embedding table is rebound onto
+  // this model's table in the initialiser list, so the model must already
+  // exist. Destruction: members die in reverse declaration order, so the draft
+  // -- which now holds a BORROWED pointer into this model's weights -- dies
+  // first.
+  //
+  // The old order was not ITSELF a use-after-free, and #1946 first said it was.
+  // `DflashDraft` has no user-declared destructor and destroying it never
+  // DEREFERENCES `weights.shared_embed_tokens`, so the dangling pointer was
+  // never read. What the old order left was a WINDOW: anything later added to
+  // that teardown -- a device-residency release, a flush, a log of the table --
+  // would have read freed memory. The new order closes the window; it did not
+  // fix a live bug.
+  std::unique_ptr<LoadedModel> model_;
   // SPEC-DFLASH D5: the owned DFlash draft (null unless method=="dflash").
   // Declared before runner_ so the borrow the runner holds stays live for the
   // runner's whole lifetime. Set in the ctor body via runner_.set_dflash_draft.
   std::unique_ptr<DflashDraft> dflash_draft_;
-  // Concrete weights and model-specific runtime state behind the central
-  // registry contract. Declared before runner_ so its borrow remains live.
-  std::unique_ptr<LoadedModel> model_;
   // KV-EXTERNAL-CACHE (LMCache): the owned external KV connector (null unless
   // EngineParams::kv_transfer_config selects one). Declared BEFORE runner_ /
   // scheduler_ so it outlives the non-owning pointers they hold to it. Built in
@@ -544,6 +785,10 @@ class LoadedEngine {
   // depends only on model_/config_/resolved_spec_config_, all declared above.
   vllm::v1::KVCacheConfig kv_cfg_;
   int max_model_len_;
+  // Declared AFTER kv_cfg_ (it is resolved against the KV pool's recurrent-state
+  // budget) and BEFORE runner_ / scheduler_ / structured_output_manager_, every
+  // one of which takes the already-resolved value. See ResolveMaxNumSeqs.
+  int max_num_seqs_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
   // ENG-SGLANG-BEHAVIOR-FLAG SW3: jump-forward enable, resolved once from

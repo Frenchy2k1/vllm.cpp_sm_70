@@ -89,6 +89,29 @@ bool TtDumpKv(const Dev& d) {
          std::getenv("VT_TT_DUMP_KV") != nullptr;
 }
 
+// Near-tie adjudication for the [TT-DUMP-LOGITS] prints: the top-2 RAW-logit
+// gap IS the top-2 logprob gap in nats (softmax is monotone), so an argmax
+// flip between two arms whose own top-2 gaps are both tiny is a bf16 near-tie
+// resolution difference, not a forward divergence — the same bar
+// scripts/qwen3-neartie-gap.py applies (gap <= ~0.5 nats = structurally
+// correct). Prints the pair as `top2=[id1:v1 id2:v2] gap2=g`.
+void TtDumpTop2(const float* v, int64_t n, char* out, size_t out_n) {
+  int64_t i1 = 0, i2 = -1;
+  float v1 = v[0], v2 = -1.0e30f;
+  for (int64_t i = 1; i < n; ++i) {
+    if (v[i] > v1) {
+      i2 = i1; v2 = v1; i1 = i; v1 = v[i];
+    } else if (v[i] > v2) {
+      i2 = i; v2 = v[i];
+    }
+  }
+  if (i2 < 0) i2 = 0;  // n==1 degenerate
+  std::snprintf(out, out_n, "top2=[%lld:%.6f %lld:%.6f] gap2=%.6g",
+                (long long)i1, static_cast<double>(v1),
+                (long long)i2, static_cast<double>(v2),
+                static_cast<double>(v1 - v2));
+}
+
 // Dense SwiGLU MLP (qwen3.py::Qwen3MLP=Qwen2MLP): merged gate_up_proj ->
 // SiluAndMul -> down_proj. `dh2` is the post-norm hidden [T,H] bf16.
 //
@@ -480,6 +503,9 @@ void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
   am_out.num_reqs = static_cast<int>(S);
   am_out.num_actual_tokens = static_cast<int>(S);
   am_out.max_query_len = 1;  // pure decode
+  // W10 (#1857): a pure-decode rewrite is never spec-classified. Belt on the
+  // vt shape guard's braces (S == q*S only at q == 1).
+  am_out.uniform_spec_query_len = 0;
   am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
   std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
             am_out.slot_mapping.begin());
@@ -513,8 +539,10 @@ std::vector<float> Qwen3DenseModel::Forward(
     for (int64_t i = 1; i < n_out * config.vocab_size; ++i)
       if (logits[static_cast<size_t>(i)] > logits[static_cast<size_t>(argmax)])
         argmax = static_cast<int>(i);
-    fprintf(stderr, "[TT-DUMP-LOGITS] Forward eager argmax=%d first5=[%f,%f,%f,%f,%f]\n",
-            argmax, logits[0], logits[1], logits[2], logits[3], logits[4]);
+    char top2[96];
+    TtDumpTop2(logits.data(), n_out * config.vocab_size, top2, sizeof(top2));
+    fprintf(stderr, "[TT-DUMP-LOGITS] Forward eager argmax=%d first5=[%f,%f,%f,%f,%f] %s\n",
+            argmax, logits[0], logits[1], logits[2], logits[3], logits[4], top2);
   }
   return logits;
 }
@@ -537,8 +565,10 @@ ForwardLogits Qwen3DenseModel::ForwardDevice(
     for (size_t i = 1; i < logits_dump.size(); ++i)
       if (logits_dump[i] > logits_dump[static_cast<size_t>(argmax)])
         argmax = static_cast<int>(i);
-    fprintf(stderr, "[TT-DUMP-LOGITS] ForwardDevice eager argmax=%d first5=[%f,%f,%f,%f,%f]\n",
-            argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+    char top2[96];
+    TtDumpTop2(logits_dump.data(), static_cast<int64_t>(logits_dump.size()), top2, sizeof(top2));
+    fprintf(stderr, "[TT-DUMP-LOGITS] ForwardDevice eager argmax=%d first5=[%f,%f,%f,%f,%f] %s\n",
+            argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4], top2);
   }
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
 }
@@ -747,8 +777,10 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
       for (int64_t i = 1; i < vocab; ++i)
         if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
           argmax = static_cast<int>(i);
-      fprintf(stderr, "[TT-DUMP-LOGITS] eager path argmax=%d first5=[%f,%f,%f,%f,%f]\n",
-              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+      char top2[96];
+      TtDumpTop2(logits_dump.data(), vocab, top2, sizeof(top2));
+      fprintf(stderr, "[TT-DUMP-LOGITS] eager path argmax=%d first5=[%f,%f,%f,%f,%f] %s\n",
+              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4], top2);
     }
     return WrapDeviceLogits(d, std::move(lg), B, vocab);
   }
@@ -815,9 +847,14 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     // R2: seed the on-device-advanced cur_pos BEFORE WarmRacIdx, so the RAC
     // path can alias update_idxs to it (eliminating the per-replay
     // update_idxs copy_to_device — the toxic ~38-replay hang class).
+    // replay_regime = this slot's graph is captured (the warm hooks run
+    // BEFORE the boundary Reset below): replay steps leave cur_pos to the
+    // captured plus_one; cold/warm/capture steps re-seed it, which is what
+    // makes a post-boundary RE-capture read the right position (#1476).
     if (!pam.seq_lens.empty()) {
       vt::tenstorrent::WarmDecodePos(
-          pam.seq_lens.data(), static_cast<int64_t>(pam.num_reqs));
+          pam.seq_lens.data(), static_cast<int64_t>(pam.num_reqs),
+          /*replay_regime=*/s.graph.captured());
     }
     vt::tenstorrent::WarmRacIdx(
         pam.slot_mapping.data(), pam.slot_mapping.data(),
@@ -906,8 +943,10 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
       for (int64_t i = 1; i < vocab; ++i)
         if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
           argmax = static_cast<int>(i);
-      fprintf(stderr, "[TT-DUMP-LOGITS] replay step argmax=%d first5=[%f,%f,%f,%f,%f]\n",
-              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+      char top2[96];
+      TtDumpTop2(logits_dump.data(), vocab, top2, sizeof(top2));
+      fprintf(stderr, "[TT-DUMP-LOGITS] replay step argmax=%d first5=[%f,%f,%f,%f,%f] %s\n",
+              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4], top2);
     }
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
@@ -1030,8 +1069,10 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
       for (int64_t i = 1; i < vocab; ++i)
         if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
           argmax = static_cast<int>(i);
-      fprintf(stderr, "[TT-DUMP-LOGITS] capture step argmax=%d first5=[%f,%f,%f,%f,%f]\n",
-              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+      char top2[96];
+      TtDumpTop2(logits_dump.data(), vocab, top2, sizeof(top2));
+      fprintf(stderr, "[TT-DUMP-LOGITS] capture step argmax=%d first5=[%f,%f,%f,%f,%f] %s\n",
+              argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4], top2);
     }
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
@@ -1051,8 +1092,10 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     for (int64_t i = 1; i < vocab; ++i)
       if (logits_dump[static_cast<size_t>(i)] > logits_dump[static_cast<size_t>(argmax)])
         argmax = static_cast<int>(i);
-    fprintf(stderr, "[TT-DUMP-LOGITS] cold step argmax=%d first5=[%f,%f,%f,%f,%f]\n",
-            argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4]);
+    char top2[96];
+    TtDumpTop2(logits_dump.data(), vocab, top2, sizeof(top2));
+    fprintf(stderr, "[TT-DUMP-LOGITS] cold step argmax=%d first5=[%f,%f,%f,%f,%f] %s\n",
+            argmax, logits_dump[0], logits_dump[1], logits_dump[2], logits_dump[3], logits_dump[4], top2);
   }
   s.warm = true;
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.

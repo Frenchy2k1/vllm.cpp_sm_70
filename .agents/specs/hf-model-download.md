@@ -141,7 +141,13 @@ Protocol calls, in order:
    a second run loads.
 3. `GET {endpoint}api/models/{repo}/tree/{commit}?recursive=true` lists files.
 4. `GET {endpoint}{repo}/resolve/{commit}/{path}` returns bytes. Follow the
-   redirect to the content delivery network.
+   redirect to the content delivery network. **The `Location` may be a RELATIVE
+   reference**, which RFC 7231 section 7.1.2 permits and which the hub sends for
+   a file that is not in large-file storage, so resolve it against the address
+   that answered per RFC 3986 section 5 rather than treating it as a URL. Read
+   `X-Linked-Size` from a redirect answer and never its `Content-Length`, which
+   is the length of the redirect's own body. Both rules are #1511, and both were
+   measured against `huggingface.co` rather than reasoned about.
 
 Cache layout is HuggingFace's documented local cache:
 `{HF_HOME}/hub/models--org--repo/` with `refs`, `blobs`, and
@@ -246,9 +252,16 @@ Reachability, answered as two separate questions, as
 [`reachability.md`](../reachability.md) requires.
 
 The production entry point is `vllm-server`, which calls `vllm_server_main`,
-which parses `--model` at `server_main.cpp:433` and calls the resolver.
-`vllm-cli` reaches the same flag. Both are registered command-line paths on
-their default configuration.
+which parses `--model` and calls the resolver. It is a registered command-line
+path on its default configuration.
+
+`vllm-cli` does NOT reach the resolver, and the earlier sentence claiming it did
+was wrong. `examples/cli/main.cpp` includes `vllm.h` and nothing else, because
+an example is an application binary interface client only, and this row
+deliberately adds no ABI function. So `vllm-cli --model org/repo` and any C ABI
+caller of `vllm_model_load` still take a local path. That is listed under
+`## Owed`: closing it means adding an ABI entry point, which is a public-surface
+decision and its own row.
 
 The smallest failing test calls `vllm_server_main(argc, argv)` with
 `--model org/repo` and `HF_ENDPOINT` aimed at the fake hub, then asserts that
@@ -261,7 +274,10 @@ byte for byte:
 
 | Mutation | Must turn red |
 |---|---|
-| Delete the resolver call in `server_main.cpp` | The end-to-end case |
+| Neutralise the resolver call in `server_main.cpp` with `if (false)` | The end-to-end case |
+| Delete the `--revision` branch in `ParseArgs` | The end-to-end case |
+| Delete the `--download-dir` branch in `ParseArgs` | The end-to-end case |
+| Drop the object-identifier preference in `BlobNameFor` | The blob-name case |
 | Range mismatch warns instead of failing | The range-ignored case |
 | Accept an all-identical object identifier listing | The fabricated-identifier case |
 | Own an identifier with an entry that reports no size | The not-disarmable case |
@@ -270,19 +286,118 @@ byte for byte:
 | Remove index-driven selection | The decoy-file case |
 | Remove the offline short circuit | The offline cases |
 
+THE RESOLVER MUTATION IS A NEUTRALISATION, NOT A DELETION, and the row above
+says `if (false)` for a measured reason. DELETING the call does not compile:
+`ResolveModelArgument` is file local, so `server_main.cpp:840` fails with
+`error: 'ResolveModelArgument(Args&)' defined but not used
+[-Werror=unused-function]` and the exit status is 1. A reviewer who ran the
+deletion got a stale binary and a false green, which is exactly the trap this
+repository has already recorded. `if (false) ResolveModelArgument(args);` is one
+changed line, compiles at exit 0, and reddens the end-to-end case at
+`test_serve_hf_model.cpp` `REQUIRE(healthy)` with an empty hub-path list,
+because the loader then opens `tiny/llama` as a relative directory.
+
 Each mutation run prints the compiler exit status and `git diff --stat` beside
 the test result. A mutation that fails to build and a mutation that never
 applied both read as a passing test, and this tree has recorded both.
 
-TLS gates, which the hermetic tests cannot give:
+TLS gates. The hermetic hub suites speak plain hypertext transfer protocol and
+prove nothing about transport security, so W5 added four separate instruments
+rather than one.
 
-1. `scripts/validate-container-image.py` boots the image with
-   `--model does-not-exist/nope` and asserts the failure is an HTTP 404 from the
-   hub, not the message that names the build options. A symbol check would pass
-   on a build where the option resolved `OFF`.
-2. One opt-in online test that fetches a real repository, following the pattern
+1. `ctest -R test_tls_transport`, which is HERMETIC and speaks REAL TLS. Its
+   fifth case generates a self-signed loopback certificate through the OpenSSL
+   application programming interface, starts an `httplib::SSLServer` on an
+   ephemeral port, points the endpoint at `https://127.0.0.1:<port>/`, trusts
+   the certificate through `SSL_CERT_FILE` rather than by weakening the
+   production client, and drives the production `HubResolveRefToCommit` through
+   a genuine handshake. The commit comes back AND the server counts exactly one
+   request, so the answer cannot have come from a cache. At the W7 head: 5
+   cases, 23 assertions, `Status: SUCCESS!`, exit 0.
+2. `scripts/validate-container-image.py` boots the image with
+   `--model does-not-exist/nope` and asserts the failure is an ANSWER FROM THE
+   HUB, not the message that names the build options. A symbol check would pass
+   on a build where the option resolved `OFF`. See "The hub answers 401, not
+   404" under `## Risks and decisions` for what the live hub actually returns.
+   `tests/scripts/test_validate_container_image.py` pins the classifier: 11
+   tests, exit 0. That suite is INVOKED by
+   `scripts/agent-preflight.sh`'s `SUITES` array and by the container block of
+   `.github/workflows/ci.yml`. W7 wired it there after a review found it
+   invoked by nothing at all: this tree treats an unrun gate as a distinct
+   third state, and a suite no runner names pins nothing. Breaking one of its
+   11 tests and running `scripts/agent-preflight.sh` reddens the run with
+   `FAIL test_validate_container_image`, measured at W7.
+3. The one-definition-rule instrument reads ALL THREE library translation units
+   that include the vendored httplib header, not two.
+   `include/vllm/http_transport_abi.h` names `api_server.cpp`, `hf_hub.cpp` and
+   `downloader.cpp`, and `HttpTransportAbiMismatch` compares the other two
+   against the server's reading. W5 shipped it reading only the first two, and
+   a review measured the hole: `-UCPPHTTPLIB_OPENSSL_SUPPORT` on
+   `downloader.cpp` ALONE compiled at exit 0 and left the suite at 5 of 5 cases
+   and 17 of 17 assertions green while `sizeof(httplib::Result)` was 72 in that
+   unit and 88 in the other two. With the third reading in place the same
+   mutation reddens 2 of 5 cases and 5 of 23 assertions.
+4. One opt-in online test that fetches a real repository, following the pattern
    in `tests/tools/test_online_gate_server_binary.py`. It does not run in the
-   default continuous integration lane.
+   default continuous integration lane. STILL OWED, and listed under `## Owed`.
+   What exists in its place is a manual measurement recorded here: the server
+   built at this head, run as
+   `./build/examples/vllm-server --model does-not-exist/nope` with no
+   `HF_ENDPOINT` set, reached `https://huggingface.co` and printed the hub's
+   HTTP 401. That is a real live https session through the production path, and
+   it is a MEASUREMENT rather than a gate, because nothing reruns it.
+
+The production REFUSAL, and what gates it. `VllmServerMain` calls
+`HttpTransportAbiMismatch` before it parses an argument or binds a socket, so a
+binary built with the macro set per file refuses to serve rather than serving a
+corrupted response object. Two instruments cover it and neither covers it
+alone.
+
+- STATIC, and it reruns. The citation
+  `src/vllm/entrypoints/openai/server_main.cpp::HttpTransportAbiMismatch` in
+  this section is checked by `scripts/check-symbol-anchors.py`, which runs in
+  `scripts/agent-preflight.sh` and in continuous integration. Deleting the
+  five-line refusal removes the only occurrence of that identifier from that
+  file and the checker reddens with `symbol not found`. Measured at W7. It
+  proves the call site EXISTS. It does not prove the refusal WORKS.
+- MANUAL, and nothing reruns it, because the behavior needs two binaries and a
+  single-binary gate for it is not constructible. The reproduction recipe, run
+  at W5 and again at W7:
+
+  ```sh
+  # 1. Mutate ONE translation unit, then rebuild.
+  # `i\` inserts the line above the match. An `s|...|...\n&|` form was tried
+  # first and the shell ate the `&`, which left a literal ampersand in the
+  # source and turned the mutation into a BUILD FAILURE. A mutation that fails
+  # to build reads as a passing test, which is why step 1 prints its status.
+  sed -i '/#include <httplib\/httplib.h>/i #undef CPPHTTPLIB_OPENSSL_SUPPORT' \
+      src/vllm/transformers_utils/downloader.cpp
+  cmake --build build --target vllm-server   # must exit 0; a build failure
+                                             # reads as a passing test
+  # 2. The refusal fires BEFORE argument parsing, so any argv reaches it.
+  ./build/examples/vllm-server --model /does/not/matter ; echo "rc=$?"
+  # EXPECT rc=2 and a message naming CPPHTTPLIB_OPENSSL_SUPPORT and all three
+  # readings, one of which reports sizeof(httplib::Result)=72 against 88.
+  # 3. Restore and verify byte-for-byte.
+  git checkout -- src/vllm/transformers_utils/downloader.cpp && git diff --quiet
+  ```
+
+  Deleting the refusal instead of mutating the macro makes step 2 print the
+  ordinary startup path, which is the negative half of the same measurement.
+
+Mutations W5 ran, each compiled at exit 0, each restored and verified with
+`git diff --stat`:
+
+| Mutation | Turned red |
+|---|---|
+| `-UCPPHTTPLIB_OPENSSL_SUPPORT` on `hf_hub.cpp` alone | `test_tls_transport`, 4 of 5 cases, 11 assertions |
+| `-UCPPHTTPLIB_OPENSSL_SUPPORT` on `downloader.cpp` alone, BEFORE W7 added the third reading | NOTHING. 5 of 5 cases, 17 of 17 assertions, `Status: SUCCESS!`. This is the hole, not a pass |
+| `-UCPPHTTPLIB_OPENSSL_SUPPORT` on `downloader.cpp` alone, AFTER it | `test_tls_transport`, 2 of 5 cases, 5 of 23 assertions |
+| Expect `unverified` where `classify_hub_reach` returns `ok` | `scripts/agent-preflight.sh`, `FAIL test_validate_container_image`. Before W7 wired the suite in, the same break reddened NOTHING |
+| Invert `ApiServerListenerIsTls` | `test_tls_transport`, 1 case, 1 assertion |
+| The hub client dials `http` whatever the scheme says | `test_tls_transport`, 1 case, 3 assertions |
+| Neutralise the no-TLS marker check in `classify_hub_reach` | `test_validate_container_image.py`, 2 tests |
+| The three build options declared and the TLS wiring absent | `test_tls_transport`, 1 case, 3 assertions. This one is the RED-FIRST state rather than a mutation of a finished head |
 
 Gate hygiene for this repository's recorded doctest traps: the focused run
 asserts a non-zero case count, reads the `Status:` line rather than grepping
@@ -308,39 +423,122 @@ asserts a non-zero case count, reads the `Status:` line rather than grepping
 | W3 | `downloader`: `HEAD`, resume, structural checks, lock, progress | Resume, truncation, and integrity cases green |
 | W4 | `model_resolver` and the `server_main.cpp` call site | The end-to-end case green, and red when the call site is deleted |
 | W5 | Build and packaging: the three options, `NOTICE`, `libssl3`, the container check | Every lane builds, and the container check distinguishes a working build from a disabled one |
-| W6 | `docs/USAGE.md` and `docs/FEATURES.md` | The new flags, environment variables, and workflow are documented |
+| W6 | `docs/guides/hugging-face-access.md`, `docs/reference/server.md` and `docs/FEATURES.md` | The new flags, environment variables, and workflow are documented |
 | W7 | Fresh review, mutation table, repair | A fresh reviewer returns `PASS` |
 
-W1 through W7 land in one pull request, which is the repository default when no
-`## Git integration` preference is recorded.
+That plan said W1 through W7 land in one pull request, which is the repository
+default when no `## Git integration` preference is recorded. It was overtaken by
+what happened. W1 and W2 landed in `31f93787c` through pull request
+[#1282](https://github.com/mudler/vllm.cpp/pull/1282), after four fresh reviews
+returned findings on the tree-listing size rule, and W3 and W4 land in a SECOND
+pull request on `row/ENG-HF-MODEL-DOWNLOAD-W3`. The split is recorded rather
+than corrected, because a spec that describes a landing that did not happen is
+a false record and this one is read by whoever picks up W5.
+
+| Stage | Landed in |
+|---|---|
+| W1, W2 | `31f93787c`, pull request #1282 |
+| W3, W4 | `995ed1ccd`, pull request #1485 |
+| W5, W6 | `row/ENG-HF-MODEL-DOWNLOAD-W5`, the third pull request |
+| W7 | not started |
 
 ## Risks and decisions
 
-**The one-definition-rule hazard.** `CPPHTTPLIB_OPENSSL_SUPPORT` changes the
-vendored httplib header for every consumer, and this repository already uses
-that header for the server. A build where some translation units define it and
-others do not links clean and misbehaves at run time. Decision: set the define
-on the target or on an interface target that every consumer inherits. Never set
-it per file. W5 gates this with a build that includes both a server translation
-unit and a fetcher translation unit.
+**The one-definition-rule hazard, and the instrument W5 built for it.**
+`CPPHTTPLIB_OPENSSL_SUPPORT` changes the vendored httplib header for every
+consumer, and this repository already uses that header for the server. A build
+where some translation units define it and others do not links clean and
+misbehaves at run time. The define is therefore set on the `vllm` TARGET and
+`PUBLIC`, so every consumer inherits it, which is also what llama.cpp does at
+`vendor/cpp-httplib/CMakeLists.txt:184 @ b10451`.
 
-**The server gains HTTPS as a side effect.** The same define lets
-`httplib::SSLServer` compile. Decision: this row does not enable a TLS listener
-and does not document one. W5 asserts the server still binds plain hypertext
-transfer protocol by default.
+"Never set it per file" is a rule that no compiler can enforce, so W5 measures
+it instead. `include/vllm/http_transport_abi.h` declares one reading per
+translation unit. `api_server.cpp` reports what the SERVER half saw and
+`hf_hub.cpp` reports what the FETCHER half saw, each from its own preprocessor
+and its own `sizeof`, never from a shared constant that could only be compiled
+once. `src/vllm/http_transport_abi.cpp` holds them side by side and includes no
+httplib header of its own, so it cannot contribute a third opinion.
+`VllmServerMain` calls the comparison before it parses a flag and refuses to
+start on a disagreement, which is what keeps the instrument on the production
+path rather than in a test fixture.
+`tests/vllm/transformers_utils/test_tls_transport.cpp` compares the two, and a
+third case compares the library's reading against `sizeof(httplib::Result)` in
+the TEST translation unit, which is the seam the first two cannot see: a define
+that reached the library and not its consumers would leave those two agreeing
+while every test and example laid the type out differently.
 
-**The `literal-static` lane.** `validate-release-archive.py:404` refuses any
-dependency on that artifact. Decision: BoringSSL links fully static there, or
-the lane sets `VLLM_CPP_HF_DOWNLOAD=OFF` and the binary refuses a repository
-identifier with a message that names the missing feature. W5 records which of
-the two the lane took.
+MEASURED. Undefining the macro for `hf_hub.cpp` alone, with
+`set_source_files_properties(... COMPILE_OPTIONS "-UCPPHTTPLIB_OPENSSL_SUPPORT")`,
+compiles at exit 0, links at exit 0, and turns 4 of the suite's 5 cases red with
+11 failed assertions. The reading it prints is the damage itself:
+`sizeof(httplib::Result)` is 72 in the fetcher and 88 in the server, and
+`sizeof(httplib::ClientConnection)` is 4 against 16. That is a sixteen byte
+layout disagreement across a seam the linker accepted without a word.
 
-**macOS and Windows are undecided, and do not block this row.**
+**The server gains HTTPS as a side effect, and does NOT use it.** The same
+define lets `httplib::SSLServer` compile. This row does not enable a TLS
+listener and documents none, and the assertion is not a comment.
+`api_server.cpp` names its listener type ONCE, as
+`using ApiServerListener = httplib::Server;`, and the `Impl` member is declared
+with that alias, so the alias is the only place the choice is made.
+`vllm::ApiServerListenerIsTls()` reads the alias and
+`tests/vllm/transformers_utils/test_tls_transport.cpp` requires it false.
+Inverting that function turns exactly that one case red, 1 of 5, with 1 failed
+assertion. `vllm-server` still binds `0.0.0.0:8000` over plain hypertext
+transfer protocol, and `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp`
+drives it with a plain `httplib::Client` in a TLS build.
+
+**The `literal-static` lane TOOK THE SECOND DISPOSITION.**
+`validate-release-archive.py:404` refuses any dependency on that artifact.
+`scripts/build-cpu-release.sh` now sets `VLLM_CPP_HF_DOWNLOAD=OFF` for
+`linux-x86_64-musl-cpu-static` and leaves every other lane on the default `ON`.
+The binary refuses a repository identifier with the message that names the three
+build options.
+
+BoringSSL was not chosen there, and the reason is not that it does not work.
+`-DVLLM_CPP_BUILD_BORINGSSL=ON` is implemented, mirrors
+`vendor/cpp-httplib/CMakeLists.txt:40-82 @ b10451` including the
+`BUILD_SHARED_LIBS`/`BUILD_TESTING` save-and-restore, and links `ssl` and
+`crypto` statically. It FETCHES FROM THE NETWORK AT CONFIGURE TIME, and a
+release lane that reaches `boringssl.googlesource.com` to produce an archive
+makes the archive depend on a host this repository cannot pin by content. That
+is a supply-chain change, not a build flag, and it belongs to whoever wants a
+static-musl fetch rather than to this row.
+
+MEASURED at this head, both dispositions:
+
+| Configuration | `readelf -dW` NEEDED | `--model does-not-exist/nope` |
+|---|---|---|
+| `VLLM_CPP_HF_DOWNLOAD=ON` | adds `libssl.so.3`, `libcrypto.so.3` | HTTP 401 from the live hub |
+| `VLLM_CPP_HF_DOWNLOAD=OFF` | unchanged, no TLS library | refused, naming the three options |
+
+The release manifest needed no hand editing for the first row.
+`scripts/release_metadata.py:123-148` derives the declared dependencies by
+running `readelf -dW`, and driving that function directly on the built server
+returns `libssl.so.3` and `libcrypto.so.3` as `dynamic` rows.
+`validate-release-archive.py` compares NEEDED against those declarations, so the
+two stay consistent by construction. The earlier note that "a null grep is not
+absence" is discharged: this was confirmed by building and by running the
+deriving function, not by grepping.
+
+**macOS and Windows: the per-lane table, and what is still owed.**
 `find_package(OpenSSL)` on macOS needs a root hint, and
-`scripts/release_macos_metadata.py` restricts install names. httplib has no
-Windows Schannel path. Decision: W5 produces a per-lane table of lane, TLS
-source, and feature state. The Linux lanes that the quickstart targets do not
-wait for it.
+`scripts/release_macos_metadata.py` restricts install names. cpp-httplib has no
+Windows Schannel path. Neither blocks the Linux lanes, and neither is silent any
+more.
+
+| Lane | TLS source | Feature state | Verified how |
+|---|---|---|---|
+| Linux glibc x86_64 and aarch64, release archives | system OpenSSL, dynamic | ON | built at this head. `readelf -dW` shows `libssl.so.3` and `libcrypto.so.3`, and `--model does-not-exist/nope` gets HTTP 401 from the live hub |
+| Container images (`cpu`, `cuda`, `vulkan`) | system OpenSSL through `libssl3` | ON | `docker/Dockerfile` installs `libssl3` beside the `ca-certificates` it already had, and `scripts/validate-container-image.py` asserts an answer from the hub. NOT built in this session: no container build was run here |
+| `linux-x86_64-musl-cpu-static` | none, deliberately | OFF | `scripts/build-cpu-release.sh` sets it, and the OFF configuration was built and measured at this head |
+| A developer host with no OpenSSL development files | none | OFF by downgrade | the `else()` branch warns and clears the option. Not exercised on this box, which has OpenSSL 3.0.13 |
+| macOS (`VLLM_CPP_METAL` lanes) | UNRESOLVED, owed | untested | `find_package(OpenSSL)` finds nothing without `OPENSSL_ROOT_DIR` on a Homebrew host, and the Apple branch that links `CoreFoundation` and `Security` is written from `vendor/cpp-httplib/CMakeLists.txt:186-190 @ b10451` and has never been compiled here. No Apple host was available |
+| Windows (`windows-msvc-*`) | UNRESOLVED, owed | untested | cpp-httplib has no Schannel backend, so MSVC needs an OpenSSL to point `find_package` at, and there is none on that runner. The option resolves OFF by downgrade, which is a WARNING and not a failed configure, so the lane is not expected to break |
+
+The two unresolved lanes are recorded under `## Owed`. They downgrade rather
+than fail, so neither can turn a green lane red without saying why.
 
 **Two divergences in the cache directory, and one restored fallback.**
 `HfHubCacheDir` mirrors llama.cpp `common/hf-cache.cpp:37-63 @ b10451`,
@@ -458,26 +656,270 @@ is recorded here. The regression case for the measured event survives it: the
 `Lightricks/LTX-2.5` fixture is refused by the degeneracy rule, and its shards
 are given different sizes so that the size rule would catch it independently.
 
-**A null grep is not absence.** This spec states that no document pins a runtime
+**A range request answered 200 is REFUSED, where llama.cpp warns.** llama.cpp
+`common/download.cpp:222-235 @ b10451` logs "server did not respond with 206"
+and carries on. W3 throws. A `200` carries the WHOLE body, and appending a whole
+body onto a partial file writes the first N bytes twice. On a safetensors the
+data-end rule catches the result, and on a format with no structural proof it is
+a silently corrupt weight that a token gate cannot see, because the model still
+emits tokens. The refusal costs one re-run and names the partial file to delete.
+The refusal is taken in the RESPONSE HANDLER rather than after the transfer,
+which is a second decision the same case pinned: with the check after the call,
+the suite measured a 12 byte partial file grown to 48 bytes under a refusal that
+still reported the right reason.
+
+**The end-to-end case leaked a listening socket, and the retry loop that hid it
+is gone.** This paragraph previously blamed box contention at load 32 and
+scheduler starvation, and said that whether a completion can genuinely hang
+under contention was not settled by this work. That was WRONG, the cause was
+inside this row's own diff, and it is recorded here because a committed spec is
+the binding record and a false cause sends the next reader into the serving
+core, which this row does not touch.
+
+`FreePort` in `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` bound an
+ephemeral port with an `httplib::Server` and called `probe.stop()`. That
+released nothing. `Server::stop()` at `third_party/httplib/httplib.h:11460` is
+guarded by `if (is_running_)`, the function never called `listen_after_bind()`,
+so `is_running_` was false and the socket was never shut down, and
+`Server::~Server()` is `= default` and does not close it either. httplib sets
+`SO_REUSEPORT` at `httplib.h:9455`, so the forked child bound the SAME port
+successfully and the kernel load balanced inbound connections between the
+orphan, which nobody ever accepted on, and the real server.
+
+Measured with `ss -ltnp` during an unmutated run at `e25d3d344`: two LISTEN rows
+on one port, one owned by the parent and one by the child, the parent's carrying
+`Recv-Q 1`, which is the hung request sitting in a backlog nobody drains.
+
+| Variant | wall, one binary, one box | verdict |
+|---|---|---|
+| `e25d3d344`, three runs at load 12 to 15 | 90.4 s, 240.4 s, 180.4 s | one FAILED |
+| `FreePort` closing its socket, five runs at load 20 to 25 | 0.12 to 0.15 s | five passed |
+
+Every stall was an exact multiple of a client read timeout, 30 s health and
+60 s completion, never an intermediate value. A contended box gives a
+distribution, not quantised multiples of the client's own timeout, and the
+repaired case is FASTER at load 25 than the committed one was at load 13.
+
+`FreePort` now uses a POSIX `socket`, `bind`, `getsockname`, `close`, because
+the close has to be unconditional. The three-attempt retry loop is DELETED: with
+the leak gone there is nothing left for it to absorb, and sixty seconds of dead
+time read as a green run with no output at all. The serving core was cleared by
+inspection in the same pass, and every wait on the path is a predicate-guarded
+`condition_variable::wait`, at `httplib.h:10444`, in
+`include/vllm/v1/engine/core_proc.h`, and at
+`src/vllm/v1/engine/output_processor.cpp:48`.
+
+`--max-num-seqs 4` stays on the command line, and the reason recorded for it was
+also wrong. The worker-pool arithmetic is true, the default 32 does start a
+36-thread pool for one four-token request, but that is not why the case was
+slow, and the comment now says so.
+
+**`--revision` and `--download-dir` were parsed and never reached.** Both
+`ParseArgs` branches could be deleted with `test_downloader`, `test_model_resolver`
+and `test_serve_hf_model` all still green, because the two cases named for those
+flags set `ModelResolveOptions` fields by hand and never touch a flag. That is
+`.agents/reachability.md`'s own sentence: a unit test that constructs the type by
+hand proves the class works, never that anything reaches it. The end-to-end case
+now carries both flags and they are LOAD BEARING. The fake hub publishes the
+checkpoint on a non-default branch and lists nothing under the commit `main`
+names, so a run without `--revision` fetches nothing and never binds, and the
+cache is asserted to land under `--download-dir` and NOT under `HF_HOME`.
+
+**A blob is named by the object identifier, else by the COMMIT and the path.**
+The `## Port map` above says "by the entity tag from the resolve response or by
+a locally computed sha256". W3 keeps the object identifier as the first choice
+and replaces both fallbacks with the commit and the path, for two reasons. An
+entity tag is a transport artifact that a mirror may respell without the bytes
+changing, and naming a cache file after one costs a `HEAD` request per file on a
+WARM cache, where the correct number of requests is zero and this row has a case
+asserting it. A locally computed sha256 has to be computed from the whole file,
+and the tree's one sha256 (`kv_cache_utils.h:175`, which the tree may not have a
+second of) takes a `std::string`, so a 60 GB shard would be hashed in memory. A
+commit plus a repository-relative path already names exactly one byte sequence,
+which is the property a content hash was wanted for. The choice the run made is
+printed under `--verbose`.
+
+**A null grep is not absence.** This spec stated that no document pins a runtime
 dependency list, based on a grep of `docs/RELEASES.md`, `docs/BUILD.md`, and
 `scripts/check-release-binary-contract.py`. That grep proves the search terms
-wrong, not the fact. W5 confirms by building and running the archive validator.
+wrong, not the fact. W5 confirmed it by BUILDING: the server was linked with the
+feature on, `readelf -dW` was read, and `release_metadata.dependencies()` was
+driven directly on the resulting binary. It returns `libssl.so.3` and
+`libcrypto.so.3` as `dynamic` rows with no hand-maintained list anywhere, and
+`validate-release-archive.py` compares NEEDED against exactly those rows. The
+full release archive was NOT produced in that session, so the claim is
+"the deriving function returns them", not "an archive was validated".
+
+**The hub answers 401, not 404.** The container audit was specified to require
+"an HTTP 404 from the hub". Measured on 20 August 2026 against the live hub,
+`GET /api/models/does-not-exist/nope/refs` answers **401** to an anonymous
+caller, and so does `GET /api/models/does-not-exist/nope`. The built server
+prints `HuggingFace refused repository 'does-not-exist/nope' with HTTP 401`. The
+audit therefore accepts 404 AND an authorization status and says which it saw,
+because either one proves the same thing: the TLS session completed and the hub
+judged the request. What it does NOT accept is the build-option message, an
+unreachable endpoint, or an exit status of zero, and the marker check runs
+BEFORE the status check so a stray `404` elsewhere in a log cannot rescue a
+no-TLS image. `tests/scripts/test_validate_container_image.py` pins all of
+that, including the ordering.
 
 **The GGUF form diverges from vLLM by design.** vLLM has no `org/repo:QUANT`
 form. This is a tracked exception under the secondary-oracle rule, not a silent
-divergence. `docs/USAGE.md` states which upstream defines which form.
+divergence. `docs/guides/hugging-face-access.md` states which upstream defines
+which form.
+
+**W5's define reached the sanitizer lanes; its libraries did not.**
+`CPPHTTPLIB_OPENSSL_SUPPORT` and `OpenSSL::SSL` are both PUBLIC on `vllm`, so
+they travel together for every consumer that links `vllm::vllm` -- which is what
+made this look safe. A sanitizer build does not link that target. It links
+`vllm_sanitize_test_shared`, a shared image of the instrumented archive that
+exists so ASan test binaries do not each force-link hundreds of megabytes
+(`CMakeLists.txt`, `vllm_sanitize_test_shared`). That shim forwarded three of
+`vllm`'s usage requirements by property genex and not the fourth: include
+directories, system include directories and compile definitions, but never
+`INTERFACE_LINK_LIBRARIES`. The define therefore arrived at every test including
+the vendored httplib header, the libraries it now requires did not, and the only
+libssl anywhere was a `DT_NEEDED` entry of the shim -- which GNU ld refuses to
+resolve a client reference through. Eight targets failed to link and both
+sanitizer lanes reported `fail` without executing a case, from `a50c57d69` until
+[#1531](https://github.com/mudler/vllm.cpp/issues/1531) forwarded the fourth
+property beside the other three. The general lesson is not about OpenSSL: a
+partial forward of a target's usage requirements is silent until one of the
+un-forwarded ones is first needed, and the half that was forwarded is what
+creates the demand for the half that was not.
 
 ## Owed
 
 - ModelScope resolution, `vllm/transformers_utils/repo_utils.py:239`.
+- **Every row of the `docs/QUICKSTART.md` model table.** The page, its
+  `PENDING(#N)` grammar and `scripts/check-quickstart-recipes.py` landed as
+  scaffolding, and the table carries exactly one row whose every cell is a
+  placeholder. The bar for a real row is that somebody ran it end to end, image
+  pulled and model fetched and tokens returned, recording the date and the host.
+  Two things block that today and neither is a judgement about a model:
+  [#1511](https://github.com/mudler/vllm.cpp/issues/1511) reads a relative HTTP
+  `Location` header as a URL, so `--model org/repo` fetches nothing from the
+  real hub, and no container image has been published, so no lane image can be
+  pulled. The two `PENDING` recipes on the page carry the same cause. Row
+  `ROAD-V1-QUICKSTART`, issue
+  [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
 - `--tokenizer-revision` and `--code-revision`, `vllm/config/model.py:186,190`.
 - LoRA adapter fetch, `vllm/lora/utils.py:346`.
 - The llama.cpp Docker-registry model path, `common/download.cpp:847`.
-- The macOS and Windows TLS lanes, resolved as a table in W5.
+- **A `.bin`-only repository is fetched and then refused by the loader.**
+  `SelectWeightFiles` mirrors vLLM's format preference, `["*.safetensors",
+  "*.bin"]` with the first matching pattern winning
+  (`default_loader.py:167-184`), so a repository that publishes only
+  `pytorch_model.bin` is downloaded in full and then refused by `LoadShards`
+  with `no *.safetensors shards found`. vLLM loads that format and this engine
+  does not, so mirroring the preference is right and the wasted transfer is
+  the cost of it. Refusing after phase one, before the weights, would save the
+  bandwidth and is what the two-phase fetch exists for, but it needs its own
+  case and its own message. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **`vllm-cli` and the C ABI do not resolve a repository identifier.** W4 wires
+  the resolver into `server_main.cpp` only. `examples/cli/main.cpp` is an ABI
+  client and this row adds no ABI function, so `vllm-cli --model org/repo` and
+  `vllm_model_load("org/repo")` still take a local path and refuse anything
+  else exactly as they did. Closing it moves the public surface, so it needs its
+  own row. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **The macOS and Windows TLS lanes.** The per-lane table is under
+  `## Risks and decisions` and both rows read UNRESOLVED. macOS needs an
+  `OPENSSL_ROOT_DIR` hint and its `release_macos_metadata.py` install-name rules
+  checked against `libssl.dylib`. The Apple branch that links `CoreFoundation`
+  and `Security` is written from upstream and has never been compiled here.
+  Windows has no Schannel backend in cpp-httplib, so MSVC needs an OpenSSL to
+  point `find_package` at. Both DOWNGRADE rather than fail, so neither turns a
+  lane red. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **The opt-in online fetch test.** `## Gates` item 3. What exists instead is a
+  one-off manual measurement of a live https session, recorded there. Row
+  `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **DISCHARGED, AND THE MEASUREMENT WAS RED: the container image was not BUILT
+  in the W5 session, and when it finally was, the fetch did not work.**
+  W5 shipped `libssl3` in `docker/Dockerfile` and the hub-reach audit in
+  `scripts/validate-container-image.py` with its classifier pinned by 11 unit
+  tests, but no image was built and no container was booted, so the audit had
+  never executed against a real image. It executed for the first time on
+  20 August 2026 and REFUSED the image: `hub reach: this image cannot speak
+  HTTPS: the binary printed the build-option message containing 'cannot speak
+  HTTPS', so VLLM_CPP_HF_DOWNLOAD resolved OFF or no TLS library was found at
+  build time`.
+  The cause was that W5 added the RUNTIME half and not the BUILD half.
+  `builder-toolchain` installed `binutils build-essential ca-certificates cmake
+  curl file git ninja-build python3` and no `libssl-dev`, so configure logged
+  `Could NOT find OpenSSL (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`
+  and took the documented downgrade, and `ldd` on the shipped `vllm-server`
+  named only `libstdc++ libm libgcc_s libc` while the image carried a `libssl3`
+  nothing linked. `builder-cuda` and the `cuda_x86` and `cuda_arm64` release
+  jobs had the same list, so the PUBLISHED CUDA archives were in the same state.
+  The build was never the risk W5 thought it was deferring; the build was the
+  only thing that could see this. Every static gate stayed green.
+  Repaired by [#1517](https://github.com/mudler/vllm.cpp/issues/1517), which
+  names `libssl-dev` in both builder stages and in the five apt-based release
+  lanes, and adds `scripts/check-build-runtime-deps.py` so a runtime that
+  advertises a capability its builder cannot compile is refused.
+  The repair was measured as a BUILT PAIR on 20 August 2026, x86_64, one tree,
+  one variable, both images built from `d189f66dd` and both deleted afterwards:
+
+  | | RED control, no `libssl-dev` | GREEN, the shipped file |
+  |---|---|---|
+  | configure | `Could NOT find OpenSSL ... (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`, then `HTTPS support is disabled` and `no transport layer security is available` | `Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.13")`, then `HuggingFace download: HTTPS through OpenSSL 3.0.13 (system, dynamic)` |
+  | `ldd vllm-server` | `libstdc++ libm libgcc_s libc` | the same plus `libssl.so.3` and `libcrypto.so.3` |
+  | `validate-container-image.py` | exit 1, `hub reach: this image cannot speak HTTPS` | exit 0, `hub reach: verified, the hub answered with an authorization status for does-not-exist/nope; the TLS session completed` |
+  | `docker run --model does-not-exist/nope` | `this build cannot speak HTTPS, so it cannot reach https://huggingface.co/` | `HuggingFace refused repository 'does-not-exist/nope' with HTTP 401 ... Set HF_TOKEN` |
+
+  The control needed its own BuildKit cache mount id. Sharing the lane's mount
+  made the second configure read the FIRST build's `CMakeCache.txt`, report
+  OpenSSL found with an empty version, and die at generate on a missing
+  `OpenSSL::SSL` target instead of taking the downgrade. That is
+  [#1521](https://github.com/mudler/vllm.cpp/issues/1521), filed and not fixed
+  in this flow. Row `ENG-HF-MODEL-DOWNLOAD`, issues
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280) and
+  [#1517](https://github.com/mudler/vllm.cpp/issues/1517).
+- **A static-musl fetch, through BoringSSL.** `-DVLLM_CPP_BUILD_BORINGSSL=ON`
+  is implemented and available, and the `linux-x86_64-musl-cpu-static` lane
+  does not use it because it fetches from the network at configure time. It has
+  NEVER BEEN COMPILED here, for the same reason and because this box was at 97
+  percent disk. No lane ships it and nothing measures it, so it is untested
+  code that the guide OFFERS, which is why `docs/guides/hugging-face-access.md`
+  now marks the option `UNTESTED` in its own row and says so in prose. Row
+  `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
+- **The release manifest does not record whether an archive can fetch.**
+  `scripts/release_metadata.py`'s `REQUIRED_FLAGS` carries no
+  `VLLM_CPP_HF_DOWNLOAD`, so a manifest is silent about a capability the guide
+  now documents as a per-lane, user-visible fact. W7 considered the one-line
+  addition and REJECTED it, because it would publish a value that is wrong
+  exactly where it matters most. `backend_flags` reads `CMakeCache.txt`, and
+  `CMakeLists.txt`'s downgrade is a plain `set(VLLM_CPP_HF_DOWNLOAD OFF)`,
+  which shadows the cache entry inside the directory scope and never writes it
+  back. Measured on this box: a configure that resolved TLS ON leaves
+  `VLLM_CPP_HF_DOWNLOAD:BOOL=ON` in the cache, and a host with no OpenSSL
+  development files leaves the SAME line while the feature is off. The cache
+  records what the user ASKED FOR, and the resolved TLS source
+  (`_vllm_tls_source`) is a local variable that reaches no cache entry at all.
+  A manifest field fed from that would read `true` on the very lane that
+  refuses. Closing this needs the RESOLVED state published, either as a new
+  cache entry or through the `VLLM_CPP_HF_DOWNLOAD_REQUESTED` pattern already
+  used by `tests/CMakeLists.txt`, plus the manifest schema and its release
+  contract checkers moved together. That is a release-contract change and it
+  needs its own row. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+  [#1280](https://github.com/mudler/vllm.cpp/issues/1280).
 - The quickstart page, issue
   [#1281](https://github.com/mudler/vllm.cpp/issues/1281).
-- **Wiring `hf_hub` to a production entry point.** W2 lands `hf_hub` reached
-  only by its own suite. Of `hf_cache`, only `ResolveCachedSnapshotDir` is
+- ~~**Wiring `hf_hub` to a production entry point.**~~ CLOSED by W4. The
+  paragraph below records why the debt existed. `HubResolveCommitCached`,
+  `HubListRepoFiles`, `HfBlobPath`, `HfSnapshotPath` and
+  `HfFinalizeSnapshotEntry` are now all reached from
+  `server_main.cpp`'s `--model` branch through `model_resolver.cpp`, and
+  `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` turns red when that
+  call site is deleted. `HfReadRef` and `HfWriteRef` are reached through
+  `HubResolveCommitCached` on the same path.
+
+  W2 landed `hf_hub` reached only by its own suite. Of `hf_cache`, only `ResolveCachedSnapshotDir` is
   reached, through the DFlash draft path in `model_loader.cpp`, and
   `tests/vllm/entrypoints/test_dflash_draft_hf_cache.cpp` gates that reach by
   entering the loader with a repository identifier. `HfReadRef`, `HfWriteRef`,
@@ -496,7 +938,194 @@ divergence. `docs/USAGE.md` states which upstream defines which form.
 
 ## Now
 
-State `READY`, and W1 and W2 have landed. W1 corrected the llama.cpp anchor
+THE FIRST FETCH THIS TREE EVER MADE FROM `huggingface.co` FAILED ON ITS FIRST
+HOP, and #1511 is that failure and its repair. W5 linked transport layer
+security, so the very next thing anyone did was point the server at a real
+repository. `--model Qwen/Qwen3-0.6B` refused with `HF_ENDPOINT
+'/api/resolve-cache/models/Qwen/Qwen3-0.6B/<commit>/config.json?...&etag="f5c3703b..."'
+has no scheme`, downloaded nothing, and blamed a variable the operator had
+never set.
+
+Two independent defects, both of them properties of what the hub answers rather
+than of what it was asked:
+
+1. The `Location` is an ABSOLUTE-PATH REFERENCE, not a URL. Both redirect loops
+   in `downloader.cpp` assigned it to `current` unresolved, so the next hop
+   parsed a path as an address. `HfResolveUrl` in `hf_hub.cpp` now resolves a
+   reference against the address that sent it, per RFC 3986 section 5, covering
+   the absolute, network-path, absolute-path, relative-path and query-only
+   forms, carrying the query and the fragment through, and removing dot
+   segments. The query is load-bearing: the hub keys its cache address on the
+   `etag` it carries.
+2. The redirect's own `Content-Length` was read as the size of the file it
+   names. Measured on 2026-08-20, the HTTP 307 answering `resolve` for
+   `config.json` carries `content-length: 234`, the length of its own text body,
+   and NO `x-linked-size`. A 726 byte file therefore probed as 234 bytes and the
+   transfer refused on a disagreement with the tree listing. `HubProbeFile` now
+   reads `Content-Length` only from a non-redirect answer. `X-Linked-Size` keeps
+   its meaning on a redirect, because the hub sets it to the LINKED file's size,
+   and the large-file-storage arm depends on that.
+
+Defect 2 is the one that shows why fixing only the reported symptom would have
+left the feature broken: resolving the address alone gets the client to the
+second hop and then refuses the file for a size it never had.
+
+WHY FOUR REVIEW ROUNDS DID NOT SEE EITHER. The redirect loops had NO hermetic
+instrument at all. `test_downloader.cpp` served every case from ONE address, so
+`IsRedirect` never returned true in a test, and the one redirect fixture in the
+whole row, `test_hf_hub.cpp`'s `a redirected API answer is refused and the token
+does not follow it`, serves an ABSOLUTE `Location` and exists to prove that the
+API client REFUSES a redirect rather than follows one. A loop with full line
+coverage and no case is what a review reads as covered. The six cases appended
+to `test_downloader.cpp` are the missing shapes, and each one is written from a
+header capture of the live hub rather than from a guess about it.
+
+The credential rule from #1485 survives untouched: the manual loop stays,
+`set_follow_location` stays off, and the token is still dropped at the first
+hop. Resolution does not weaken it, because the measured large-file-storage
+redirect crosses to `us.aws.cdn.hf.co` with its own signature in the query and
+needs no bearer token. `downloader: a cross-host redirect does not carry the
+bearer token` now pins both halves of that: the host the caller named receives
+the token and the other authority does not.
+
+LIVE PROOF, 2026-08-20, x86_64, TLS through system OpenSSL, `HF_HOME` empty:
+`--model Qwen/Qwen3-0.6B` fetched the repository and served it. What landed is
+recorded in the pull request body.
+
+State `READY`. W1 through W6 have landed. W7, the fresh review, has run once
+and returned FAIL on seven findings, and every one of them is repaired or
+recorded at this head. What that round changed is in the paragraph beginning
+"A SIXTH FRESH REVIEW" below.
+
+W5 is what made the feature real. Before it, `--model org/repo` fetched and
+served, but only over plain hypertext transfer protocol, because nothing in the
+tree linked a transport-layer-security library at all. Three options now decide
+that, in the `VLLM_CPP_SERVER` idiom that downgrades with a WARNING rather than
+failing a configure: `VLLM_CPP_HF_DOWNLOAD` (ON), `VLLM_CPP_OPENSSL` (ON, with
+llama.cpp's own `check_c_source_compiles` version gate), and
+`VLLM_CPP_BUILD_BORINGSSL` (OFF, static, fetched). On this box the configure
+prints `HuggingFace download: HTTPS through OpenSSL 3.0.13 (system, dynamic)`,
+`readelf -dW` shows `libssl.so.3` and `libcrypto.so.3`, and the built server
+reaches `https://huggingface.co` and prints the hub's answer.
+
+The define is set on the TARGET and `PUBLIC`, never per file, and that is
+MEASURED rather than asserted: `include/vllm/http_transport_abi.h` takes one
+reading from EACH of the three library translation units that include the
+vendored header, `VllmServerMain` refuses to start when any of them disagrees
+with the server's, and undefining the macro for one file alone leaves that unit
+16 bytes apart from the others on `httplib::Result` with a clean link and a red
+suite. W5 shipped only two of the three readings, and the paragraph beginning
+"A SIXTH FRESH REVIEW" records what that missed.
+
+`tests/vllm/transformers_utils/test_tls_transport.cpp` is the new suite: five
+cases, twenty-three assertions, and its fifth case is a REAL TLS handshake against
+an in-process `httplib::SSLServer` on loopback, driven through the production
+`HubResolveRefToCommit`. It opens no network connection. The two no-TLS cases
+the fifth review repaired were re-read in a TLS build and both still count four
+assertions each, so neither became a skip wearing a pass.
+
+The server still binds plain hypertext transfer protocol. The listener type is
+named once, as an alias, and a case requires it not to be a TLS listener.
+
+`linux-x86_64-musl-cpu-static` took the second disposition: the lane sets
+`VLLM_CPP_HF_DOWNLOAD=OFF` and the binary refuses a repository identifier with
+the message naming the three options. That configuration was built and measured,
+and it adds no `NEEDED` entry, which is what the literal-static archive contract
+requires. `NOTICE` gained OpenSSL as a dynamic system dependency and BoringSSL
+as an optional vendored static. `docker/Dockerfile` gained `libssl3`.
+`scripts/validate-container-image.py` gained the hub-reach audit that separates
+a working TLS build from a silently disabled one, pinned by eleven unit tests.
+
+W6 documented what this head does and nothing else.
+`docs/guides/hugging-face-access.md` gained the build options, the per-lane
+state, the offline path, and the two integrity refusals as the user sees them,
+and its claim that the tree "speaks no transport layer security" is gone.
+`docs/reference/server.md` points at it. `docs/FEATURES.md` gained the
+capability row, marked partial, naming the musl lane and the two entry points
+that still take a local path.
+
+The paragraph below records the state W4 left.
+
+W1 through W4 landed first. W3 added
+`src/vllm/transformers_utils/downloader.{h,cpp}`: a `HEAD` probe for size,
+entity tag and range support, a `Range: bytes=N-` resume that REFUSES a `200`
+answer rather than appending it, a `.incomplete` temporary file renamed only
+after the structural proof passes, the safetensors data-end rule and the GGUF
+proof through the tree's own reader, a per-repository `flock` beside the
+repository directory, progress under `--verbose`, and `SIGINT` cancellation that
+keeps the partial file so the next run resumes.
+
+W4 added `src/vllm/transformers_utils/model_resolver.{h,cpp}` and the call site
+in `src/vllm/entrypoints/openai/server_main.cpp`, which is what makes
+`--model org/repo` and `--model org/repo:Q4_K_M` fetch and serve. `--revision`
+and `--download-dir` are the vLLM flags rather than an invented inline syntax.
+The fetch is two phase, configuration JSON before weights, and index driven, so
+a published checkpoint's `original/` copy is never requested.
+
+Three suites cover W3 and W4. `tests/vllm/transformers_utils/test_downloader.cpp`
+and `tests/vllm/transformers_utils/test_model_resolver.cpp` run against
+in-process fake hubs, and `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp`
+is the REACHABILITY gate: it enters at `VllmServerMain(argc, argv)` with
+`--model tiny/llama --revision serving --download-dir <dir>`, and the server
+fetches the committed `llama_embed_e2e` checkpoint from the fake hub, boots, and
+completes a `/v1/completions` request. Neutralising the resolver call site in
+`server_main.cpp` with `if (false)` leaves the server unable to bind and turns
+that case red. DELETING the call instead does not compile, and the mutation
+table above records why.
+
+A SIXTH FRESH REVIEW returned FAIL on seven findings, and this head repairs six
+and records the seventh. `tests/scripts/test_validate_container_image.py` ran in
+NO gate: it was invoked by neither `scripts/agent-preflight.sh` nor
+`.github/workflows/ci.yml`, so the spec's claim that it pinned the classifier
+was a claim about a suite nothing ran. It is now in both, and breaking one of
+its eleven tests reddens a preflight run. The one-definition-rule instrument
+named three translation units and read two, and undefining the macro for
+`downloader.cpp` alone was measured to leave the suite fully green; it now takes
+a third reading from that unit and the same mutation reddens 2 of 5 cases. The
+production refusal in `server_main.cpp` had no gate at all, and a symbol
+citation in `## Gates` now reddens `scripts/check-symbol-anchors.py` when the
+call site is deleted, with the two-configuration behavior recorded there as a
+manual measurement and its recipe. `VLLM_CPP_BUILD_BORINGSSL` was offered
+without saying it has never been compiled, and the guide now marks it
+`UNTESTED`. Two comment defects are corrected: the `HUB_REACH_MODEL` comment
+claimed a 404 the same file elsewhere records as a measured 401, and a guide
+sentence promised two refusing lanes above a three-row table whose first row
+works. The seventh finding, `VLLM_CPP_HF_DOWNLOAD` missing from
+`release_metadata.py`'s `REQUIRED_FLAGS`, is recorded under `## Owed` with the
+reason the one-line fix was rejected: the CMake cache carries the REQUESTED
+value and the downgrade never writes back, so the field would read `true` on
+exactly the lane that refuses.
+
+A FIFTH FRESH REVIEW returned FAIL on six findings, and every one is repaired at
+this head. The end-to-end case leaked a listening socket and the retry loop hid
+it, both recorded under `## Risks and decisions` with the measurement.
+`--revision` and `--download-dir` were parsed and never reached, and the
+end-to-end case now carries both and reddens when either `ParseArgs` branch is
+deleted. The recorded resolver mutation did not compile, and the table now
+records the one that does. The two no-TLS cases were wrapped in
+`#ifndef CPPHTTPLIB_OPENSSL_SUPPORT` and would have become zero-assertion skips
+the moment W5 defines that macro, so the preprocessor now selects WHICH
+statement each case makes rather than whether it makes one. Preprocessing both
+files with the macro defined yields zero surviving assertions at `e25d3d344` and
+the TLS arm at this head. And the object-identifier preference in `BlobNameFor`
+was unpinned, so `test_model_resolver.cpp` now gives one listed file an
+identifier and asserts the two blob names apart.
+
+#1491 landed while this branch was open and split `docs/USAGE.md` into
+`docs/guides/`, `docs/models/` and `docs/reference/`. The merge takes that file
+unchanged from `origin/main` and re-applies this row's documentation where the
+split put it: the fetch, the cache layout and the limits in
+`docs/guides/hugging-face-access.md`, and the `--model`, `--revision` and
+`--download-dir` rows in `docs/reference/server.md`.
+
+At the end of W4, W5, W6 and W7 had not been done: there was no transport layer
+security option, no `docs/FEATURES.md` entry, and no fresh review. W5 and W6 are
+described at the top of this section. W7 has run one round.
+
+The paragraph below records the state W2 left, and is kept because the size-rule
+findings it names are what the current head's integrity rules are built from.
+
+W1 and W2 landed first. W1 corrected the llama.cpp anchor
 table onto stock tag `b10451`. W2 landed `hf_hub` and `hf_cache` under
 `src/vllm/transformers_utils/`, with `include/vllm/transformers_utils/`
 headers, and moved the DFlash draft path's copy of the cache walk onto the
@@ -526,6 +1155,4 @@ documented on the function and on `HfFile::oid`. `test_hf_hub.cpp` now carries
 
 The row stays `READY` rather than moving to `ACTIVE`, because an `ACTIVE` row
 needs a `CLAIM-*` owner recorded in a claim source and that is the operator's
-record to write, not an implementer's. W3 through W7 have not been done: there
-is no downloader, no `--model` grammar, no transport layer security option, and
-no user-facing workflow. `--model` still takes a local path only.
+record to write, not an implementer's.

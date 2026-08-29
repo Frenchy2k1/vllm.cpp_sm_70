@@ -42,6 +42,7 @@
 #include <nlohmann/json.hpp>
 
 #include "support/max_abs_diff.h"
+#include "support/test_env.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
@@ -1145,4 +1146,681 @@ TEST_CASE("ltx2 device: a single-stream model type is REFUSED") {
       (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, nullptr, vt::DType::kF32));
   CHECK_THROWS(
       (void)Ltx2DitForwardDevice(q, p, staged.weights, nullptr, &m.audio, vt::DType::kF32));
+}
+
+// ---------------------------------------------------------------------------
+// The perturbations — #1092's second half, row LTX25-GUIDED-VIDEO §12
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The perturbation shapes the guided denoiser builds (denoisers.py:100-137),
+// measured against the unperturbed baseline.
+struct PerturbationCase {
+  const char* name;
+  bool video_self;   // SKIP_VIDEO_SELF_ATTN on block 0
+  bool audio_self;   // SKIP_AUDIO_SELF_ATTN on block 0
+  bool skip_a2v;     // SKIP_A2V_CROSS_ATTN, all blocks
+  bool skip_v2a;     // SKIP_V2A_CROSS_ATTN, all blocks
+  bool moves_video;  // which stream this shape must move
+  bool moves_audio;
+};
+
+vllm::Ltx2DitPerturbation BuildPerturbation(const PerturbationCase& pc, int64_t num_layers) {
+  vllm::Ltx2DitPerturbation p;
+  if (pc.video_self) {
+    p.video_self_attn.assign(static_cast<size_t>(num_layers), 0);
+    p.video_self_attn[0] = 1;
+  }
+  if (pc.audio_self) {
+    p.audio_self_attn.assign(static_cast<size_t>(num_layers), 0);
+    p.audio_self_attn[0] = 1;
+  }
+  p.video_cross_attn_skip_all = pc.skip_a2v;
+  p.audio_cross_attn_skip_all = pc.skip_v2a;
+  return p;
+}
+
+double MaxAbsOf(const std::vector<float>& v) {
+  double m = 0.0;
+  for (const float x : v) m = std::max(m, std::abs(static_cast<double>(x)));
+  return m;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 device: the device forward HONOURS every perturbation and tracks the host arm") {
+  // WHY THIS CASE EXISTS. `Ltx2DitForwardDevice` took no `perturbations` argument
+  // until 2026-08-19, so the guided denoiser's `ptb` and `mod` passes could not
+  // run on `device != 0` and `ltx2_video.cpp` REFUSED the whole render rather
+  // than serve an unperturbed forward. The first full-model render (#1375) paid
+  // for that: it ran `one_stage --device cuda` with `stg_scale` pinned to 0.0 and
+  // `modality_scale` to 1.0, i.e. with two of upstream's four guidance terms
+  // switched off, and finished a clip along a different trajectory.
+  //
+  // TWO ASSERTIONS PER ROW, because either alone is passable by a defect:
+  //
+  //   AGREEMENT   the device arm must match the HOST arm on the same perturbed
+  //               inputs, to the same 2e-5 the existing host-tracking case uses.
+  //               A device arm that applied the flag WRONG fails this.
+  //   NON-VACUITY the perturbed result must differ from the UNPERTURBED one by
+  //               more than that same bound, on the stream the perturbation
+  //               writes. A device arm that accepted the argument and dropped it
+  //               would agree with a host arm it never diverged from, and would
+  //               pass the first assertion alone. This is the half that is RED
+  //               before the change.
+  //
+  // The bound on the second is `kDeviceRoundOff` ITSELF, and that is the precise
+  // statement: the perturbed run must miss the unperturbed one by MORE than the
+  // tolerance the agreement half is held to, or a dropped perturbation would pass
+  // this gate.
+  //
+  // CPU BACKEND, and that is not a weakening: `Ltx2DeviceKernelsAvailable(kCPU)`
+  // is what lets the whole device-forward CODE PATH be covered without a GPU, as
+  // the seam case at the top of this file argues. A GPU gates the KERNELS. What a
+  // GPU still owes here is the END-TO-END entry through `vllm_video_engine_load`
+  // on `device = 1`; see .agents/specs/ltx25-guided-video.md §12.8 link B.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, false);
+
+  const vllm::Ltx2DitOutputs base_dev =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  const vllm::Ltx2DitOutputs base_host =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  // The unperturbed baseline must itself be non-zero, or every "moved" and "did
+  // not move" comparison below is trivially satisfied by a forward that computed
+  // nothing at all.
+  REQUIRE(MaxAbsOf(base_dev.video) > 1e-6);
+  REQUIRE(MaxAbsOf(base_dev.audio) > 1e-6);
+  CHECK(MaxAbsDiff(base_dev.video, base_host.video.data(), base_host.video.size()) <
+        kDeviceRoundOff);
+  CHECK(MaxAbsDiff(base_dev.audio, base_host.audio.data(), base_host.audio.size()) <
+        kDeviceRoundOff);
+
+  const PerturbationCase cases[] = {
+      // `ptb`, video half — SKIP_VIDEO_SELF_ATTN on block 0. It moves BOTH
+      // streams, because block 0's video state is what block 0's V2A and block
+      // 1's cross attentions read.
+      {"ptb / SKIP_VIDEO_SELF_ATTN", true, false, false, false, true, true},
+      {"ptb / SKIP_AUDIO_SELF_ATTN", false, true, false, false, true, true},
+      {"ptb / both self types", true, true, false, false, true, true},
+      // `mod` — both cross directions off in every block, which is exactly what
+      // `_guided_denoise` builds when either guider's `modality_scale != 1.0`
+      // (denoisers.py:125-138, `blocks=None` on both types). Every VIDEO row of
+      // the params table defaults it to 3.0, so this is the SHIPPED shape.
+      {"mod / both cross directions", false, false, true, true, true, true},
+      {"mod-shaped / SKIP_A2V only", false, false, true, false, true, true},
+      {"mod-shaped / SKIP_V2A only", false, false, false, true, true, true},
+  };
+
+  for (const PerturbationCase& pc : cases) {
+    // `INFO(char*)` stringifies as a BOOL in doctest and prints `1`; a label that
+    // cannot name the failing row is not a label. std::string is the fix.
+    INFO("perturbation: " << std::string(pc.name));
+    const vllm::Ltx2DitPerturbation pert = BuildPerturbation(pc, p.num_layers);
+    const vllm::Ltx2DitOutputs dev =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &pert);
+    const vllm::Ltx2DitOutputs host =
+        Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32,
+                       /*cache=*/nullptr, &pert);
+    REQUIRE(dev.video.size() == base_dev.video.size());
+    REQUIRE(dev.audio.size() == base_dev.audio.size());
+
+    // AGREEMENT.
+    const double av = MaxAbsDiff(dev.video, host.video.data(), host.video.size());
+    const double aa = MaxAbsDiff(dev.audio, host.audio.data(), host.audio.size());
+    MESSAGE(std::string(pc.name) << ": device-vs-host video=" << av << " audio=" << aa);
+    CHECK(av < kDeviceRoundOff);
+    CHECK(aa < kDeviceRoundOff);
+
+    // NON-VACUITY, against the UNPERTURBED device run.
+    const double mv = MaxAbsDiff(dev.video, base_dev.video.data(), base_dev.video.size());
+    const double ma = MaxAbsDiff(dev.audio, base_dev.audio.data(), base_dev.audio.size());
+    MESSAGE(std::string(pc.name) << ": device moved by video=" << mv << " audio=" << ma);
+    if (pc.moves_video) {
+      CHECK_MESSAGE(mv > kDeviceRoundOff,
+                    "the device forward returned the UNPERTURBED video for a perturbed call, so "
+                    "`perturbations` reached no guard. That is the state #1092's refusal existed "
+                    "to prevent, now reachable instead of refused: the guider's "
+                    "`stg_scale * (cond - ptb)` and `(modality_scale - 1) * (cond - mod)` terms "
+                    "would be identically zero and the render would finish");
+    }
+    if (pc.moves_audio) {
+      CHECK_MESSAGE(ma > kDeviceRoundOff,
+                    "the device forward returned the UNPERTURBED audio for a perturbed call");
+    }
+  }
+
+  // And the bf16 PRODUCTION stream carries it too, because that is the dtype a
+  // real accelerator render runs at and the f32 arm above is the parity one.
+  // Held to the bf16 band against the host f32 arm, which is the bound every
+  // other bf16 case in this file uses.
+  const Ltx2DitDeviceWeights staged_bf16 =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
+  vllm::Ltx2DitPerturbation mod_pass;
+  mod_pass.video_cross_attn_skip_all = true;
+  mod_pass.audio_cross_attn_skip_all = true;
+  const vllm::Ltx2DitOutputs bf16_base =
+      Ltx2DitForwardDevice(q, p, staged_bf16.weights, &m.video, &m.audio, vt::DType::kBF16);
+  const vllm::Ltx2DitOutputs bf16_mod =
+      Ltx2DitForwardDevice(q, p, staged_bf16.weights, &m.video, &m.audio, vt::DType::kBF16,
+                           /*cache=*/nullptr, &mod_pass);
+  const vllm::Ltx2DitOutputs host_mod =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32,
+                     /*cache=*/nullptr, &mod_pass);
+  const double bv = MaxAbsDiff(bf16_mod.video, host_mod.video.data(), host_mod.video.size());
+  MESSAGE("bf16 mod pass vs host f32: video max|diff| = " << bv);
+  CHECK(bv < kBf16RoundOff);
+  // ... and it MOVED at bf16 too, or the assertion above would pass on a bf16 arm
+  // that dropped the perturbation and happened to sit inside the band.
+  CHECK(MaxAbsDiff(bf16_mod.video, bf16_base.video.data(), bf16_base.video.size()) >
+        kBf16RoundOff);
+}
+
+TEST_CASE("ltx2 device: each CROSS perturbation gates ITS OWN direction and no other (#1092)") {
+  // THE DEVICE TWIN OF tests/vllm/multimodal/test_ltx2_video.cpp's host case, and
+  // it exists for the same MEASURED reason. Against the host arm three mutations
+  // were GREEN until a direct per-direction case existed: apply only
+  // `video_cross_attn_skip_all`, apply only `audio_cross_attn_skip_all`, and SWAP
+  // which flag gates which direction. A both-streams-enabled forward cannot
+  // separate them, because a `mod`-shaped call still differs from `cond` with one
+  // direction applied.
+  //
+  // HOW ONE DIRECTION IS ISOLATED on a DiT with more than one block. Within a
+  // block the two directions are independent — both read the pre-cross snapshots
+  // `vx_pre` / `ax_pre` (transformer.py:333). ACROSS blocks they are not: block
+  // 1's V2A reads what block 0's A2V wrote, and this fixture has two blocks. The
+  // separation therefore comes from upstream's own predicates
+  // (transformer.py:268-269), which test the OTHER stream's PRESENCE and this
+  // stream's `enabled`:
+  //
+  //   run_a2v = run_vx and audio is present      run_vx = video.ENABLED and ...
+  //   run_v2a = run_ax and video is present      run_ax = audio.ENABLED and ...
+  //
+  // so `audio->enabled = false` with the audio stream still PRESENT runs A2V and
+  // not V2A, and `video->enabled = false` runs V2A and not A2V.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+
+  vllm::Ltx2DitPerturbation skip_a2v;
+  skip_a2v.video_cross_attn_skip_all = true;  // SKIP_A2V_CROSS_ATTN
+  vllm::Ltx2DitPerturbation skip_v2a;
+  skip_v2a.audio_cross_attn_skip_all = true;  // SKIP_V2A_CROSS_ATTN
+
+  SUBCASE("SKIP_A2V_CROSS_ATTN moves the VIDEO stream and SKIP_V2A does not") {
+    Modalities m;
+    BuildModalities(&m, false);
+    m.audio.enabled = false;  // audio still PRESENT: A2V runs, V2A does not
+    const vllm::Ltx2DitOutputs base =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    REQUIRE(MaxAbsOf(base.video) > 1e-6);
+
+    const vllm::Ltx2DitOutputs a2v_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_a2v);
+    REQUIRE(a2v_off.video.size() == base.video.size());
+    CHECK_MESSAGE(MaxAbsDiff(a2v_off.video, base.video.data(), base.video.size()) > 0.0,
+                  "`video_cross_attn_skip_all` changed nothing on a device forward where A2V is "
+                  "the only cross direction running, so the flag reaches no guard "
+                  "(transformer.py:335). The isolated-modality pass is then the conditional pass "
+                  "again in the audio->video direction, on a recipe whose modality_scale is 3.0");
+
+    const vllm::Ltx2DitOutputs v2a_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_v2a);
+    REQUIRE(v2a_off.video.size() == base.video.size());
+    // BIT-IDENTICAL, not "within a band". Nothing this flag gates runs at all on
+    // this forward, so any difference is the two flags wired to each other's
+    // directions — which is what makes the SWAP detectable and not only the
+    // omission.
+    CHECK_MESSAGE(v2a_off.video == base.video,
+                  "`audio_cross_attn_skip_all` moved the VIDEO stream on a device forward that "
+                  "runs no V2A at all, so the two flags are wired to each other's directions. "
+                  "The flag rides on the stream being WRITTEN (transformer.py:335, :367)");
+  }
+
+  SUBCASE("SKIP_V2A_CROSS_ATTN moves the AUDIO stream and SKIP_A2V does not") {
+    Modalities m;
+    BuildModalities(&m, false);
+    m.video.enabled = false;  // video still PRESENT: V2A runs, A2V does not
+    const vllm::Ltx2DitOutputs base =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    REQUIRE(MaxAbsOf(base.audio) > 1e-6);
+
+    const vllm::Ltx2DitOutputs v2a_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_v2a);
+    REQUIRE(v2a_off.audio.size() == base.audio.size());
+    CHECK_MESSAGE(MaxAbsDiff(v2a_off.audio, base.audio.data(), base.audio.size()) > 0.0,
+                  "`audio_cross_attn_skip_all` changed nothing on a device forward where V2A is "
+                  "the only cross direction running, so the flag reaches no guard "
+                  "(transformer.py:367)");
+
+    const vllm::Ltx2DitOutputs a2v_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_a2v);
+    REQUIRE(a2v_off.audio.size() == base.audio.size());
+    CHECK_MESSAGE(a2v_off.audio == base.audio,
+                  "`video_cross_attn_skip_all` moved the AUDIO stream on a device forward that "
+                  "runs no A2V at all, so the two flags are wired to each other's directions");
+  }
+
+  SUBCASE("the pre-cross snapshot stays OUTSIDE both direction guards") {
+    // `vx_pre_av = vx` sits ABOVE both guards upstream (transformer.py:333), so a
+    // pass that skips one direction still lets the surviving one read the
+    // PRE-cross state, and the two blocks stay COUPLED: block 1's V2A reads the
+    // video state block 0's A2V wrote.
+    //
+    // The instrument is that coupling. With both streams enabled, skipping A2V
+    // must move the AUDIO stream even though no V2A flag was set — it moves
+    // because block 0's A2V no longer writes the video state block 1's V2A reads.
+    // A build that hoisted the snapshot into the guards, or that applied the flags
+    // per stream instead of per direction, breaks that and this reads zero.
+    Modalities m;
+    BuildModalities(&m, false);
+    const vllm::Ltx2DitOutputs both_on =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    const vllm::Ltx2DitOutputs a2v_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_a2v);
+    const vllm::Ltx2DitOutputs v2a_off =
+        Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                             /*cache=*/nullptr, &skip_v2a);
+    CHECK(MaxAbsDiff(a2v_off.audio, both_on.audio.data(), both_on.audio.size()) > kDeviceRoundOff);
+    CHECK(MaxAbsDiff(v2a_off.video, both_on.video.data(), both_on.video.size()) > kDeviceRoundOff);
+    // ... and the two shapes are not the same shape, so neither row above can be
+    // satisfied by a forward that treats the two flags as one.
+    CHECK(MaxAbsDiff(a2v_off.video, v2a_off.video.data(), v2a_off.video.size()) > kDeviceRoundOff);
+  }
+}
+
+TEST_CASE("ltx2 device: a malformed perturbation is REFUSED with the HOST arm's own text") {
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, false);
+
+  // A vector built for a DIFFERENT layer count is refused rather than indexed
+  // defensively: it would otherwise perturb a prefix of the blocks and leave the
+  // rest alone, which is a legal-looking STG pass over the wrong blocks. The host
+  // arm refuses it at ltx2_dit.cpp:837-842, and the two arms must not disagree
+  // about the same request — which is the divergence #1111 records on a
+  // neighbouring predicate.
+  for (const int64_t delta : {int64_t{1}, int64_t{-1}}) {
+    vllm::Ltx2DitPerturbation bad;
+    bad.video_self_attn.assign(static_cast<size_t>(p.num_layers + delta), 0);
+    const std::string msg = RefusalMessage([&] {
+      (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32,
+                                 /*cache=*/nullptr, &bad);
+    });
+    INFO(msg);
+    CHECK(msg.find("neither empty nor one entry per block") != std::string::npos);
+    // The HOST arm refuses the same request with the same WORDS, so a reader who
+    // hits it on one residency finds the other. `VT_CHECK` appends ` at
+    // <file>:<line>`, which necessarily differs between two files, so the
+    // comparison is over the sentence and not over the whole string — and the
+    // sentence is required to be non-empty so a build where both throw nothing
+    // recognisable cannot satisfy it by comparing two empty strings.
+    const std::string host_msg = RefusalMessage([&] {
+      (void)Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32,
+                           /*cache=*/nullptr, &bad);
+    });
+    const auto sentence = [](const std::string& text) {
+      const size_t at = text.rfind(" at ");
+      return at == std::string::npos ? text : text.substr(0, at);
+    };
+    REQUIRE(sentence(msg).size() > 20);
+    CHECK(sentence(host_msg) == sentence(msg));
+  }
+
+  // An EMPTY vector is not a malformed one: it is `PerturbationConfig.empty()`'s
+  // own shape and means "no block", which is what the `mod` pass carries beside
+  // its two cross booleans.
+  vllm::Ltx2DitPerturbation mod_only;
+  mod_only.video_cross_attn_skip_all = true;
+  mod_only.audio_cross_attn_skip_all = true;
+  CHECK_NOTHROW((void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio,
+                                           vt::DType::kF32, /*cache=*/nullptr, &mod_only));
+}
+
+// ---------------------------------------------------------------------------
+// REACHABILITY — the DiT self-attention must actually ENTER the fast op
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFa2, not Flash or vt::Attention") {
+  // WHY THIS CASE EXISTS (#1549). Until 2026-08-21 the device DiT self-attention
+  // called `vt::Attention`, which on CUDA is `vt::cuda::AttentionKernel` — the
+  // kernel whose own header calls itself "Correctness-grade (M0.9)". One DiT
+  // forward at 768x448/49f measured 47.84 s on GB10 because of it. NOTHING in
+  // this tree could see that: the output was right so every golden above passed,
+  // the op was registered so no refusal fired, and `GetOpProviderStats` counted
+  // the naive selection as the success it genuinely was. The only symptom was a
+  // wall clock, and a diffusion render has no reference wall clock.
+  //
+  // So the gate for this change cannot be numerical. It has to be a DISPATCH
+  // observation, and this is it.
+  //
+  // TWO-SIDED, because either half alone is passable by a defect:
+  //
+  //   POSITIVE   `kAttentionDenseFa2` must be selected once per self-attention
+  //              per block per batch row. A count of zero means the swap did not
+  //              happen or the branch was never entered.
+  //   NEGATIVE   `kAttention` AND `kAttentionDenseFlash` must both be selected
+  //              ZERO times across the whole forward. This is the half that makes
+  //              it a ROUTING proof rather than an ADDITION proof: LTX's
+  //              cross-attentions use `kAttentionCross`, so after the swap the DiT
+  //              has no remaining caller of either rung. A second, unswapped
+  //              self-attention path added later turns this half red.
+  //
+  // THREE RUNGS, THREE OPS, and the negative half now names two of them because
+  // #1551 moved the default UP a rung rather than sideways. `kAttentionDenseFlash`
+  // was the #1549 default and is still reachable through the A/B knob, so "not
+  // selected" is a statement about the DEFAULT arm specifically. Dropping the
+  // flash half of the negative would let a partial revert — one stream moved back
+  // to flash, the other left on FA-2 — stay green while the video stream, which is
+  // the whole point of #1551, quietly lost its tensor cores.
+  //
+  // The EXACT count is asserted, not a floor. A floor below the real count is a
+  // mute switch: it stays green while one of the two streams silently stops
+  // routing here.
+  //
+  // ENTRY POINT. `Ltx2DitForwardDevice` is the production device forward —
+  // `src/vllm/multimodal/ltx2_video.cpp::Ltx2DitForwardDevice` at :4246, inside
+  // the denoise loop, calls exactly this function. This case does not construct a
+  // `vt::Attention` call by hand; a test that did would prove the op works and
+  // nothing about whether the model reaches it.
+  //
+  // CPU BACKEND, and that is not a weakening. `GetOp` is the dispatch point on
+  // every backend, so the ROUTING is observable without a GPU; what a GPU gates
+  // is the kernel behind it. On CPU all four ops resolve to the same registered
+  // function (`src/vt/cpu/cpu_ops.cpp:3750-3764`, the `kAttention` /
+  // `kAttentionDenseFast` / `kAttentionDenseFlash` / `kAttentionDenseFa2`
+  // registrations), which is exactly why the golden cases above stay
+  // byte-unchanged by this swap and why this case has to ask the provider rather
+  // than the numbers.
+  //
+  // UNMASKED inputs on purpose: a MASKED self-attention carries a bias and
+  // legitimately routes to `kAttentionCross` (the dispatch condition is
+  // `context == nullptr && a.bias == nullptr`). Masked is a different question
+  // and is not this case's.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, /*masked=*/false);
+  REQUIRE(m.video.batch == m.audio.batch);
+
+  // SCOPE GUARDS, because both of these are PROCESS state and this case has
+  // `REQUIRE`s in it. A failed `REQUIRE` unwinds out of the case, and a `throw`
+  // from either forward does the same; on the straight-line version the counting
+  // instrument stayed enabled and the knob stayed set for the other 21 cases in
+  // this binary, which would make an unrelated case's failure depend on which
+  // case failed first.
+  struct StatsGuard {
+    ~StatsGuard() { vt::EnableOpProviderCallStats(false); }
+  } stats_guard;
+  struct KnobGuard {
+    ~KnobGuard() { vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN"); }
+  } knob_guard;
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+
+  const vllm::Ltx2DitOutputs out =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  // The forward must have actually computed something, or every count below is a
+  // count of a forward that did nothing.
+  REQUIRE(MaxAbsOf(out.video) > 1e-6);
+  REQUIRE(MaxAbsOf(out.audio) > 1e-6);
+
+  const vt::OpProviderStats fa2 =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
+  const vt::OpProviderStats flash =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  const vt::OpProviderStats naive =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+
+  // Two self-attentions per block — `attn1` on the video stream and
+  // `audio_attn1` on the audio one — each looping the batch rows.
+  const unsigned long long want =
+      static_cast<unsigned long long>(2 * p.num_layers * m.video.batch);
+  MESSAGE("kAttentionDenseFa2 selections = " << fa2.selections << " (want " << want
+                                             << "), kAttentionDenseFlash = " << flash.selections
+                                             << ", kAttention = " << naive.selections);
+  CHECK(fa2.selections == want);
+  CHECK(flash.selections == 0);
+  CHECK(naive.selections == 0);
+
+  // The A/B knob is the same-binary control this row's measurement runs on, so
+  // it is gated too: `=0` must put every one of those calls BACK on the naive op.
+  // A knob that silently did nothing would leave the A/B measuring one arm twice,
+  // which is the failure mode a same-binary A/B exists to avoid.
+  // Through the shared shim, not a private `#ifdef _WIN32` branch: `setenv` and
+  // `unsetenv` are POSIX and MSVC has neither, and issue #603 exists because
+  // three files had already grown their own copy. `check-windows-portability.py`
+  // cannot see an unguarded `::setenv` in a test translation unit (#1107), so
+  // nothing would have caught a private branch here either.
+  vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", "0");
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  const vllm::Ltx2DitOutputs off =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  const vt::OpProviderStats flash_off =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  const vt::OpProviderStats naive_off =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+  CHECK(flash_off.selections == 0);
+  CHECK(naive_off.selections == want);
+  // And the two arms must agree BYTE-FOR-BYTE on CPU, where `kAttention` and
+  // `kAttentionDenseFlash` are the same registered function. This is the CPU half
+  // of the numerics claim, stated as an equality rather than a tolerance because
+  // on this backend nothing else is defensible. The CUDA half is NOT bit-identical
+  // and is gated by the host-vs-device parity case above, at its own tolerance.
+  REQUIRE(off.video.size() == out.video.size());
+  REQUIRE(off.audio.size() == out.audio.size());
+  CHECK(std::equal(off.video.begin(), off.video.end(), out.video.begin()));
+  CHECK(std::equal(off.audio.begin(), off.audio.end(), out.audio.begin()));
+
+  // AND THE THIRD ARM, `=flash`, which until the review of #1551 was protected by
+  // NOTHING EXECUTABLE. Deleting the whole `else if (std::strcmp(arm, "flash"))`
+  // arm from `ltx2_device.cpp` left this binary at 22 cases / 653 assertions /
+  // SUCCESS, because no case here ever set the knob to anything but `"0"`: the
+  // deleted arm simply fell through to the FA-2 default, and the FA-2 default is
+  // what every other half of this case already asserts. The harness precondition
+  // meant to catch that (`ltx25-dit-attn-fa2-hd128-ab.sh`) counted COMMENTS
+  // rather than code, so it read 2 on the mutated tree and passed its own
+  // `-ge 1`. Both halves are repaired; this is the executable one.
+  //
+  // WHY IT IS A CORRECTNESS PROBLEM AND NOT A TIDINESS ONE. `flash` is the
+  // DENOMINATOR of this row's ratio. An arm that silently becomes a second copy
+  // of the numerator's arm makes the A/B measure one rung twice and still print
+  // two columns, and the ratio it yields is ~1.00x — which is also exactly what
+  // "no speedup" looks like, so the number cannot report its own failure. A
+  // denominator therefore needs the same routing proof the default arm has, and
+  // for the same reason.
+  //
+  // ALL THREE counters are reset first. `kAttentionDenseFa2` in particular has
+  // been counting since the top of this case, and a stale value would make the
+  // `== 0` below pass for a reason that has nothing to do with the knob. EXACT
+  // counts again, never floors, for the reason recorded at the head of this case.
+  vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", "flash");
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  const vllm::Ltx2DitOutputs den =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  const vt::OpProviderStats flash_on =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  const vt::OpProviderStats fa2_on =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
+  const vt::OpProviderStats naive_on =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+  MESSAGE("=flash: kAttentionDenseFlash selections = "
+          << flash_on.selections << " (want " << want
+          << "), kAttentionDenseFa2 = " << fa2_on.selections
+          << ", kAttention = " << naive_on.selections);
+  CHECK(flash_on.selections == want);
+  CHECK(fa2_on.selections == 0);
+  CHECK(naive_on.selections == 0);
+  // The denominator arm must also COMPUTE what the other two do, for the reason
+  // the `=0` equality above states: on CPU all three ops are the one registered
+  // function, so byte equality is the only defensible bound here, and the CUDA
+  // deviation is the parity case's question rather than this one's.
+  REQUIRE(den.video.size() == out.video.size());
+  REQUIRE(den.audio.size() == out.audio.size());
+  CHECK(std::equal(den.video.begin(), den.video.end(), out.video.begin()));
+  CHECK(std::equal(den.audio.begin(), den.audio.end(), out.audio.begin()));
+  // `stats_guard` disables the counting instrument on the way out, on this path
+  // and on every unwinding one.
+}
+
+TEST_CASE("ltx2 device: an unrecognised VLLM_LTX2_DIT_FLASH_ATTN value is REFUSED by name") {
+  // WHY THIS CASE EXISTS (#1751). The case above gates the three arms the knob
+  // HAS. Nothing gated the fourth value — the one an operator actually types.
+  //
+  // Until this row the dispatch read the knob by two different rules. The naive
+  // arm tested `arm[0] == '0'`, a PREFIX, so `0x`, `07` and `0flash` all selected
+  // `vt::Attention`; the flash arm used `strcmp`, so only the exact string
+  // selected `vt::AttentionDenseFlash`; and everything matching neither — a typo
+  // (`falsh`), a case difference (`FLASH`), a trailing space, a plausible-looking
+  // `naive` or `1`, or an empty value from an unset shell variable — fell into a
+  // bare `else` and ran the FA-2 DEFAULT with no diagnostic.
+  //
+  // THAT IS A MEASUREMENT DEFECT, not a tidiness one, and it inverts the exact
+  // comparison the knob exists to support. `flash` is the DENOMINATOR of the
+  // 2.74x ratio in `.agents/specs/ltx25-dit-attn-fa2-hd128.md` §8. A mistyped
+  // denominator arm did not fail: it ran the NUMERATOR's kernel a second time and
+  // yielded ~1.00x, which is also exactly what "no speedup" looks like — so the
+  // number could not report its own failure. The harness is protected
+  // (`assert_arm_op` in `scripts/ltx25-dit-attn-fa2-hd128-ab.sh` reads the
+  // `VT_OP_PROVIDER_STATS=1` announcement and exits 47 on a mismatch); a human
+  // exporting the variable in a shell or a service unit was not.
+  //
+  // ENTRY POINT, for the same reason the case above states it: the refusal is
+  // asserted through `Ltx2DitForwardDevice`, the production device forward that
+  // `src/vllm/multimodal/ltx2_video.cpp::Ltx2DitForwardDevice` calls inside the
+  // denoise loop. A test that parsed the value by hand would prove a parser works
+  // and nothing about whether the model reaches it.
+  //
+  // CPU BACKEND is sufficient and is not a weakening: the dispatch that reads the
+  // knob is backend-independent, and what a GPU gates is the kernel behind each
+  // arm rather than which arm is chosen.
+  vt::Queue q{Cpu(), nullptr};
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const Ltx2DitDeviceWeights staged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kF32);
+  Modalities m;
+  BuildModalities(&m, /*masked=*/false);
+
+  // PROCESS state, and this case throws on purpose, so the knob is unset on every
+  // unwinding path as well — the reason the case above carries the same guard.
+  struct KnobGuard {
+    ~KnobGuard() { vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN"); }
+  } knob_guard;
+
+  // Each of these is a value a person plausibly sets, and every one of them ran
+  // an arm it did not name before this change. The first three are the PREFIX
+  // hole — they silently selected the naive rung. The rest silently selected the
+  // FA-2 default.
+  const char* const rejected[] = {"0x", "07", "0flash", "falsh", "FLASH",
+                                  "flash ", "naive", "1"};
+  auto refuses = [&](const char* value, const std::string& msg) {
+    // `shown` is a std::string on purpose: doctest stringifies a `const char*`
+    // passed to INFO as a BOOL, so the value under test would print as `true`.
+    const std::string shown = std::string("VLLM_LTX2_DIT_FLASH_ATTN=\"") + value + "\" -> " + msg;
+    INFO(shown);
+    // It REFUSED at all. An empty message is a forward that returned, which is
+    // the defect: it ran an arm the operator did not ask for.
+    CHECK(!msg.empty());
+    // It refused BY NAME. A bare "invalid value" leaves the reader to guess which
+    // of the `VLLM_LTX2_*` and `VT_*` knobs in `docs/ENVIRONMENT.md` it came
+    // from, and this one is read from inside a 48-layer denoise loop.
+    CHECK(msg.find("VLLM_LTX2_DIT_FLASH_ATTN") != std::string::npos);
+    // It named the ACCEPTED values, so the message is actionable without the
+    // source. Both spellings, because a refusal that lists one arm reads as if
+    // the other does not exist.
+    CHECK(msg.find("flash") != std::string::npos);
+    CHECK(msg.find("unset") != std::string::npos);
+    // And it echoed WHAT WAS SET. A trailing space and a case difference are
+    // invisible in a shell history; a message that repeats the offending value is
+    // what separates `flash ` from `flash` for the person reading it.
+    CHECK(msg.find(std::string("\"") + value + "\"") != std::string::npos);
+  };
+  for (const char* value : rejected) {
+    vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", value);
+    const std::string msg = RefusalMessage([&] {
+      (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    });
+    vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+    refuses(value, msg);
+  }
+
+  // A DEFINED-BUT-EMPTY value, which is a NINTH case and cannot go in the loop
+  // above. `vllm_test::SetEnv` maps an empty value to a DELETE on both platforms
+  // by documented design (`tests/support/test_env.h`), because `_putenv_s(name,
+  // "")` deletes on Windows while `setenv(name, "", 1)` defines an empty string
+  // on POSIX; that header says a test needing a defined-but-empty variable has to
+  // say so at its own call site, so this one does. Guarded rather than skipped
+  // for the same reason the shim exists: an unguarded `::setenv` does not fail
+  // the MSVC lane, it breaks its build.
+  //
+  // IT IS WORTH THE GUARD. `export VLLM_LTX2_DIT_FLASH_ATTN=$ARM` with an unset
+  // `ARM` produces exactly this, and it is the case in which an operator most
+  // believes they selected an arm. On Windows the state is unreachable — the
+  // platform has no defined-but-empty variable — so there is nothing there to
+  // assert rather than an assertion being dropped.
+#if !defined(_WIN32)
+  REQUIRE(::setenv("VLLM_LTX2_DIT_FLASH_ATTN", "", 1) == 0);
+  const std::string empty_msg = RefusalMessage([&] {
+    (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  });
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+  refuses("", empty_msg);
+#endif
+
+  // THE NEGATIVE HALF, and it is the half that keeps the fix from being a
+  // regression. A parse strict enough to refuse `falsh` is also strict enough to
+  // refuse `flash`, and a refusal on `0` or `flash` would take the 47.84 s and
+  // 7.68 s rungs out of this binary — which is the same loss of the A/B, from the
+  // opposite direction. The case above proves those two values still ROUTE to
+  // their own ops; this proves they still RUN at all, next to the refusals, so a
+  // mutation that refuses everything cannot pass this case.
+  const char* const accepted[] = {"0", "flash"};
+  for (const char* value : accepted) {
+    vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", value);
+    const std::string msg = RefusalMessage([&] {
+      (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+    });
+    vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+    const std::string shown = std::string("VLLM_LTX2_DIT_FLASH_ATTN=\"") + value + "\" -> " + msg;
+    INFO(shown);
+    CHECK(msg.empty());
+  }
+  // UNSET is the shipped default and the only serving arm, so it must reach the
+  // forward with no environment at all. This is the assertion that says the
+  // refusal was not implemented as "the variable is now required".
+  const std::string unset_msg = RefusalMessage([&] {
+    (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  });
+  INFO(unset_msg);
+  CHECK(unset_msg.empty());
 }

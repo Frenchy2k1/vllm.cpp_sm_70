@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import math
 import pathlib
 import signal
@@ -121,6 +122,38 @@ MAX_WITHIN_RUN_SPREAD_PCT = 5.0
 # consistent with that ceiling and sits under it exactly as a partly
 # memory-bound kernel should, which is corroboration, not the argument.
 MAX_CROSS_ARM_OFFSET_PCT = 1.0
+#
+# Cross-arm MEAN offset, 1.0. The rule above bounds the two arms' MEDIANS, and a
+# median is not the statistic that carries the transfer it is bounding.
+# Throughput is an INTEGRAL over the window, so what it sees is the arm's mean
+# clock. On the three Qwen3.8-27B bf16 c1 pairings of 2026-08-19
+# (`/mnt/nas_share/rc/q38bf16/out/`) `median_offset_pct` reads exactly 0.0000% on
+# all three while the MEANS are 0.2521 / 0.1530 / 0.1035 points apart. The
+# excursion population is 5.74% of retained busy samples (97 of 1690) and sits
+# almost entirely below the median -- 95 of those 97 -- so a median over 155 to
+# 246 samples steps straight over the one part of the distribution that does NOT
+# cancel between the arms. #1546.
+#
+# The NUMBER is not a new one, deliberately. It is the same physics ceiling and
+# the same forward criterion that place MAX_CROSS_ARM_OFFSET_PCT: the transfer is
+# bounded above by 1.0 point of kernel time per point of clock, so a 1.0% mean
+# offset implies AT MOST a 1.0% effect on the ratio, which is under the 2.97%
+# smallest deficit this harness has been used to rank. On a flat window
+# mean == median and the two terms are identical, so every steady capture --
+# including the 2026-08-15 pinned series, flat 2184 MHz over n=861 -- scores the
+# same on both, and no new class of window is refused there.
+#
+# It bounds a CROSS-ARM quantity and not a per-arm one. A burden BOTH arms pay
+# divides out of the ratio and this term is silent on it; bounding the burden
+# each arm carries on its own is a different rule, specced under #1354 and not
+# implemented here.
+#
+# What it does NOT bound is a phase-scoped metric. The excursions are locked to
+# the request head, so the mean bounds output throughput and median inter-token
+# latency and does NOT bound time-to-first-token, whose repeat CV is 2.20%
+# against 0.01% for median inter-token latency in the same files. Argument,
+# rejected statistics and evidence: `.agents/specs/clock-cross-arm-mean.md`.
+MAX_CROSS_ARM_MEAN_OFFSET_PCT = 1.0
 #
 # Retained busy samples per window, 30. `spread_pct` over n == 1 is definitionally
 # 0.00% -- the BEST score the gate can award -- so without a floor the window the
@@ -292,7 +325,14 @@ def query_once(*, smi: str = NVIDIA_SMI, timeout_s: float = 10.0) -> dict[str, A
 
 
 def summarize_sm_clocks(values: Sequence[float]) -> dict[str, float]:
-    """Return `{n, min, median, max, spread_pct}` over the measured window."""
+    """Return `{n, min, median, max, mean, spread_pct}` over the measured window.
+
+    `mean` is what an INTEGRAL metric was actually clocked at. The median steps
+    over the excursion population entirely -- 5.74% of the 2026-08-19 samples,
+    95 of 97 of them below their window's median -- and that population is the
+    part that does not cancel between two arms. Recording it is what makes
+    MAX_CROSS_ARM_MEAN_OFFSET_PCT computable (#1546).
+    """
 
     if not values:
         raise HarnessError("cannot summarize an empty SM-clock window")
@@ -303,6 +343,7 @@ def summarize_sm_clocks(values: Sequence[float]) -> dict[str, float]:
     median = statistics.median(numbers)
     return {
         "max": max(numbers),
+        "mean": statistics.fmean(numbers),
         "median": median,
         "min": min(numbers),
         "n": len(numbers),
@@ -367,6 +408,194 @@ def build_clock_record(
     }
 
 
+def sample_instant_s(sample: Mapping[str, Any]) -> float:
+    """The wall-clock instant this sample was taken at, in Unix epoch seconds.
+
+    `run_sampler` writes `timestamp_utc` as an AWARE ISO-8601 stamp, and this is
+    the only field that can place a sample against a span a DIFFERENT process
+    measured. `elapsed_s` cannot: it is relative to the sampler's own start, and
+    the arm that marks its legs has no access to that origin.
+
+    A naive stamp is a REFUSAL rather than an assumed UTC. An unknown zone
+    shifts every span by the host's offset, which is a whole hour on this fleet
+    and moves a window nobody would see was wrong.
+    """
+
+    raw = sample.get("timestamp_utc")
+    if raw is None:
+        raise HarnessError(
+            "clock sample omits timestamp_utc, so it cannot be placed in a span"
+        )
+    text = str(raw).strip()
+    # `fromisoformat` takes `Z` from 3.11 on; normalizing keeps this module on
+    # the standard library floor the rest of it holds to.
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = dt.datetime.fromisoformat(text)
+    except ValueError as error:
+        raise HarnessError(
+            f"clock sample timestamp_utc is not ISO-8601: {raw!r}: {error}"
+        ) from error
+    if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+        raise HarnessError(
+            f"clock sample timestamp_utc {raw!r} carries no time zone; an unknown "
+            "zone is not UTC and would shift every span by the host's offset"
+        )
+    return moment.timestamp()
+
+
+def normalize_spans(spans: Sequence[Sequence[float]]) -> list[tuple[float, float]]:
+    """Validate the spans a driver measured its work in, or refuse.
+
+    An EMPTY list is the refusal that matters most. It is what a driver whose
+    leg markers did not parse hands over, and falling back to the whole stream
+    there would silently restore the very window the busy floor refused -- under
+    a record that claims to be spanned.
+    """
+
+    if not spans:
+        raise HarnessError(
+            "a spanned clock record was asked for with no span at all; there is "
+            "no window to attribute the measurement to, and the whole stream is "
+            "not a fallback"
+        )
+    normalized: list[tuple[float, float]] = []
+    for index, span in enumerate(spans):
+        pair = tuple(span)
+        if len(pair) != 2:
+            raise HarnessError(
+                f"clock span {index + 1} is not a (start, end) pair: {span!r}"
+            )
+        start, end = (float(pair[0]), float(pair[1]))
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise HarnessError(f"clock span {index + 1} is not finite: {span!r}")
+        if end < start:
+            raise HarnessError(
+                f"clock span {index + 1} ends before it starts: {start!r} -> {end!r}"
+            )
+        normalized.append((start, end))
+    return normalized
+
+
+def samples_within_spans(
+    samples: Sequence[Mapping[str, Any]], spans: Sequence[Sequence[float]]
+) -> list[Mapping[str, Any]]:
+    """The samples whose instant lies inside the union of `spans`.
+
+    Both ends are inclusive. The sampler ticks on its own interval and the spans
+    come from another process's clock, so an exclusive end would drop a sample
+    that lands exactly on a boundary for no reason anyone could state.
+    """
+
+    bounds = normalize_spans(spans)
+    return [
+        sample
+        for sample in samples
+        if any(start <= sample_instant_s(sample) <= end for start, end in bounds)
+    ]
+
+
+def build_spanned_clock_record(
+    samples: Sequence[Mapping[str, Any]],
+    spans: Sequence[Sequence[float]],
+    *,
+    boot_id: str,
+) -> dict[str, Any]:
+    """Reduce a sampled stream to the record for the WORK, not for the process.
+
+    `MIN_BUSY_FRACTION` asks that the retained window describe the measured
+    work. A driver that samples across a whole process lifetime does not satisfy
+    it by accident: the DFlash2 our-arm run of 2026-08-22 sampled 3222 seconds
+    of which 93 were warm generation, and `clock_reasons` refused it at 18.37%
+    busy ([#1671](https://github.com/mudler/vllm.cpp/issues/1671)). The refusal
+    was correct, so the repair is not to the floor. It is to the WINDOW: a
+    driver that can say when its work ran hands the spans over here, and the
+    record is built from the samples inside them.
+
+    **Nothing here relaxes a rule.** The result is an ordinary clock record and
+    `clock_reasons` judges it unchanged -- the busy fraction, the retained
+    count, the spread, the throttle reasons and persistence mode all apply, to a
+    smaller and truer set of samples. A span the GPU was idle through is refused
+    below; a span too short to observe fails the count floor; and no span at all
+    is refused rather than widened back to the stream.
+
+    It reuses `build_clock_record` rather than re-deriving anything, so the
+    statistics, the idle accounting and the mid-window field check are the same
+    code the unrestricted path runs.
+    """
+
+    if not samples:
+        raise HarnessError("cannot build a clock record from an empty window")
+    bounds = normalize_spans(spans)
+    kept = samples_within_spans(samples, bounds)
+    if not kept:
+        raise HarnessError(
+            f"the {len(bounds)} measured span(s) retained none of the "
+            f"{len(samples)} clock samples in the stream; the driver's spans and "
+            "the sampler's window do not overlap, which is a driver defect and "
+            "never a fast window"
+        )
+    record = build_clock_record(kept, boot_id=boot_id)
+    #: WHAT WAS RESTRICTED, beside the record it produced. Without it a reader
+    #: cannot tell a window that covered the work from one that covered a
+    #: fraction of it, and both score the same on `spread_pct`.
+    record["window"] = {
+        "retained_samples": len(kept),
+        "spanned_s": sum(end - start for start, end in bounds),
+        "spans": len(bounds),
+        "stream_samples": len(samples),
+    }
+    return record
+
+
+def read_sample_stream(path: pathlib.Path) -> list[dict[str, Any]]:
+    """Read the raw per-sample stream `run_sampler` writes, or refuse.
+
+    ONE TRUNCATED FINAL LINE IS TOLERATED, and nothing else is. `run_sampler`
+    flushes after every sample, so a consumer that reads the file while the
+    sampler is still appending sees whole lines and, at worst, a partial tail.
+    Refusing that would end a two-hour leased run on the newest sample in the
+    file -- which is by construction AFTER the last leg and therefore outside
+    every span the caller asked for, so it can cost the measurement nothing.
+
+    A malformed line ANYWHERE ELSE is a refusal. A stream with a hole in the
+    middle is not a shorter stream, and a shorter stream is exactly what the
+    coverage floors exist to catch.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise HarnessError(f"cannot read the clock sample stream {path}: {error}") from error
+    lines = text.splitlines()
+    # `splitlines` cannot tell `{...}\n` from `{...}`, and only the latter is a
+    # tail still being written. The final line is exempt only when the file does
+    # not end in a newline.
+    partial_tail_allowed = bool(lines) and not text.endswith("\n")
+    samples: list[dict[str, Any]] = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError as error:
+            if number == len(lines) and partial_tail_allowed:
+                break
+            raise HarnessError(
+                f"clock sample stream {path} line {number} is not JSON: {error}"
+            ) from error
+        if not isinstance(sample, dict):
+            raise HarnessError(
+                f"clock sample stream {path} line {number} is not an object"
+            )
+        samples.append(sample)
+    if not samples:
+        raise HarnessError(f"clock sample stream {path} holds no sample")
+    return samples
+
+
+
 def merge_clock_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Fold one arm's repeated legs into the arm's clock record.
 
@@ -403,6 +632,22 @@ def merge_clock_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     lowest = min(float(record["sm_clock_mhz"]["min"]) for record in records)
     highest = max(float(record["sm_clock_mhz"]["max"]) for record in records)
     median = statistics.median(medians)
+    # SAMPLE-COUNT WEIGHTED, because the arm's mean is over the arm's whole
+    # retained busy series and the legs are not the same length -- 155 / 155 /
+    # 156 at c1 and 245 / 246 / 244 at c8 in the one campaign this fold has run
+    # on. An unweighted mean of leg means is a different number and is wrong.
+    # A leg with no mean makes the ARM have none rather than a fabricated one, so
+    # the refusal in `compare_clock_records` propagates instead of being papered
+    # over by the two legs that do carry it.
+    leg_means = [_mean_or_none(record) for record in records]
+    weighted_mean: float | None = None
+    if all(value is not None for value in leg_means):
+        counts = [int(record["sm_clock_mhz"]["n"]) for record in records]
+        total = sum(counts)
+        if total > 0:
+            weighted_mean = (
+                sum(value * count for value, count in zip(leg_means, counts)) / total
+            )
     throttle: set[str] = set()
     for record in records:
         throttle.update(_normalize_throttle(value) for value in record["throttle_reasons_active"])
@@ -419,6 +664,7 @@ def merge_clock_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "persistence_mode": first["persistence_mode"],
         "sm_clock_mhz": {
             "max": highest,
+            **({} if weighted_mean is None else {"mean": weighted_mean}),
             "median": median,
             "min": lowest,
             "n": sum(int(record["sm_clock_mhz"]["n"]) for record in records),
@@ -611,6 +857,44 @@ def compare_clock_records(
                 f"{offset_pct:+.2f}% (>{MAX_CROSS_ARM_OFFSET_PCT}%), estimated to move "
                 f"kernel time by {effect_pct:+.2f}%; the ratio is NOT ESTABLISHED"
             )
+
+    # The same comparison on the statistic an integral metric was actually
+    # clocked at. Independent of the rule above on the recorded evidence: the
+    # median offset is exactly 0.0000% on all three 2026-08-19 c1 pairings while
+    # the mean offset is -0.2521 / -0.1530 / +0.1035 (#1546).
+    ours_mean = _mean_or_none(ours)
+    theirs_mean = _mean_or_none(theirs)
+    mean_offset_pct: float | None = None
+    for mean, label in ((ours_mean, ours_label), (theirs_mean, theirs_label)):
+        if mean is None:
+            # Fail closed. Every record written before this term lacks the field,
+            # and skipping the term on those is the absent hook that reads as an
+            # armed instrument: the block would print a clean verdict on a
+            # quantity nothing examined. Unknown is not absence or success.
+            reasons.append(
+                f"clock: {label} SM-clock record carries no usable mean, so the "
+                "cross-arm MEAN SM-clock comparison cannot be computed; the "
+                "record predates that term and the window must be re-recorded"
+            )
+    if ours_mean is not None and theirs_mean is not None and theirs_mean > 0.0:
+        mean_offset_pct = (ours_mean / theirs_mean - 1.0) * 100.0
+        if abs(mean_offset_pct) > MAX_CROSS_ARM_MEAN_OFFSET_PCT + _THRESHOLD_EPSILON:
+            reasons.append(
+                f"clock: {ours_label} and {theirs_label} ran at MEAN SM clocks "
+                f"{mean_offset_pct:+.2f}% apart ({ours_mean:.1f} vs {theirs_mean:.1f} "
+                f"MHz, >{MAX_CROSS_ARM_MEAN_OFFSET_PCT}%); the excursion population "
+                "does not cancel between the arms and the ratio is NOT ESTABLISHED"
+            )
+    ours_cost_pct = _mean_cost_pct(ours)
+    theirs_cost_pct = _mean_cost_pct(theirs)
+    # REPORTED, never gated on -- the same demotion `spread_pct` and
+    # CLOCK_TIME_TRANSFER carry. It is the quantity #1546 quotes, and §Design of
+    # `.agents/specs/clock-cross-arm-mean.md` measures the pairing where it reads
+    # exactly 0.0000 while the arms' mean clocks are 2.28% apart: an absolute
+    # value discards the sign, and two opposing excursion populations ADD.
+    burden_difference_pct: float | None = None
+    if ours_cost_pct is not None and theirs_cost_pct is not None:
+        burden_difference_pct = abs(ours_cost_pct) - abs(theirs_cost_pct)
     return {
         "allow_cross_boot": bool(allow_cross_boot),
         "caveats": caveats,
@@ -621,6 +905,10 @@ def compare_clock_records(
             "measured ONCE (marlin::Marlin 45.2845 -> 49.6544 ms/step over a "
             "12.79% clock offset, #543); reported, never gated on"
         ),
+        # Reported beside the two gated offsets so a reader can see WHICH part of
+        # each arm's distribution carried a refusal. Not gated on.
+        "excursion_burden_difference_pct": burden_difference_pct,
+        "mean_offset_pct": mean_offset_pct,
         "median_offset_pct": offset_pct,
         f"{ours_label}_boot_id": ours_boot,
         # How much of the window each side actually observed. Without these two
@@ -628,6 +916,8 @@ def compare_clock_records(
         # barely touched, and the latter scores a perfect 0.00% spread.
         f"{ours_label}_busy_samples": _busy_or_none(ours),
         f"{ours_label}_idle_samples_excluded": _idle_or_none(ours),
+        f"{ours_label}_mean_cost_pct": ours_cost_pct,
+        f"{ours_label}_mean_sm_mhz": ours_mean,
         f"{ours_label}_median_sm_mhz": ours_median,
         f"{ours_label}_spread_pct": _spread_or_none(ours),
         "reasons": reasons,
@@ -635,6 +925,8 @@ def compare_clock_records(
         f"{theirs_label}_boot_id": theirs_boot,
         f"{theirs_label}_busy_samples": _busy_or_none(theirs),
         f"{theirs_label}_idle_samples_excluded": _idle_or_none(theirs),
+        f"{theirs_label}_mean_cost_pct": theirs_cost_pct,
+        f"{theirs_label}_mean_sm_mhz": theirs_mean,
         f"{theirs_label}_median_sm_mhz": theirs_median,
         f"{theirs_label}_spread_pct": _spread_or_none(theirs),
     }
@@ -657,6 +949,34 @@ def _median_or_none(record: Mapping[str, Any]) -> float | None:
 
 def _spread_or_none(record: Mapping[str, Any]) -> float | None:
     return _summary_field(record, "spread_pct")
+
+
+def _mean_or_none(record: Mapping[str, Any]) -> float | None:
+    """The window's mean SM clock, or None for a record that predates the field.
+
+    A record written before #1546 has no `mean`, and there is no way to recover
+    one from `{n, min, median, max}`. `compare_clock_records` turns the None into
+    a refusal rather than into a skipped term.
+    """
+
+    value = _summary_field(record, "mean")
+    return value if value is not None and value > 0.0 else None
+
+
+def _mean_cost_pct(record: Mapping[str, Any]) -> float | None:
+    """`(median - mean) / median * 100`, SIGNED, over the retained busy series.
+
+    Positive means the mean sits BELOW the median, which is what a downward
+    excursion population does. Reported and never gated on: the gated quantity is
+    the CROSS-ARM mean offset, because two arms carrying the same burden cancel
+    and two arms carrying opposite ones add.
+    """
+
+    mean = _mean_or_none(record)
+    median = _median_or_none(record)
+    if mean is None or median is None or median <= 0.0:
+        return None
+    return (median - mean) / median * 100.0
 
 
 def _busy_or_none(record: Mapping[str, Any]) -> int | None:
@@ -768,11 +1088,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(canonical_json(record))
         return 0
 
-    import json as _json
-
+    # `json` is imported at module scope since `read_sample_stream` needed it;
+    # the function-local `import json as _json` this replaced is now redundant.
     comparison = compare_clock_records(
-        _json.loads(args.ours.read_text(encoding="utf-8")),
-        _json.loads(args.vllm.read_text(encoding="utf-8")),
+        json.loads(args.ours.read_text(encoding="utf-8")),
+        json.loads(args.vllm.read_text(encoding="utf-8")),
         allow_cross_boot=args.allow_cross_boot,
     )
     print(canonical_json(comparison))

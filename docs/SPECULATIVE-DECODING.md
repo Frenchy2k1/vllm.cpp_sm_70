@@ -11,7 +11,9 @@ same JSON object vLLM takes, so a config written for vLLM works here.
 ## Methods
 
 The engine accepts five `method` strings. Anything else is refused at load with
-the list of accepted ones (`src/vllm/config/speculative.cpp`).
+the list of accepted ones (`src/vllm/config/speculative.cpp`). A `method` selects
+exactly one speculator; the [drafter chain](#the-drafter-chain-and-why-it-does-not-run-yet)
+below is the one place a document can name several, and it does not run yet.
 
 | `method` | Draft | k | State |
 |---|---|---|---|
@@ -22,7 +24,7 @@ the list of accepted ones (`src/vllm/config/speculative.cpp`).
 | `draft_model` | a separate full model | from the draft | **Config only.** The JSON parses, but the engine has no branch for it and refuses the load |
 
 MTP and DFlash are the two with binding numbers behind them; the per-method
-detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
+detail below and in [the benchmark record](BENCHMARKS.md) says which is which.
 
 ## Which keys the JSON accepts
 
@@ -42,6 +44,7 @@ that was typed.
 | `prompt_lookup_min`, `prompt_lookup_max` | an integer of at least 1, `ngram` only |
 | `draft_sample_method` | `greedy` only, which is upstream's default and what this engine does |
 | `rejection_sample_method` | `standard` only, which is upstream's default and what this engine does |
+| `vllm_cpp` | this engine's own extension object; its only key is `drafter_chain`, described below |
 
 There are two kinds of refusal, worded differently on purpose. A name vLLM's own
 `SpeculativeConfig` declares, such as `quantization` or `max_model_len`, is
@@ -49,6 +52,61 @@ reported as a real vLLM field this engine does not implement. Any other name is
 reported as unknown, together with the list above, because that one is usually a
 typo. `draft_sample_method: probabilistic` and the `synthetic` and `block`
 acceptance variants name row `SPEC-ACCEPT-VARIANTS`, which owes them.
+
+## The drafter chain, and why it does not run yet
+
+`--speculative-config` also accepts one key vLLM does not have. It lives under a
+`vllm_cpp` object so that it can never be confused with a vLLM field, which is
+the same place `--offload-config` keeps this engine's own residency keys:
+
+```json
+{"vllm_cpp": {"drafter_chain": [
+  {"method": "dflash", "model": "z-lab/Qwen3.6-27B-DFlash", "num_speculative_tokens": 16},
+  {"method": "ngram", "num_speculative_tokens": 4}
+]}}
+```
+
+It describes a **preference order**, not an ensemble: try the first speculator,
+and where it produces no draft for a sequence, try the next. One speculator wins
+per sequence, nothing merges proposals, and the verify is untouched.
+
+**The engine refuses this document today, by name, before it reads a byte of
+weights.** The field is parsed, validated and stored; nothing resolves it yet.
+Refusing is the point rather than an oversight: a chain that parsed and was then
+ignored would start a server drafting with one speculator, or with none, under a
+document whose author asked for several, and any measurement taken there would
+describe a configuration nobody chose. Resolution is owed by row
+`SPEC-DRAFTER-CHAIN`, [#1522](https://github.com/mudler/vllm.cpp/issues/1522).
+
+Everything about the field except the running is real, so a document can be
+written and checked now:
+
+| Rule | Refused |
+|---|---|
+| `method` at the top level, beside a chain | yes, they are mutually exclusive: name every speculator as an entry |
+| `model`, `num_speculative_tokens`, `prompt_lookup_min`, `prompt_lookup_max` at the top level, beside a chain | yes, each configures one speculator and there is no entry it belongs to |
+| `draft_sample_method`, `rejection_sample_method` at the TOP LEVEL, beside a chain | no, both describe the verify and the draft sampling rule, which are engine-wide |
+| either of those two INSIDE a chain entry | yes, by name (#1598): they are engine-wide rather than per drafter, and the message says the engine honours them and where to spell them |
+| an entry naming anything but `mtp`, `dflash`, `dspark` or `ngram` | yes, by name, including a real vLLM method such as `eagle3`, and including `draft_model`, whose chain arm is owed |
+| an entry missing the key its method requires | yes, by the same rules the top-level `method` follows |
+| any other entry key the top level does not honour | yes, by name, split the way #1160 splits the top-level document: a vLLM `SpeculativeConfig` field this engine does not implement is refused as that, and a name nobody declares is refused as unknown with the accepted list |
+| the same method named twice | yes: per-drafter attribution keys on the method name, so two entries of one method cannot be told apart in the counters |
+| an empty chain, or a `vllm_cpp` object with no `drafter_chain` | yes: omitting `vllm_cpp` is how a document says "no chain" |
+| a chain of one entry | no, that is the degenerate preference list and it is legal |
+
+**With no `vllm_cpp` key, nothing above applies.** Every document that worked
+before this field existed keeps its exact meaning, key for key, which is what
+makes the field additive rather than a fork of vLLM's surface.
+
+That is a claim about MEANING, and it is deliberately not a claim of
+byte-identity. There is exactly one visible delta on a chain-free document, it
+was measured, and it is stated here rather than left for a reader to find: the
+accepted-key list quoted at the end of an unknown-key or unimplemented-key
+refusal now also names `vllm_cpp.drafter_chain`. Every such refusal message is
+therefore longer by that tail. The change is required rather than incidental —
+an accepted-key list that omits an accepted key stops closing the user's search,
+which is the whole reason #1160 appends one. No document's parse result moves,
+no key changes meaning, and no error changes which guard produced it.
 
 The distinction matters beyond ergonomics. Draft sampling and verify are greedy
 here, so a dropped `probabilistic` produced a **deterministic** run when a sampled
@@ -111,6 +169,154 @@ ratified near-tie rule, and at concurrency 1 it is 2.9x our own speculative-off
 throughput and at or above vLLM's own DFlash-on decode. Speculative-off stays
 byte-identical.
 
+### DFlash2 checkpoints
+
+DFlash2 adds a grouped dynamic depthwise convolution and a candidate selector
+that replaces DFlash1's per-slot argmax with a scored path walk over the target
+head's top-K. **A safetensors checkpoint that declares `DFlash2DraftModel` now
+drafts end to end**: it loads, runs the convolution around every attention and
+MLP sublayer, scores the selector's transition lattice, and walks that lattice
+from the verified anchor to produce the block's tokens. Use it exactly as a
+DFlash1 draft:
+
+```bash
+server --model /models/Qwen3.8-27B \
+  --speculative-config '{"method":"dflash","model":"<dflash2-draft-path>","num_speculative_tokens":7}'
+```
+
+Startup prints a notice naming what runs and what is still owed. The engine
+never substitutes the DFlash1 per-slot argmax for a DFlash2 block: that would
+emit valid target tokens while silently reducing draft acceptance, which is the
+failure this lane is built to avoid because no token gate can see it. If the
+walk cannot run, the draft is refused by name instead.
+
+Two limits are worth knowing before you use it. **Draft sampling is greedy
+only** -- `draft_sample_method: "probabilistic"` is refused by name here, as it
+is for every method, so DFlash2's noised walk and its cached proposal
+distribution are not built. And **no DFlash2 throughput number has been taken
+yet**: correctness comes first on this lane, and a DFlash2 draft additionally
+runs its block forward off the paged CUDA-graph fast path, because the candidate
+selector needs the hidden states of the same forward its logits came from.
+
+**A GGUF DFlash2 checkpoint now drafts too**, in all three published arms:
+bf16, Q8_0 and Q4_K_M. Point `--speculative-config` at the `.gguf` file exactly
+as you would at a safetensors directory. The file is identified from
+DFlash2-specific metadata rather than from an architecture string, because a
+GGUF declares none and the published DFlash2 GGUF writes
+`general.architecture = dflash`, the same value a DFlash1 drafter writes.
+Ordinary DFlash1 GGUF drafts are unchanged.
+
+What that claim rests on, so you can weigh it: the three ENCODINGS are gated by a
+synthetic draft this engine writes itself in each block format and then drafts
+from, value-for-value against the suite's own encoders, and the published files
+are read for their NAMES, SHAPES and TYPES. **The Q4_K_M arm has additionally
+been loaded for real**, on 2026-08-21: the published 1.06 GiB file was pointed at
+a 27B target through the command-line client, mapped and decoded every tensor at
+the full geometry, proposed seven speculative blocks and generated. The BF16 and
+Q8_0 arms are still gated by the synthetic draft and the header read alone.
+`Q4_K_M` is also llama.cpp's usual mixture rather than one encoding: the
+published file is 32 F32, 45 Q4_K and 4 Q6_K tensors
+(`blk.{2,4}.{attn_v,ffn_down}.weight`), all of which this loader decodes.
+
+One property of this container is worth knowing before you pick an arm: **a GGUF
+drafter is dequantized to bf16 at load.** That is this lane's design rather than
+a fallback -- a DFlash draft is a handful of layers, so the loader hands the
+shared weight path bf16 views and reuses the whole safetensors body -- but it
+means a Q4_K_M draft costs its bf16 residency and not its file size. Summed
+over the published 27B drafter's own tensor table, that is 3 848 808 960 bytes
+(3.584 GiB) of draft weights whichever of the three files you load -- against
+1.06 GiB on disk for the Q4_K_M one -- of which 254 279 680 bytes are the
+candidate selector's two codebooks, which the DFlash1 lane never allocates at
+all. Pick the smallest file to save disk and download time; it will not save
+memory.
+
+**The TARGET's `lm_head` may be quantized, as long as this engine can compute
+with it.** A DFlash or DFlash2 draft owns no output head; it runs the target's.
+Until [#1628](https://github.com/mudler/vllm.cpp/issues/1628) that head had to be
+stored as dense bf16, so pointing a draft at a safetensors target whose
+`lm_head.weight` is ModelOpt or compressed-tensors NVFP4 refused the load with
+`dflash: target tensor lm_head.weight is not BF16 (got U8)`. Such a head is now
+kept PACKED and multiplied by the same W4A16 GEMM the target's own logits take,
+so the candidate selector reads the target's exact top-K rather than a widened
+head's.
+
+What is still refused, and why the distinction is the point: a head this engine
+would have to WIDEN to read stays refused by name, because the selector's whole
+input is the target head's exact top-K and a widened head produces a different
+candidate set with no visible symptom -- the verify is lossless, the emitted
+tokens are still the target's, and only acceptance falls. That covers a GGUF
+target's `output.weight` (dequantized on the way in), an FP8 `lm_head`, and an
+NVFP4 head with the activation divisor in force under `VT_MODELOPT_W4A4=1`. A
+DSpark draft still refuses every quantized target head. The DFlash1 lane is
+unaffected either way.
+
+**This change's own gates are CPU.** The packed-head equality above is
+measured on CPU fixtures, and the CUDA arm and a real NVFP4 target are owed a
+measurement ([#1628](https://github.com/mudler/vllm.cpp/issues/1628)).
+
+**The acceptance gate has now passed, and no speed result has been taken.**
+Measured 2026-08-21 on a GB10 against vLLM built at
+[vllm#52816](https://github.com/vllm-project/vllm/pull/52816) head `66e5414c6`,
+`Qwen/Qwen3.8-27B` bf16 with the `z-lab/Qwen3.8-27B-DFlash2` drafter, k=7,
+greedy, one request at a time, 64 tokens on each of four prompts:
+
+| | |
+|---|---|
+| output tokens | **4 of 4 prompts identical to vLLM's** |
+| draft tokens | **45 of 47 blocks byte-identical to vLLM's own drafts** |
+| acceptance | **identical per prompt** -- 49, 54, 54, 52 on both engines |
+
+The two draft blocks that differ each differ by one token, in a part of the
+selector that is a floating-point reduction and is specified within an envelope
+rather than bit-exact; both blocks then produced the same output tokens.
+
+**That head is one merge behind vLLM's `main`, and the numbers above are still
+the ones that were measured.** vllm#52816 MERGED on 2026-08-21 at 05:27:22Z, at
+head `3406ec1d` and merge commit `b389ac29` -- 46 minutes before this row's W6
+work commit `bb416e0ae` was authored at `06:13:50Z`. **The 46 minutes is the
+interval between those two COMMITS, and it is not the gap to the run.** The
+wheel above was built at head `66e5414c`, which is an earlier head of the same
+pull request than the merged `3406ec1d`. WHEN it was built and run is NOT a
+number this document can state, because no timestamp for that build or that run
+survives anywhere in the tree -- not in the golden, not in the record -- so
+where the run falls against the merge instant is unmeasured, and transferring
+the commit interval onto it would be a measurement nobody took. The measurement
+stays pinned to `66e5414c` because that is what executed, and re-labelling a run
+with a head it never ran would be a false pin. Re-reading the gates at the
+merged head is owed under
+[#1561](https://github.com/mudler/vllm.cpp/issues/1561).
+
+**The backend that comparison ran on is not vLLM's default here.** vLLM was run
+on `TRITON_ATTN` rather than on the flash-attention backend it auto-selects,
+which is a deliberate constraint recorded in
+[#1456](https://github.com/mudler/vllm.cpp/issues/1456) and is stated because it
+is not free: running the same vLLM on its two backends changes its own answer on
+one of these four prompts and moves its own acceptance by six points.
+
+**Still no throughput number**, and two things would bound one taken today. A
+DFlash2 draft here runs off the paged CUDA-graph fast path, because the candidate
+selector needs the hidden states of the same forward its logits came from, while
+vLLM captures a CUDA graph for its DFlash2 draft step. And every wall-clock
+figure above was taken with a 51.75 GiB checkpoint read over a network mount, so
+it measures loading rather than decoding
+([#1314](https://github.com/mudler/vllm.cpp/issues/1314)).
+
+**The exact checkpoints this was built and gated against.** Every sha256 below
+was computed locally from the downloaded artifact. The HuggingFace tree API
+returns no usable `lfs.oid` for these files, so a hub-reported hash is not
+evidence here.
+
+| Arm | Repo and revision | File | Bytes | sha256 |
+|---|---|---|---|---|
+| Draft, bf16 safetensors — DRAFTS | `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `model.safetensors` | 3 848 817 896 | `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
+| Draft, GGUF — DRAFTS | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
+| Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
+| Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
+| Target the draft heads | `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | published shards | — | — |
+
+A repo id alone is not a pin, because checkpoints get re-quantized in place
+under an unchanged name. The revisions above are what these results describe.
+
 ## n-gram
 
 The draft-free proposer: candidates come from matching the sequence's own
@@ -125,7 +331,7 @@ server --model /models/Qwen3.6-27B \
 It is wired end to end and reuses the same verify machinery as MTP. No
 throughput number is published for it.
 
-## DSpark (semi-autoregressive block drafting) — in progress
+## DSpark (semi-autoregressive block drafting), in progress
 
 DSpark drafts a whole block in one parallel pass and then adds intra-block
 dependency with a small sequential head, so a block draft stops being k
@@ -156,8 +362,8 @@ with a SINGLE COLD oracle invocation per paired run, so the denominator paid
 compile-JIT the numerator did not; with the oracle warm and generation length
 matched, the paired measurement is **0.834x**. Those two cannot be differenced
 directly, because the gate host was reimaged in between and is no longer the same
-machine. The deciding experiment — a single cold oracle invocation on the CURRENT
-box — is specified in the benchmark record and has not yet run. Until it does, no
+machine. The deciding experiment, a single cold oracle invocation on the CURRENT
+box, is specified in the benchmark record and has not yet run. Until it does, no
 speed claim in either direction is supportable. The acceptance-rate band and the
 other target families remain owed. A GGUF target, and a target architecture with no aux
 multi-tap, are both refused by name.
@@ -168,7 +374,7 @@ main --model /models/Qwen3-4B \
 ```
 
 `num_speculative_tokens` is required for a DSpark draft (a native DSpark config
-carries no `n_predict`), and it must be at least the checkpoint's block size —
+carries no `n_predict`), and it must be at least the checkpoint's block size,
 a smaller value produces incorrect output rather than merely lower acceptance,
 so it is rejected.
 
@@ -252,7 +458,7 @@ engine is already about 4% faster than vLLM with speculation off, so the lead is
 preserved with it on. The extra state speculation needs (a doubled recurrent-state
 slot at k=1, plus the draft cache and head) costs about 3.6 GB, well inside the
 box's unified memory. The full A/B, including the higher-concurrency numbers, is
-in [BENCHMARKS.md](BENCHMARKS.md).
+in [the benchmark record](BENCHMARKS.md).
 
 ## Concurrency above 1
 
@@ -293,7 +499,7 @@ Each of these names the method it applies to.
   such a tie speculative-on and speculative-off, and even two speculative-off
   runs, can pick differently. The same weights loaded from GGUF, which expands
   to bf16, show no such ties and are token-identical. Open; see
-  [docs/STATUS.md](STATUS.md).
+  [the current project status](../README.md#project-status).
 - **Concurrency above 1 is not token-stable for the 27B.** Its greedy output is
   not bit-stable across batch shapes even with speculation off (changing the batch
   size flips a few near-tie tokens), so exact token-for-token agreement between

@@ -189,11 +189,22 @@ std::vector<std::string> AttentionBackend::validate_configuration(
   // CudaPlatform.get_attn_backend_cls asserts `device_capability is not None`
   // before it calls this (cuda.py:403-404), and CpuPlatform has a separate
   // selector that never reaches it (cpu.py:75-87). Our selector is shared across
-  // every DeviceType, and DeviceCapability::present() is already false for every
-  // platform that cannot answer the question, so the predicate applies exactly
-  // where upstream applies it. Without this, FLASH_ATTN — which this tree also
-  // registers for kCPU/kMETAL/kVULKAN/kTENSTORRENT — would be refused on every
-  // one of them by a rule about NVIDIA compute capability.
+  // every DeviceType, so the guard is where upstream's caller-side assert lands.
+  // Without it, FLASH_ATTN — which this tree also registers for
+  // kCPU/kMETAL/kVULKAN/kTENSTORRENT — would be refused on every one of them by
+  // a rule about NVIDIA compute capability.
+  //
+  // #1823: this comment used to argue that `present()` is "already false for
+  // every platform that cannot answer the question". THAT WAS NOT TRUE, and it
+  // was not true of two platforms at once — Metal answered with the Apple GPU
+  // family and Vulkan with the Vulkan API version, so an SM-8.0 bar was compared
+  // against numbers that have nothing to do with SM versions. `present()` is a
+  // guard on WHETHER a platform answers, and it can say nothing about the UNIT.
+  // The unit is a contract on the value, stated on
+  // Platform::get_device_capability (include/vllm/platforms/interface.h) and
+  // gated for every registered platform by
+  // tests/vllm/platforms/test_platform.cpp. This line is correct only because
+  // that contract holds.
   if (capability.present() && !supports_compute_capability(capability)) {
     invalid_reasons.emplace_back("compute capability not supported");
   }
@@ -301,6 +312,14 @@ void TritonMLAImpl::forward_mqa(const AttentionLayer& layer, const vt::Tensor& q
   args.scale = scale;  // `:253` self.scale
   args.num_kv_splits = metadata.num_kv_splits;
   args.max_seq_len = metadata.max_seq_len;
+  // dots3-note's windowed decode (#699 W4b-2): `_forward_swa_mqa` keeps keys
+  // `kv_pos >= query_pos - WINDOW_SIZE + 1` (attention.py:152 @ bc2d63e650),
+  // i.e. the inclusive left distance is `sliding_window - 1` — the same pair
+  // upstream hands FlashAttention on the prefill half (`:300`). 0 leaves this
+  // `std::nullopt`, which is the full-context loop the op already had.
+  if (sliding_window > 0) {
+    args.window_size = vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
+  }
   // `:242-259` decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o, lse,
   //   block_table, seq_lens, attn_logits, num_kv_splits, scale, PAGE_SIZE, ...)
   // — the two "K" and "V" arguments are the SAME buffer, which our single

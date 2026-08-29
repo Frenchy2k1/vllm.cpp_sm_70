@@ -249,10 +249,12 @@ only when it appears in this table and has a recorded pin:
 | vLLM-Omni | `vllm-omni` | diffusion, TTS, and omni-only architectures that vLLM does not register |
 | HuggingFace `transformers` | `transformers` | a model, processor, or tokenizer reference implementation that vLLM mirrors |
 | `diffusers` | `diffusers` | schedulers, VAEs, and diffusion pipelines |
+| Lightricks `LTX-2` | `ltx-2` | the LTX-2.5 architecture and pipeline recipes, from the model author's own runtime, for the generations and defaults vLLM-Omni's `ltx2` registration does not reach |
 | SGLang | `sglang` | a model or serving path that SGLang implements and vLLM does not |
 | SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models served by SGLang's pipeline runtime, in a third repository that is not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
 | `unslothai/llama.cpp` fork | `llama-cpp-unsloth` | the sub-IQ1_S quant encodings (IQ1_XS, IQ1_XXS, IQ1_XXXS) that no upstream llama.cpp defines, and that a published Qwen3.8-2.4T checkpoint stores its experts in |
+| turboderp-org `exllamav3` | `exllamav3` | the EXL3 trellis quantization format and its kernels, and the DeepSeek-V4 support the pinned HEAD carries, which neither vLLM nor vLLM-Omni implements |
 | Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, for which vLLM has no backend |
 
 <!-- oracle-registry:end -->
@@ -406,15 +408,16 @@ projections, not narratives. Each fact lives in one document.
 
 | Surface | Changes when |
 |---|---|
-| `docs/STATUS.md` | a row changes lifecycle state |
-| `docs/BENCHMARKS.md` | a row gains an accepted or explicitly pending/failed/void measurement |
+| `docs/BENCHMARKS.md` | a public benchmark ID is added, removed, or changes disposition |
 | `docs/FEATURES.md` | a feature, model, backend, or quantization surface changes |
 | `docs/USAGE.md` | a command, C API, config key, install step, or workflow changes |
 | `README.md` | a user-visible headline, positioning, or quick start changes |
 | the moved row spec's `## Now` | a row changes lifecycle state |
 
 Editing `src/`, `include/`, or `tests/` on its own owes none of these. A
-lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
+lifecycle change owes only the moved row spec's `## Now`; Git and the row's
+records carry detailed status and history. Publishing a benchmark owns one
+`docs/benchmarks/<benchmark-id>.md` detail file and its index row.
 `.agents/NOW.md` is authored only at operator cadence and is never a per-row
 lifecycle write.
 

@@ -1406,7 +1406,7 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
 
   SUBCASE("NVFP4 experts but an UNQUANTIZED lm_head — now LOADS (#864)") {
     // The dense arm has always accepted a bf16 head (`LoadLmHeadAnyDtype`,
-    // qwen3_5_dense_weights.cpp:246-340); the MoE arm hard-required NVFP4 and
+    // qwen3_5_dense_weights.cpp:247-341); the MoE arm hard-required NVFP4 and
     // refused here. #864 gave it the bf16 arm, so the same fixture loads and
     // binds the head to the bf16 slot. Kept, inverted, for the reason above.
     CHECK(load(MoeSpecsWithBf16LmHead("model."), "bf16_lmhead").empty());
@@ -1819,8 +1819,18 @@ TEST_CASE("qwen3_8: the bf16 GDN tower loads through the MoE arm") {
     CHECK_FALSE(g.a_log.Empty());
     CHECK_FALSE(g.dt_bias.Empty());
     CHECK_FALSE(g.norm_weight.Empty());
-    CHECK_FALSE(g.in_proj_a.Empty());
-    CHECK_FALSE(g.in_proj_b.Empty());
+    // GDN-MOE-PACKED-BA (#1169): the b/a shards of that tail now land in the
+    // ONE merged `in_proj_ba` owner (`[2*Hv, H]`, nk, rows [b; a]) on the MoE
+    // arm too, as the dense loader always did, and the split fields stay empty.
+    // Still independent of the tower arm, which is what this case pins; the
+    // owner's bytes are pinned by test_qwen35_moe_gdn_ba_owner.
+    CHECK_FALSE(g.in_proj_ba.Empty());
+    CHECK(g.in_proj_ba.nk);
+    CHECK(g.in_proj_ba.rank == 2);
+    CHECK(g.in_proj_ba.shape[0] == 2 * kGdnValueHeads);
+    CHECK(g.in_proj_ba.shape[1] == kMoeHidden);
+    CHECK(g.in_proj_a.Empty());
+    CHECK(g.in_proj_b.Empty());
     // ...and the other three components stay quantized.
     CHECK_FALSE(w.lm_head_fp4.Empty());
     CHECK_FALSE(w.layers[0].moe.shared_gate_proj_fp4.Empty());

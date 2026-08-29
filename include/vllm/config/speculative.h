@@ -28,6 +28,37 @@
 
 namespace vllm {
 
+// SPEC-DRAFTER-CHAIN W1 (#1522): one entry of the preference-ordered drafter
+// chain — the `vllm_cpp.drafter_chain` extension of `--speculative-config`.
+//
+// It is a list of OBJECTS and not llama.cpp's comma-separated `--spec-type`
+// name string (`common/arg.cpp:3754-3763`), because each entry carries its own
+// draft checkpoint and its own k. The fields are exactly the five HONOURED
+// top-level keys of the same document, with the same meanings, so an entry is
+// read the way a single-method config is read and there is no second spelling
+// of anything.
+//
+// vLLM has NO composition surface to mirror: `SpeculativeMethod` is a single
+// `Literal` and `SpeculativeConfig.method` one value of it, verified at the
+// parity pin `555967922` and at upstream `origin/main` `c20572610`
+// (.agents/specs/drafter-chain.md `## Upstream chain`). llama.cpp is the
+// secondary oracle for the SEMANTICS only.
+struct SpeculativeChainEntry {
+  // "mtp", "dflash", "dspark" or "ngram" — the four this engine implements and
+  // the four the row scopes. Never empty on a parsed entry.
+  std::string method;
+  // The entry's own k (`num_speculative_tokens`). std::nullopt = "not given",
+  // resolved per method exactly as the top-level key is.
+  std::optional<int> num_speculative_tokens = std::nullopt;
+  // The entry's own draft checkpoint (`model`). Required for "dflash" and
+  // "dspark"; meaningless for "mtp" (whose draft lives in the target) and for
+  // "ngram" (which has no draft model).
+  std::optional<std::string> draft_model_path = std::nullopt;
+  // The entry's own n-gram window. Only meaningful for "ngram".
+  std::optional<int> prompt_lookup_min = std::nullopt;
+  std::optional<int> prompt_lookup_max = std::nullopt;
+};
+
 // SpeculativeConfig (T0 scheduler subset). Value type; the Scheduler ctor reads
 // it (upstream vllm_config.speculative_config).
 struct SpeculativeConfig {
@@ -67,6 +98,22 @@ struct SpeculativeConfig {
   // reject P-EAGLE on the V2 runner (config/vllm.py:2168-2177); for us it is the
   // declarative marker that the propose path is block-shaped.
   bool parallel_drafting = false;
+
+  // SPEC-DRAFTER-CHAIN W1 (#1522): the preference-ordered drafter chain, in the
+  // order the user gave it. EMPTY is "no chain", which is every document that
+  // predates this field and every document vLLM accepts — the additivity the
+  // row is built on (.agents/specs/drafter-chain.md D1).
+  //
+  // W1 lands the field, its validation and its refusals, and NO chain
+  // behaviour. `LoadedEngine::ResolveSpecConfig` is the production reader: it
+  // refuses a chain BY NAME, before any weight I/O, rather than reducing it to
+  // one drafter or to no speculation at all. Resolution is owed by W3.
+  std::vector<SpeculativeChainEntry> drafter_chain;
+
+  // use_drafter_chain: whether this config asks for a chain at all. The one
+  // predicate every consumer asks, so "empty vector means absent" is stated
+  // once instead of at each call site.
+  bool use_drafter_chain() const { return !drafter_chain.empty(); }
 
   // ResolveMtp: build the scheduler-facing SpeculativeConfig for a Qwen3.5 MTP
   // checkpoint. Mirrors speculative.py:480-489 (method "mtp",
@@ -115,9 +162,15 @@ struct SpeculativeConfig {
   // IsDflash2Draft: whether a DFlash draft is a DFlash2 one, by the architecture
   // upstream itself selects on.
   //
-  // BEYOND-PIN (SPEC-DFLASH2 W1, #1314). vllm-project/vllm#52816 is OPEN at head
-  // `19c9351904df4c63042671bc67a866ca48dc7d6f`; the parity pin `555967922` does
-  // not carry the architecture at all, and this row does NOT advance the pin.
+  // BEYOND-PIN (SPEC-DFLASH2 W1, #1314). vllm-project/vllm#52816 MERGED upstream
+  // on 2026-08-21 at 05:27:22Z, at head
+  // `3406ec1dae9916f920b90f0dbf90dcf54923d042`, merge commit
+  // `b389ac29465b33f9e9c534df221ea3c129e9793f`. This comment said OPEN at head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f` -- the FIRST of three heads the
+  // pull request carried -- and was doubly stale; corrected 2026-08-21 by the
+  // W6 repair wave. The parity pin `555967922` still does not carry the
+  // architecture at all, this row does NOT advance the pin, and reconciling the
+  // port onto the merged head is owed under #1561.
   // Upstream registers `"DFlash2DraftModel" -> ("qwen3_dflash2",
   // "DFlash2Qwen3ForCausalLM")` (`model_executor/models/registry.py:628`) and
   // asks exactly this question in two places: the speculator selection
@@ -444,6 +497,22 @@ struct SpeculativeConfig {
   // separate bonus query.
   bool use_dspark() const { return method == "dspark"; }
 
+  // async_scheduling_compatible (SPEC-DFLASH2 W7, #1824): whether async
+  // scheduling stays ON with this speculative method. Mirrors the pin's
+  // resolution predicate (vllm/config/vllm.py:1076-1087 @ 555967922): async is
+  // disabled only for a method OUTSIDE
+  //   EagleModelTypes ∪ NgramGPUTypes ∪ {"dspark"}
+  // where EagleModelTypes = eagle / eagle3 / extract_hidden_states / every MTP
+  // type / dflash (speculative.py:60-65). Over the methods THIS engine
+  // implements that is exactly use_eagle() — mtp, dflash (DFlash2 rides method
+  // "dflash", same as upstream at b389ac2946 speculative.py:952-956), dspark,
+  // eagle, eagle3. Host "ngram" is NOT upstream's async lane ("ngram_gpu" is a
+  // different, GPU-side implementation this engine does not have), and
+  // "draft_model" is refused AT THE PIN (b389ac2946 later allows it —
+  // vllm/config/vllm.py:1291 there — but the pin governs; reconcile when the
+  // pin advances past that commit).
+  bool async_scheduling_compatible() const { return use_eagle(); }
+
   // NumLookaheadTokens: the scheduler's num_lookahead_tokens for this config
   // (scheduler.py:275-292). This is the value threaded into allocate_slots so the
   // verify slots are reserved ahead of time. 0 for a method the scheduler does
@@ -462,12 +531,23 @@ struct SpeculativeConfig {
 
 // Parse vLLM's `--speculative-config` JSON (SPEC-MTP I5d). Mirrors the subset of
 // vllm/engine/arg_utils.py speculative-config handling the CLI needs: the
-// `method` string and the optional `num_speculative_tokens`. "mtp" and "dflash"
-// (SPEC-DFLASH D4) are supported at this pin; any other method throws. The
-// returned config has n_predict == 0 — the loader resolves it from the model's
-// mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp (MTP) or the draft's
-// dflash_config via ResolveDflash (DFlash) once the HF config is known. Throws
-// std::invalid_argument on a malformed document / unknown method.
+// `method` string and the optional `num_speculative_tokens`. The accepted
+// methods at this pin are "mtp", "dflash" (SPEC-DFLASH D4), "dspark"
+// (SPEC-DSPARK W1), "ngram" (SPEC-NGRAM) and "draft_model" (SPEC-DRAFT-MODEL);
+// any other method throws. Every key is judged by name and none is dropped
+// (#1160). The returned config has n_predict == 0 — the loader resolves it from
+// the model's mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp (MTP) or
+// the draft's dflash_config via ResolveDflash (DFlash) once the HF config is
+// known. Throws std::invalid_argument on a malformed document / unknown method.
+//
+// SPEC-DRAFTER-CHAIN W1 (#1522): the document also accepts this engine's own
+// `vllm_cpp` extension object, whose only key is `drafter_chain` — a JSON array
+// of speculator entries in preference order, filling `drafter_chain` above.
+// `method` is REQUIRED exactly when that field is ABSENT: the two are mutually
+// exclusive, so a chain document leaves `method` empty and a chain-free one is
+// unchanged in every respect (spec `.agents/specs/drafter-chain.md` D7). This
+// function parses and validates the chain; `LoadedEngine::ResolveSpecConfig`
+// refuses one by name, because nothing resolves a chain at this wave.
 SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text);
 
 }  // namespace vllm

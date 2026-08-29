@@ -31,7 +31,9 @@
 #include <mma.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -41,6 +43,7 @@
 
 #include "vt/cuda/cuda_device_caps.h"
 #include "vt/ops.h"
+#include "vt/paged_attn_route.h"
 
 namespace vt::cuda {
 
@@ -64,6 +67,16 @@ void LaunchDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                          const PagedAttentionArgs& args, int64_t hq, int64_t d,
                          int64_t num_reqs, int64_t num_kv_heads,
                          int64_t block_size);
+// SPEC-DFLASH2 W10 (#1857): the UNIFORM-QLEN SPECULATIVE VERIFY on the d256
+// decode lane — q_len query rows per request, batched split-KV, bottom-right
+// causal against seqused_k (the packed draft mask's semantics). Toggle
+// VT_FA2_SPEC_DECODE (see Fa2SpecDecodeEnabled()).
+void LaunchSpecDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                             const Tensor& k_cache, const Tensor& v_cache,
+                             const Tensor& block_table, const Tensor& seq_lens,
+                             const PagedAttentionArgs& args, int64_t hq, int64_t d,
+                             int64_t num_reqs, int64_t num_kv_heads,
+                             int64_t block_size, int64_t q_len);
 // VARLEN d128 decode for Qwen3-dense DECODE (bf16 paged KV, head_dim 128). Toggle
 // VT_FA2_DECODE_QWEN3 (see Fa2DecodeQwen3Enabled()). gqa_swap selects the vLLM
 // seqlenq_ngroups_swapped grid (VT_FA2_DECODE_GQA_SWAP, see Fa2DecodeGqaSwapEnabled());
@@ -135,6 +148,62 @@ __device__ inline float Load(const __half* p, int64_t i) { return __half2float(p
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
 
+// ─── fp8 KV-cache READ (KV-FP8 W2, #1593) ──────────────────────────────────
+// One K/V-CACHE element as f32, with the fp8 dequant folded in. `scale` is the
+// per-tensor k_scale / v_scale BaseKVCacheMethod loads from the checkpoint
+// (vllm/model_executor/layers/quantization/kv_cache.py:108-191) and is INERT on
+// the float arms, which forward to Load() unchanged — so every existing bf16/f32
+// caller reads exactly the bytes, in exactly the order, it read before.
+//
+// The fp8 arm mirrors upstream's attention-side dequant
+// `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:419-429): fp8 byte ->
+// float, then multiply by the scale, i.e. `Dequant(FP8) * scale = HP` (the
+// convention at :296-300). It is written as the SAME ARITHMETIC as the W1 CPU
+// codec vt::F8E4M3ToF32 (include/vt/fp8_kv.h) rather than as the hardware
+// `__nv_cvt_fp8_to_halfraw`, because W1 is this wave's oracle and sharing the
+// decode makes CUDA==CPU on the read a property of the source rather than a
+// measurement. The two agree in any case: every one of the 254 FINITE e4m3 codes
+// is exactly representable in fp16, so upstream's fp8->half->float round trip is
+// lossless. `std::ldexp(mantissa, exp - 7)` on a float IS `ldexpf`, so each of
+// those 254 decodes to the same f32 bits as the CPU codec.
+//
+// THE TWO NaN CODES are not identical, and the suite cannot see it. On 0x7F and
+// 0xFF the CPU returns `std::numeric_limits<float>::quiet_NaN()` (0x7FC00000)
+// and this returns `CUDART_NAN_F` (0x7FFFFFFF): both are quiet NaNs and both
+// propagate the same way, but the PAYLOAD differs. No gate here
+// distinguishes them, because a NaN compares unequal to everything including
+// itself, so a byte or NMSE comparison fails on ANY payload rather than on the
+// wrong one. It is recorded here rather than measured. Reaching it also needs a
+// non-finite input: `__NV_SATFINITE` clamps an out-of-range magnitude to the max
+// finite code (0x7E/0xFE), so a store of a finite `hp / scale` never writes
+// 0x7F/0xFF.
+__device__ __forceinline__ float Fp8E4M3ToF32Dev(uint8_t byte) {
+  const uint32_t sign = static_cast<uint32_t>(byte >> 7) & 0x1U;
+  const uint32_t exp = static_cast<uint32_t>(byte >> 3) & 0xFU;
+  const uint32_t mant = static_cast<uint32_t>(byte) & 0x7U;
+  const float sm = sign ? -1.0f : 1.0f;
+  if (exp == 0xFU && mant == 0x7U) return CUDART_NAN_F;  // e4m3fn NaN (0x7F/0xFF)
+  if (exp == 0U) return sm * (static_cast<float>(mant) * (1.0f / 512.0f));
+  const float mantissa = 1.0f + static_cast<float>(mant) * (1.0f / 8.0f);
+  return sm * ldexpf(mantissa, static_cast<int>(exp) - 7);
+}
+
+__device__ inline float LoadKv(const float* p, int64_t i, float scale) {
+  (void)scale;
+  return Load(p, i);
+}
+__device__ inline float LoadKv(const __nv_bfloat16* p, int64_t i, float scale) {
+  (void)scale;
+  return Load(p, i);
+}
+__device__ inline float LoadKv(const __half* p, int64_t i, float scale) {
+  (void)scale;
+  return Load(p, i);
+}
+__device__ inline float LoadKv(const uint8_t* p, int64_t i, float scale) {
+  return Fp8E4M3ToF32Dev(p[i]) * scale;
+}
+
 // FlashAttention local-mask bounds for one bottom-right-aligned absolute query
 // position p. Negative window values mean the corresponding full bound. Public
 // PagedAttentionArgs uses nullopt for full attention; launchers unwrap it to -1.
@@ -202,7 +271,8 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
                                      int64_t block_size, int64_t bt_row, int64_t bt_col,
                                      int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
                                      int64_t vc_pg, int64_t vc_hd, float scale, float softcap, bool causal,
-                                     int window_left, int window_right) {
+                                     int window_left, int window_right, float k_scale,
+                                     float v_scale) {
   const int64_t t = blockIdx.x;  // global query-token index
   const int64_t h = blockIdx.y;  // q-head
   // Find request r with query_start_loc[r] <= t < query_start_loc[r+1].
@@ -245,7 +315,7 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
     const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
     float part = 0.0f;
     for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
-      part += Load(query, qoff + e) * Load(k_cache, kbase + e);
+      part += Load(query, qoff + e) * LoadKv(k_cache, kbase + e, k_scale);
     red[threadIdx.x] = part;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -261,7 +331,7 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
     const float pw = expf(s - m_new);
     const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
     for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
-      acc[e] = acc[e] * corr + pw * Load(v_cache, vbase + e);
+      acc[e] = acc[e] * corr + pw * LoadKv(v_cache, vbase + e, v_scale);
     __syncthreads();
     if (threadIdx.x == 0) {
       s_l = s_l * corr + pw;
@@ -637,7 +707,7 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                  int block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk,
                                  int64_t kc_pg, int64_t kc_hd, int64_t vc_blk, int64_t vc_pg,
                                  int64_t vc_hd, float scale, float softcap, bool causal, int window_left,
-                                 int window_right, int bn) {
+                                 int window_right, int bn, float k_scale, float v_scale) {
   const int tile_idx = blockIdx.x;
   const int h = blockIdx.y;  // q-head
   if (tile_idx >= num_tiles) return;
@@ -706,12 +776,14 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
       const int j = j0 + kk;
       const int blk = block_table[static_cast<int64_t>(r) * bt_row + (j / block_size) * bt_col];
       const int off = j % block_size;
-      ksm[idx] = Load(k_cache, static_cast<int64_t>(blk) * kc_blk +
-                                   static_cast<int64_t>(off) * kc_pg +
-                                   static_cast<int64_t>(g) * kc_hd + ee);
-      vsm[idx] = Load(v_cache, static_cast<int64_t>(blk) * vc_blk +
-                                   static_cast<int64_t>(off) * vc_pg +
-                                   static_cast<int64_t>(g) * vc_hd + ee);
+      ksm[idx] = LoadKv(k_cache,
+                        static_cast<int64_t>(blk) * kc_blk + static_cast<int64_t>(off) * kc_pg +
+                            static_cast<int64_t>(g) * kc_hd + ee,
+                        k_scale);
+      vsm[idx] = LoadKv(v_cache,
+                        static_cast<int64_t>(blk) * vc_blk + static_cast<int64_t>(off) * vc_pg +
+                            static_cast<int64_t>(g) * vc_hd + ee,
+                        v_scale);
     }
     __syncthreads();
 
@@ -2079,7 +2151,7 @@ extern "C" void vt_sm70_fa2_ref_decode(
       static_cast<const __half*>(v), block_table, seq_lens, d_qsl,
       num_reqs, hq, num_kv, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
       vc_blk, vc_pg, vc_hd, scale, /*softcap=*/0.f, /*causal=*/true,
-      /*window_left=*/1, /*window_right=*/1);
+      /*window_left=*/1, /*window_right=*/1, /*k_scale=*/1.f, /*v_scale=*/1.f);
   Check(cudaGetLastError(), "sm70 fa2 oracle decode");
   cudaFree(d_qsl);
 }
@@ -2135,7 +2207,8 @@ bool Sm70FaValidate(cudaStream_t s, float* out, const Tensor& query,
       block_table.stride[0], block_table.stride[1],
       k_cache.stride[0], k_cache.stride[1], k_cache.stride[2],
       v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      scale, /*softcap=*/0.f, /*causal=*/true, /*wl=*/1, /*wr=*/1);
+      scale, /*softcap=*/0.f, /*causal=*/true, /*wl=*/1, /*wr=*/1, /*k_scale=*/1.f,
+      /*v_scale=*/1.f);
   vt_sm70_fa2_decode(out, query.Ptr<__half>(), k_cache.Ptr<__half>(),
                      v_cache.Ptr<__half>(), block_table.Ptr<int32_t>(),
                      seq_lens.Ptr<int32_t>(), num_tokens, hq, nkv, d, block_size,
@@ -2255,6 +2328,32 @@ bool Sm70PrefillTakeover(cudaStream_t c, Tensor& out, const Tensor& query,
 #endif  // VLLM_CPP_HAS_SM70_FA2
 #endif  // VLLM_CPP_HAS_SM70_FA2
 
+// The correctness-grade block kernel, lifted out of LaunchDecode's tail so the
+// fp8 KV arm (KV-FP8 W2) can reach it WITHOUT instantiating the vectorized
+// decode-opt / GQA kernels above it, whose LoadRowN/LoadRow8 128-bit loaders are
+// bf16/f32-only. Byte-for-byte the launch LaunchDecode always made: same kernel,
+// same grid, same shared memory, same argument order.
+template <typename TQ, typename TKV, typename Tout>
+void LaunchPagedBlock(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                      const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                      const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                      int64_t num_tokens, int64_t hq, int64_t d, int64_t num_reqs,
+                      int64_t num_kv_heads, int64_t block_size) {
+  const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(hq));
+  const size_t shmem = (static_cast<size_t>(d) + kPagedBlock) * sizeof(float);
+  auto* kernel = args.window_size.has_value()
+                     ? PagedAttentionKernel<TQ, TKV, Tout, true>
+                     : PagedAttentionKernel<TQ, TKV, Tout, false>;
+  kernel<<<grid, kPagedBlock, shmem, s>>>(
+      out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
+      block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), num_reqs,
+      hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
+      k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1],
+      v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal, WindowLeft(args),
+      WindowRight(args), args.k_scale, args.v_scale);
+  Check(cudaGetLastError(), "paged_attention decode launch");
+}
+
 template <typename TQ, typename TKV, typename Tout>
 void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                   const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
@@ -2362,18 +2461,9 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
     Check(cudaGetLastError(), "paged_attention decode-opt launch");
     return;
   }
-  const size_t shmem = (static_cast<size_t>(d) + kPagedBlock) * sizeof(float);
-  auto* kernel = args.window_size.has_value()
-                     ? PagedAttentionKernel<TQ, TKV, Tout, true>
-                     : PagedAttentionKernel<TQ, TKV, Tout, false>;
-  kernel<<<grid, kPagedBlock, shmem, s>>>(
-      out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
-      block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), num_reqs,
-      hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
-      k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1],
-      v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal, WindowLeft(args),
-      WindowRight(args));
-  Check(cudaGetLastError(), "paged_attention decode launch");
+  LaunchPagedBlock<TQ, TKV, Tout>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                  query_start_loc, args, num_tokens, hq, d, num_reqs,
+                                  num_kv_heads, block_size);
 }
 
 // --- op-level parity driver (brick F adoption proof) ----
@@ -2680,7 +2770,8 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args), bn);
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args), bn,
+      args.k_scale, args.v_scale);
   Check(cudaGetLastError(), "paged_attention prefill flash launch");
   Check(cudaFreeAsync(d_tiles, s), "paged flash tiles free");
 }
@@ -3051,6 +3142,48 @@ bool Fa2DecodeEnabled() {
   return e == nullptr || e[0] != '0';
 }
 
+// SPEC-DFLASH2 W10 (#1857): spec-as-decode — keep a CLASSIFIED uniform-qlen
+// speculative verify (PagedAttentionArgs::uniform_spec_query_len, set by the
+// runner off the mirrored 1+2K reorder threshold, backend.py:718-736 @
+// b389ac2946) on the d256 FA-2 split-KV DECODE lane instead of the
+// num_splits=1 prefill ladder. This is what FlashInfer's
+// supports_spec_as_decode does for its decode kernels (flashinfer.py:852-860),
+// and it is the +9 ms/step the #1574 K-ladder attributed. DEFAULT ON
+// (parity-enablers-ship-as-defaults); =0 restores the prefill route for a
+// same-binary A/B. Non-byte-exact vs the prefill route only when the split
+// heuristic picks num_splits>1 (the split combine reorders f32 partials — the
+// same near-tie class as VT_FA2_DECODE_GQA_SWAP, argued in the wave spec's
+// numerics section). Read fresh (host path per step). MUST match qwen3_5.cpp
+// Fa2SpecDecodeOn(), which selects the bf16 q/out dtypes that make this
+// admission eligible — W10 shipped without that model-side half and the lane
+// died at the dtype conjuncts with every counter green (#1865).
+bool Fa2SpecDecodeEnabled() {
+  const char* e = std::getenv("VT_FA2_SPEC_DECODE");
+  return e == nullptr || e[0] != '0';
+}
+
+// SPEC-DFLASH2 W11 (#1890): the DRAFT BLOCK arm of the same spec-as-decode
+// admission. The draft's (1+k) query block over its own paged context store is
+// a uniform-qlen batch of exactly the shape W10 already keeps on the split-KV
+// decode lane; what kept it off was not the shape but KV RESIDENCY, which the
+// model side now fixes by writing the block K/V into the store's pages before
+// the read (qwen3_dflash.cpp, ForwardPagedBody). Measured cost of the lane it
+// leaves: 449.7 us/call x 5.1 calls/step against SGLang's 14.3 us/call for the
+// same work, while W10's verify on this lane runs at 17.1 (#1890).
+//
+// SEPARATE from VT_FA2_SPEC_DECODE on purpose: the two arms serve different
+// models (the 27B target's d256 verify vs the draft's d128 block), so one
+// rollback must not disturb the other. DEFAULT ON
+// (parity-enablers-ship-as-defaults); =0 keeps the classified draft read on the
+// prefill-class ladder in the same binary. MUST match qwen3_dflash.cpp
+// DflashBlockPagedRouteEnabled(), which decides whether the block K/V are
+// resident at all — a read this admission accepts but that no ReshapeAndCache
+// preceded would attend to stale pages. Read fresh (host path per layer).
+bool Fa2DflashBlockEnabled() {
+  const char* e = std::getenv("VT_FA2_DFLASH_BLOCK");
+  return e == nullptr || e[0] != '0';
+}
+
 // 35B ratio-8 (Hq/Hkv=16/2) hd-256 decode arm of the SAME vendored split-KV
 // path. The old ratio-6 decode launched only grid=(num_reqs,num_kv_heads) blocks
 // at c1 (2 blocks on a ~100-SM GB10 ⇒ near-zero occupancy); the split-KV kernel
@@ -3122,10 +3255,124 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   const int64_t num_kv_heads = k_cache.shape[2], block_size = k_cache.shape[1];
   if (num_tokens == 0 || hq == 0 || d == 0) return;
 
+  // GQA query-heads-per-KV-head ratio, shared by the WMMA GQA ladder and the
+  // FA-2 decode topology gates below.
+  const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
+#ifdef VLLM_CPP_FLASH_ATTN
+  // FA-2 d256 decode topology + toggle gates (shared by the pure-decode arm and
+  // the spec-as-decode arm below):
+  //   * 4B ratio-4 Hq/Hkv=16/4, gated by VT_FA2_DECODE_4B;
+  //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G), gated by VT_FA2_DECODE;
+  //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1), gated by
+  //     VT_FA2_DECODE_35B — the old ratio-8 path launched only 2 blocks/step.
+  const bool fa2_decode_r4 =
+      hq == 16 && num_kv_heads == 4 && qpk == 4 && Fa2Decode4BEnabled();
+  const bool fa2_decode_r6 = hq == 24 && num_kv_heads == 4 && qpk == 6 && Fa2DecodeEnabled();
+  const bool fa2_decode_r8 = hq == 16 && num_kv_heads == 2 && qpk == 8 && Fa2Decode35BEnabled();
+  // SPEC-AS-DECODE (SPEC-DFLASH2 W10, #1857): a CLASSIFIED uniform-qlen
+  // speculative verify (args.uniform_spec_query_len, set by the runner off the
+  // mirrored 1 + 2K reorder threshold — backend.py:718-736 @ b389ac2946) stays
+  // on the d256 split-KV DECODE lane instead of the num_splits=1 prefill
+  // ladder, exactly as FlashInfer's supports_spec_as_decode keeps the verify on
+  // its decode kernel (flashinfer.py:852-860). The admission composes the
+  // host-testable shape guard (include/vt/paged_attn_route.h) with the SAME
+  // eligibility terms the pure-decode arm requires, so an inadmissible verify
+  // (f32 A/B, other head dims, windows, foreign ratios, VT_FA2_SPEC_DECODE=0)
+  // routes byte-identically to before.
+  //
+  // The terms both arms share, factored so the W10 arm below stays the shipped
+  // predicate verbatim: the classification's shape guard, a page size the
+  // vendored kernel can address, a unit-column-stride block table, and bf16
+  // end to end.
+  const bool fa2_spec_common =
+      PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
+      block_size % 16 == 0 && block_table.stride[1] == 1 &&
+      std::is_same<TQ, __nv_bfloat16>::value &&
+      std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16;
+  const bool fa2_spec_verify = fa2_spec_common && d == 256 && args.causal &&
+                               !args.window_size.has_value() &&
+                               (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
+                               Fa2SpecDecodeEnabled();
+  // SPEC-DFLASH2 W11 (#1890): the DRAFT BLOCK arm. Head dim 128 (the published
+  // DFlash2 drafts' `head_dim`), any GQA-divisible topology, and the THREE
+  // masks a DFlash layer can present:
+  //
+  //   * full attention   -> non-causal over the whole combined sequence;
+  //   * causal-SWA       -> a LEFT window with right == 0;
+  //   * plain causal     -> no window.
+  //
+  // A right-open window is deliberately NOT admitted: `PagedAttentionArgs`
+  // intersects the window with the causal bound, so `causal && right > 0` still
+  // means `j <= p`, while FA-2's local mask would take the window's word for it
+  // and admit `j <= p + right`. Refusing that shape here is cheaper than
+  // encoding the intersection in the launcher, and no draft layer produces it.
+  const bool fa2_dflash_window_ok =
+      !args.window_size.has_value() ||
+      (args.causal && args.window_size->left >= 0 && args.window_size->right == 0);
+  const bool fa2_dflash_block = fa2_spec_common && d == 128 && num_kv_heads > 0 &&
+                                hq % num_kv_heads == 0 && fa2_dflash_window_ok &&
+                                Fa2DflashBlockEnabled();
+  const bool fa2_spec_decode = fa2_spec_verify || fa2_dflash_block;
+#else
+  const bool fa2_spec_decode = false;
+#endif  // VLLM_CPP_FLASH_ATTN
+  // THE UNSERVED-CLASSIFICATION NARRATION. W10's repair (#1865) added it for
+  // the verify arm; W11 (#1890) widened the SAME line to carry both arms rather
+  // than print a second one, because two narrations that each name half the
+  // predicate are how a reader concludes the wrong half declined.
+  //
+  // A spec-CLASSIFIED batch this dispatch cannot serve is LEGAL — it routes
+  // byte-identically to pre-W10 — but it must not be SILENT. #1865 is the case
+  // this exists for: a whole profiled campaign ran with the FA-2 arm dark,
+  // every counter green, and only an nsys kernel table could see it. One
+  // stderr line per process names the conjunct group that declined, so the next
+  // dead lane shows up in the server log at the first classified step instead
+  // of in a profile ("make the instrument say what it is measuring",
+  // .agents/verification.md).
+  if (PagedAttnUniformSpecShape(num_tokens, num_reqs, args.uniform_spec_query_len) &&
+      !fa2_spec_decode) {
+    static std::once_flag spec_unserved_once;
+    std::call_once(spec_unserved_once, [&] {
+#ifdef VLLM_CPP_FLASH_ATTN
+      std::fprintf(
+          stderr,
+          "[vt] paged_attn: uniform-qlen batch CLASSIFIED (q=%d, d=%d, hq=%d, "
+          "hkv=%d) but NOT admitted onto the FA-2 split-KV lane; routing to the "
+          "prefill-class ladder (first occurrence). Shared: block16=%d "
+          "bt_stride1=%d q_bf16=%d kv_bf16=%d out_bf16=%d. Verify arm (W10): "
+          "d256=%d causal=%d no_window=%d decode_topology=%d toggle=%d. Draft "
+          "arm (W11): d128=%d gqa_divisible=%d window_shape=%d toggle=%d\n",
+          static_cast<int>(args.uniform_spec_query_len), static_cast<int>(d),
+          static_cast<int>(hq), static_cast<int>(num_kv_heads),
+          static_cast<int>(block_size % 16 == 0),
+          static_cast<int>(block_table.stride[1] == 1),
+          static_cast<int>(std::is_same<TQ, __nv_bfloat16>::value),
+          static_cast<int>(std::is_same<TKV, __nv_bfloat16>::value),
+          static_cast<int>(out.dtype == DType::kBF16), static_cast<int>(d == 256),
+          static_cast<int>(args.causal), static_cast<int>(!args.window_size.has_value()),
+          static_cast<int>(fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8),
+          static_cast<int>(Fa2SpecDecodeEnabled()), static_cast<int>(d == 128),
+          static_cast<int>(num_kv_heads > 0 && hq % num_kv_heads == 0),
+          static_cast<int>(fa2_dflash_window_ok),
+          static_cast<int>(Fa2DflashBlockEnabled()));
+#else
+      std::fprintf(
+          stderr,
+          "[vt] paged_attn: uniform-qlen batch CLASSIFIED (q=%d) but this binary "
+          "carries NO FlashAttention-2 (VLLM_CPP_FLASH_ATTN off — unstaged "
+          "CUTLASS headers leave the FA2 arch manifest empty, and the configure "
+          "log says so while still printing `cutlass-fp8: ENABLED`). The batch "
+          "runs the prefill-class fallback and VT_FA2_SPEC_DECODE / "
+          "VT_FA2_DFLASH_BLOCK have no effect.\n",
+          static_cast<int>(args.uniform_spec_query_len));
+#endif  // VLLM_CPP_FLASH_ATTN
+    });
+  }
   // DECODE (every request query_len 1 ⟺ num_tokens == num_reqs) or head_dim too
   // large for the register-tiled flash path: keep the graph-safe block kernel.
-  // Otherwise PREFILL → flash. num_tokens/num_reqs are host-known (no device read).
-  const bool is_prefill = num_tokens > num_reqs;
+  // Otherwise PREFILL → flash — except a spec-as-decode admitted verify, which
+  // takes the decode class. num_tokens/num_reqs are host-known (no device read).
+  const bool is_prefill = PagedAttnIsPrefill(num_tokens, num_reqs, fa2_spec_decode);
   // bf16 tensor-core prefill. The whole WMMA ladder (flash2vec/BM GQA kernels,
   // kGqaQG shared-memory sizing, the QKᵀ/PV WMMA tile counts) was tuned and
   // validated ONLY for the gate models' head_dim 256 with a bf16 query + bf16 KV
@@ -3150,7 +3397,6 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // GQA K/V reuse: eligible when qpk = hq/num_kv_heads is a multiple of the reuse
   // group size (else a group would span two KV heads). Mirrors flash_attn's
   // load-K/V-once-per-KV-head GQA loop; halves redundant K/V traffic vs per-head.
-  const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
   const bool gqa = wmma && PrefillWmmaGqaEnabled() && (qpk % kGqaQG == 0) &&
                    (hq % kGqaQG == 0);
   const bool flash2 = gqa && PrefillWmmaFlash2Enabled();
@@ -3178,18 +3424,11 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
                            out.dtype == DType::kBF16;
   // FA2 pure-decode scope: pure decode, D256, paged BF16, global causal
   // attention and FA2-compatible page/block-table layout. q/out are selected
-  // BF16 by the matching model-side gate, so no cast kernel appears. Two
-  // independently-toggled topologies share the exact vendored split-KV path:
-  //   * 4B ratio-4 Hq/Hkv=16/4, gated by VT_FA2_DECODE_4B;
-  //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G), gated by VT_FA2_DECODE;
-  //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1), gated by
-  //     VT_FA2_DECODE_35B — the old ratio-8 path launched only 2 blocks/step.
+  // BF16 by the matching model-side gate, so no cast kernel appears. The three
+  // independently-toggled topologies (fa2_decode_r4/r6/r8, defined beside the
+  // spec-as-decode admission above) share the exact vendored split-KV path.
   // The LaunchDecodeFA2Bf16 body is generic in groups/heads; only these gates
   // and the model-side dtype selection need the ratio widened.
-  const bool fa2_decode_r4 =
-      hq == 16 && num_kv_heads == 4 && qpk == 4 && Fa2Decode4BEnabled();
-  const bool fa2_decode_r6 = hq == 24 && num_kv_heads == 4 && qpk == 6 && Fa2DecodeEnabled();
-  const bool fa2_decode_r8 = hq == 16 && num_kv_heads == 2 && qpk == 8 && Fa2Decode35BEnabled();
   const bool fa2_decode = !is_prefill && num_tokens == num_reqs && d == 256 &&
                           block_size % 16 == 0 && args.causal &&
                           !args.window_size.has_value() &&
@@ -3263,6 +3502,12 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       if (fa2_prefill) {
         LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                              query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
+      } else if (fa2_spec_decode) {
+        // W10 (#1857): the classified uniform-qlen verify — split-KV decode
+        // with the bottom-right causal draft mask, q_len rows per request.
+        LaunchSpecDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                args, hq, d, num_reqs, num_kv_heads, block_size,
+                                args.uniform_spec_query_len);
       } else if (fa2_decode) {
         LaunchDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                             args, hq, d, num_reqs, num_kv_heads, block_size);
@@ -3308,6 +3553,61 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   }
 }
 
+// ─── fp8 KV-cache READ dispatch (KV-FP8 W2, #1593) ─────────────────────────
+// TKV is `uint8_t`: the cache pages are 1-byte fp8-e4m3 (DType::kI8) and each
+// read is dequantized as Dequant(fp8) * k_scale|v_scale inside LoadKv, mirroring
+// upstream's `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:419-429).
+//
+// SCOPE, argued rather than assumed. Only the two CORRECTNESS-GRADE kernels are
+// reachable from here — the tiled flash prefill and the block decode — and that
+// is not a shortcut, it is what the ladder above already implies. Every faster
+// arm is bf16-NATIVE by construction: the WMMA prefill ladder stages
+// `__nv_bfloat16` fragments, the vendored FA-2 launchers take bf16 pointers, and
+// the vectorized decode-opt/GQA kernels read the cache through LoadRowN/LoadRow8,
+// which are 128-bit `uint4` loads specialized for bf16 and f32 only. Upstream
+// draws the same line from the other side: FlashAttention only serves a
+// quantized KV cache when `flash_attn_supports_kv_cache_dtype` says so
+// (flash_attn.py:181-187,796-805) and otherwise the backend refuses. A tensor-
+// core fp8 read is a PERFORMANCE brick, not this one; W2's gate is parity with
+// the W1 CPU reference, and W4 owns the memory/throughput measurement.
+template <typename TQ, typename Tout>
+void LaunchPagedFp8Out(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                       const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                       const Tensor& query_start_loc, const PagedAttentionArgs& args) {
+  const int64_t num_tokens = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t num_reqs = seq_lens.shape[0];
+  const int64_t num_kv_heads = k_cache.shape[2], block_size = k_cache.shape[1];
+  if (num_tokens == 0 || hq == 0 || d == 0) return;
+  // Same predicate LaunchPaged uses to pick the tiled prefill kernel.
+  const bool is_prefill = num_tokens > num_reqs;
+  if (is_prefill && d <= kMaxEpl * 32 && PrefillFlashEnabled()) {
+    LaunchPrefillFlash<TQ, uint8_t, Tout>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                          query_start_loc, args, hq, d, num_reqs, num_kv_heads,
+                                          block_size);
+    return;
+  }
+  LaunchPagedBlock<TQ, uint8_t, Tout>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                      query_start_loc, args, num_tokens, hq, d, num_reqs,
+                                      num_kv_heads, block_size);
+}
+
+template <typename TQ>
+void LaunchPagedFp8(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                    const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                    const Tensor& query_start_loc, const PagedAttentionArgs& args) {
+  switch (out.dtype) {
+    case DType::kF32:
+      LaunchPagedFp8Out<TQ, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                   query_start_loc, args);
+      break;
+    case DType::kBF16:
+      LaunchPagedFp8Out<TQ, __nv_bfloat16>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                           query_start_loc, args);
+      break;
+    default: VT_CHECK(false, "cuda paged_attention: unsupported out dtype (fp8 KV read)");
+  }
+}
+
 // Dispatch on (query dtype, KV-cache dtype). Both f32 and bf16 caches are valid
 // (Phase-1 bf16 KV cache mirrors vLLM's bf16 flash_attn KV store); the query may
 // independently be f32 (Phase 1) or bf16.
@@ -3315,6 +3615,16 @@ template <typename TQ>
 void LaunchPagedByKv(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                      const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                      const Tensor& query_start_loc, const PagedAttentionArgs& args) {
+  // fp8 KV cache: the STORAGE dtype is a raw byte (kI8) and the INTERPRETATION
+  // travels in args.kv_cache_dtype, exactly as upstream carries cache_t=uint8_t
+  // plus a KV_DTYPE template parameter (dtype_fp8.cuh:15-19). Key on the
+  // interpretation, never on the storage dtype: a kI8 tensor with kAuto is not
+  // an fp8 cache, and the op wrapper already refuses that pair.
+  if (args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3) {
+    LaunchPagedFp8<TQ>(s, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc,
+                       args);
+    return;
+  }
   switch (k_cache.dtype) {
     case DType::kF32:
       LaunchPaged<TQ, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,

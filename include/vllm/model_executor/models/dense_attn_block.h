@@ -30,11 +30,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf/MakeTensor/Reshape
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
 #include "vllm/model_executor/models/tensor_parallel.h"  // TensorParallel/TpAllReduceSum (W2)
 #include "vllm/platforms/interface.h"
@@ -196,9 +198,33 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
   // blocker for the Metal/Vulkan model bring-up
   // (.agents/specs/metal-mlx-reuse-study.md §3.3 item 2). The correct predicate
   // is `is_cpu()`: alias when the "device" IS the host, upload otherwise.
-  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu())
+  // #1953 (found by #1946's review): AN EMPTY WEIGHT CANNOT BE MADE RESIDENT, AND
+  // NOTHING DOWNSTREAM CAN TELL. Every op validates rank, shape, dtype, contiguity and
+  // device — `vt::Embedding` (src/vt/ops.cpp) is the one this row cares about and
+  // it is typical — and the SHAPE here comes from the CALLER, not from the bytes.
+  // So a tensor with no bytes passes all of them: the alias arm below hands a
+  // kernel a null host pointer (SIGSEGV) and the staging arm `Alloc(0)`s and then
+  // views [vocab, H] over a zero-byte allocation (out-of-bounds device reads,
+  // silently wrong values). Both are worse than a refusal and neither names the
+  // weight. Refuse here, where the name is still in hand.
+  //
+  // `bytes.empty()` and NOT `Empty()`: a weight whose host buffer was reclaimed
+  // after upload (`host_released`) IS populated, and the `d_dev` branch below is
+  // what serves it. Each arm therefore asserts the precondition IT needs, which
+  // is also why the staging assert sits inside `if (!w.d_dev)` — a resident
+  // weight re-read on the hot path pays nothing for this.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+    VT_CHECK(!w.bytes.empty(),
+             std::string("resident weight: EMPTY tensor has no host bytes to "
+                         "alias (host-alias arm, dtype ") +
+                 vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
     return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device, shape);
+  }
   if (!w.d_dev) {
+    VT_CHECK(!w.bytes.empty(),
+             std::string("resident weight: EMPTY tensor has no host bytes to "
+                         "upload (device-staging arm, dtype ") +
+                 vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
     // Issue #150 accounting: this is the ONE host->device weight upload. When
@@ -395,8 +421,18 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   VT_CHECK(w.qkv_bias.Empty(),
            "qwen3 dense forward: attention_bias not supported yet (Qwen3-0.6B has none)");
-  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
-           "qwen3 dense: KV cache must be bf16 or f32");
+  // KV-FP8 W3: a third storage dtype joins the two float ones — 1-byte fp8
+  // (`vt::DType::kI8`), which `IsFp8KvCache` admits only together with a
+  // matching fp8 interpretation, so a bare `kI8` view still fails here. This
+  // guard and the routing at the store/read below are ONE decision: leaving it
+  // at the two float dtypes made `fp8_kv` provably false at every call and the
+  // fp8 arms of `WriteKvCache`/`ApplyKvCacheQuant` unreachable, which is the
+  // shape G12 exists to keep out (`qwen3_5.cpp:5313` is the same widening on
+  // the other routed family).
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32 ||
+               IsFp8KvCache(kv),
+           "qwen3 dense: KV cache must be bf16, f32, or 1-byte fp8 "
+           "(--kv-cache-dtype fp8)");
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "qwen3 dense: KV cache head dims mismatch config");
 
@@ -559,9 +595,16 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   // no-op, the common production case).
   Tensor kw = k3;
   Tensor vw = v3;
-  DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
-  DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
-  if (kv.dtype != adt) {
+  // KV-FP8 W3: on an fp8 cache there is NO cast to do. `vt::ReshapeAndCacheFp8`
+  // takes the model-dtype K/V and performs `Quantize(hp / k_scale|v_scale)`
+  // itself (`quant_utils.cuh:296-300`), so the buffers below are allocated at
+  // the SOURCE dtype and the branch is skipped — casting to `kI8` would be
+  // meaningless, and allocating a `kI8` scratch here would silently halve it.
+  const bool fp8_kv = IsFp8KvCache(kv);
+  const DType cast_dt = fp8_kv ? adt : kv.dtype;
+  DBuf kcast(d, cast_dt, {T, Hkv, Dh});
+  DBuf vcast(d, cast_dt, {T, Hkv, Dh});
+  if (!fp8_kv && kv.dtype != adt) {
     if (kv.dtype == DType::kBF16) {
       vt::CastBf16(d.q, kcast.t(), k3);
       vt::CastBf16(d.q, vcast.t(), v3);
@@ -574,13 +617,19 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   }
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
-  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
+  WriteKvCache(d.q, kv, kw, vw, k_cache, v_cache, si.slot_mapping.t());
 
   DBuf attn(d, adt, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
   vt::PagedAttentionArgs pa{scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  // SPEC-DFLASH2 W10 (#1857): forward the runner's spec-as-decode
+  // classification through the shared seam. Today only the d256 CUDA decode
+  // lane consumes it (the d128 arms keep their q==1 gates), so every model on
+  // this block routes exactly as before unless a d256 verify arrives.
+  pa.uniform_spec_query_len = meta.uniform_spec_query_len;
+  ApplyKvCacheQuant(pa, kv);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

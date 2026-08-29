@@ -153,6 +153,61 @@ std::string HubResolveCommitCached(const std::string& repo_id,
                                    const std::string& revision,
                                    const HfHubOptions& opts);
 
+// A parsed hypertext address, and the two checks every call in this file and
+// in `downloader.h` runs before it opens a socket. They are declared HERE so
+// the byte transport speaks ONE address grammar with the protocol half rather
+// than growing a second one that drifts.
+//
+// Mirrors llama.cpp `common/http.h:33-98 @ b10451`, narrowed to what a hub
+// address needs: no user information, because a hub endpoint carries none.
+struct HfParsedUrl {
+  std::string scheme;
+  std::string host;
+  int port = 0;
+  std::string path;  // always begins with '/'
+};
+
+// Throws std::runtime_error naming `url` on a missing scheme, an unterminated
+// bracketed IPv6 authority, an unsupported scheme, or an empty host. `role`
+// names WHAT the address is in the refusal. It defaults to "the address"
+// because most calls here parse a file address the caller never typed: a
+// message that says `HF_ENDPOINT '/api/resolve-cache/...' has no scheme` blames
+// the operator's configuration for a server's answer, which is what #1511 read
+// like from the outside.
+HfParsedUrl HfParseUrl(const std::string& url,
+                       const std::string& role = "the address");
+
+// Resolve `location`, the value of a `Location` header, against `base`, the
+// address that answered with it. RFC 3986 section 5, narrowed to the reference
+// forms a redirect can carry:
+//
+//   `https://cdn.example/x`  absolute URL          -> returned unchanged
+//   `//cdn.example/x`        network-path          -> base's scheme + it
+//   `/api/resolve-cache/x?e` absolute-path         -> base's authority + it
+//   `../../x?e`              relative-path         -> merged onto base's
+//                                                     directory, dot segments
+//                                                     then removed
+//   `?e=1`                   query-only            -> base's path + it
+//
+// The query string and the fragment ride along untouched, because the hub signs
+// its cache addresses with the query and a resolution that dropped it would be
+// answered 404. RFC 7231 section 7.1.2 permits every one of these forms in a
+// `Location`, and huggingface.co sends the third one.
+//
+// Throws std::runtime_error when `base` is itself not absolute, because there
+// is then nothing to resolve against.
+std::string HfResolveUrl(const std::string& base, const std::string& location);
+
+// `[host]` for an IPv6 literal, `host` otherwise. What httplib's scheme-host-port
+// constructor needs.
+std::string HfFormatHost(const std::string& host);
+
+// Throw when `url` is `https` and this build carries no transport layer
+// security, with a message that NAMES the three build options. A build where
+// the option resolved OFF otherwise fails with a connection error that reads
+// like a network fault.
+void HfRefuseHttpsWithoutTls(const std::string& url);
+
 // True when `repo_id` has the shape the hub accepts: base characters
 // `[A-Za-z0-9_]`, the special characters `/.-` only between base characters,
 // and exactly one '/'. Mirrors llama.cpp `common/hf-cache.cpp:121-142`.

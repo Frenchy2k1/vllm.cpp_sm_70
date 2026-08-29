@@ -11,8 +11,12 @@
 // d2_dflash_draft_ref.py); the resolver here tries the bare name first, then a
 // "model."-prefixed fallback, matching both conventions.
 #include "vllm/model_executor/models/qwen3_dflash.h"
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628): the draft SHARES the target's head, so it
+// takes the target loader's own routing decision for it.
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 
 #include <cstring>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -90,6 +94,15 @@ OwnedTensor ConcatRawNK(const TensorResolver& get, const std::vector<std::string
   }
   return out;
 }
+
+// The RoPE base a DFlash draft takes when NEITHER spelling declares one, which
+// is upstream's own `set_default_rope_theta(config, default_theta=1000000)`
+// (qwen3_dflash.py:304 @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`). Inert on every published draft:
+// all four DFlash1 configs declare the flat key and both DFlash2 configs declare
+// the nested one. It exists so that this builder answers what upstream answers
+// rather than throwing where upstream defaults.
+constexpr double kDflashDefaultRopeTheta = 1000000.0;
 
 // DeclaredCausal: upstream's `is not None` test followed by its `bool(...)`
 // coercion, for either spelling of the explicit causality (#1366).
@@ -236,16 +249,101 @@ HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c) {
   cfg.num_key_value_heads = c.at("num_key_value_heads").get<int64_t>();
   cfg.head_dim = c.at("head_dim").get<int64_t>();
   cfg.rotary_dim = cfg.head_dim;
-  cfg.rope_theta = c.at("rope_theta").get<double>();
+  // ROPE THETA, in BOTH spellings (SPEC-DFLASH2 W2, spec `## Owed` O3, #1314).
+  // `transformers` 5 moved the RoPE settings under `rope_parameters`, and BOTH
+  // published DFlash2 drafts nest it there and declare NO top-level `rope_theta`
+  // -- so the flat `c.at("rope_theta")` threw before any DFlash2 mechanism could
+  // be reached. Upstream reads one resolved `config.rope_parameters`
+  // (`qwen3_dflash.py:340` @ vllm-project/vllm#52816 head
+  // `19c9351904df4c63042671bc67a866ca48dc7d6f`) after
+  // `set_default_rope_theta(config, default_theta=1000000)` (`:304`), which is
+  // where the fallback value below comes from. This is a FALLBACK and not a
+  // replacement: every published DFlash1 draft carries the flat spelling and
+  // must keep taking it, which is why the flat key is tested FIRST.
+  cfg.rope_theta = kDflashDefaultRopeTheta;
+  if (c.contains("rope_theta") && c.at("rope_theta").is_number()) {
+    cfg.rope_theta = c.at("rope_theta").get<double>();
+  } else if (c.contains("rope_parameters") && c.at("rope_parameters").is_object() &&
+             c.at("rope_parameters").contains("rope_theta") &&
+             c.at("rope_parameters").at("rope_theta").is_number()) {
+    cfg.rope_theta = c.at("rope_parameters").at("rope_theta").get<double>();
+  }
   cfg.intermediate_size = c.at("intermediate_size").get<int64_t>();
   cfg.vocab_size = c.at("vocab_size").get<int64_t>();
   cfg.num_hidden_layers = c.at("num_hidden_layers").get<int64_t>();
   cfg.rms_norm_eps = c.at("rms_norm_eps").get<double>();
   cfg.sliding_window = c.at("sliding_window").get<int64_t>();
-  cfg.layer_types = c.at("layer_types").get<std::vector<std::string>>();
+  // LAYER TYPES are OPTIONAL (spec `## Owed` O4, #1314, #1366). Upstream reads
+  // `getattr(config, "layer_types", None)` (`qwen3_dflash.py:134`, and `:66` in
+  // `_dflash_layer_causal`, @ that head), so an absent key is upstream's `None`
+  // and an EMPTY vector here -- which is exactly the state
+  // `ResolveQwen3DFlashAttnModes` already treats as "no declared layer types",
+  // taking `dflash_config.use_swa` for the window and NON-causal for the
+  // causality. `c.at("layer_types")` instead threw
+  // `[json.exception.out_of_range.403]` on the only published draft of that
+  // shape (`XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`), which is why #1366's
+  // `use_swa` repair was UNREACHED at its own merge commit.
+  if (c.contains("layer_types") && c.at("layer_types").is_array()) {
+    cfg.layer_types = c.at("layer_types").get<std::vector<std::string>>();
+  }
   cfg.raw = nlohmann::json::object();
   cfg.raw["dflash_config"] = c.at("dflash_config");
-  cfg.raw["block_size"] = c.at("block_size");
+  const nlohmann::json& dflash_cfg = cfg.raw.at("dflash_config");
+  // ATTENTION SINK BIAS is REFUSED BY NAME (spec `## Owed` O4, #1314).
+  //
+  // Upstream reads `dflash_config.attention_sink_bias`, falling back to a
+  // top-level `add_swa_attention_sink_bias`, and when it is truthy it allocates a
+  // per-head `attention_sink_bias` parameter and passes it into its `Attention`
+  // as `sinks=` (`qwen3_dflash.py:309-313` and `:240-257` @ that head). This lane
+  // has NO attention sink of any kind: `vt::DFlashBlockAttention` and its paged
+  // sibling compute a plain max-subtracted softmax with no extra denominator
+  // term, and the loader has no name for the tensor.
+  //
+  // Refusing rather than ignoring is the whole point of this arm. The key sits on
+  // `XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash`, which is ALSO the only published draft
+  // that declares no `layer_types` -- so before the fallback above, that
+  // checkpoint died on a loud `key 'layer_types' not found`, and the fallback
+  // alone would have converted that loud failure into a draft that loads with the
+  // sinks silently absent. A missing sink moves acceptance and nothing else: the
+  // verify is lossless, so the emitted tokens are still the target's and no token
+  // gate can see it. That is the exact defect class this row exists to remove.
+  //
+  // A FALSY value is upstream's own default and is not refused, because upstream
+  // then creates no sink parameter at all and the two engines agree.
+  const auto sink_declared = [](const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object() || !obj.contains(key)) return false;
+    const nlohmann::json& v = obj.at(key);
+    if (v.is_boolean()) return v.get<bool>();
+    if (v.is_number()) return v.get<double>() != 0.0;
+    return !v.is_null();
+  };
+  VT_CHECK(!sink_declared(dflash_cfg, "attention_sink_bias") &&
+               !sink_declared(c, "add_swa_attention_sink_bias"),
+           "qwen3_dflash: this draft declares a per-head attention sink "
+           "(dflash_config.attention_sink_bias / add_swa_attention_sink_bias), and "
+           "this engine has no attention sink: vt::DFlashBlockAttention computes a "
+           "plain softmax with no sink term. Upstream allocates the parameter and "
+           "passes it as Attention(sinks=...) "
+           "(vllm/model_executor/models/qwen3_dflash.py:240-257,309-313 @ "
+           "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f). "
+           "Loading without it would succeed and draft worse tokens with no visible "
+           "symptom, because the verify is lossless and only acceptance falls. Owed "
+           "by row SPEC-DFLASH2 (.agents/specs/dflash2-spec-decode.md `## Owed` O4), "
+           "issue #1314 (https://github.com/mudler/vllm.cpp/issues/1314).");
+  // BLOCK SIZE, in BOTH spellings (spec `## Owed` O3). The DFlash1 drafts declare
+  // it at the top level; both published DFlash2 drafts declare it ONLY as
+  // `dflash_config.block_size`, so the flat read threw on them too. Upstream
+  // never reads a top-level `block_size` in this file at all -- the conv's block
+  // is `1 + speculative_config.num_speculative_tokens`
+  // (`qwen3_dflash2.py` `DFlash2Qwen3DecoderLayer.__init__` @ that head) and the
+  // checkpoint key only supplies that value's DEFAULT, which this engine's loader
+  // resolves from the CLI. The key is carried for the DFlash1 callers that read
+  // it and is not the conv's authority.
+  if (c.contains("block_size")) {
+    cfg.raw["block_size"] = c.at("block_size");
+  } else if (dflash_cfg.contains("block_size")) {
+    cfg.raw["block_size"] = dflash_cfg.at("block_size");
+  }
   // SPEC-DFLASH2 W1 (#1314): the top-level attention semantics, which
   // ResolveQwen3DFlashAttnModes resolves ahead of every legacy arm. Upstream gets
   // this key for free by reading it off a HuggingFace config object
@@ -273,6 +371,121 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
   out.mask_token_id = mask_token_id;
   out.draft_vocab_size = config.vocab_size;
 
+  // SPEC-DFLASH2 W2 (#1314): the grouped-convolution geometry, read off the
+  // draft's own dflash_config. A DFlash1 checkpoint declares NONE of these keys
+  // and carries no conv tensor, so `conv_taps` stays 0, `IsDflash2()` is false,
+  // and everything below this point loads exactly as before -- which is the
+  // inertness the DFlash1 gates assert.
+  {
+    const nlohmann::json empty = nlohmann::json::object();
+    const nlohmann::json& dflash =
+        (config.raw.is_object() && config.raw.contains("dflash_config") &&
+         config.raw.at("dflash_config").is_object())
+            ? config.raw.at("dflash_config")
+            : empty;
+    const bool has_taps =
+        dflash.contains("conv_kernel_size") && dflash.at("conv_kernel_size").is_number();
+    const bool has_group =
+        dflash.contains("conv_group_size") && dflash.at("conv_group_size").is_number();
+    // Both or neither. A checkpoint declaring one alone is not a shape this port
+    // knows how to size, and guessing the other would size the projection wrong
+    // and be invisible: the draft would still emit the target's tokens.
+    VT_CHECK(has_taps == has_group,
+             "qwen3_dflash: dflash_config declares only one of conv_kernel_size / "
+             "conv_group_size; a DFlash2 draft declares both (SPEC-DFLASH2, #1314)");
+    if (has_taps) {
+      out.conv_taps = dflash.at("conv_kernel_size").get<int64_t>();
+      out.conv_group_size = dflash.at("conv_group_size").get<int64_t>();
+      VT_CHECK(out.conv_taps > 0 && out.conv_group_size > 0,
+               "qwen3_dflash: conv_kernel_size and conv_group_size must be > 0");
+      // Upstream refuses a group size that does not divide hidden
+      // (`DFlashGroupedConv.__init__` @ the PR head), with the same polarity.
+      VT_CHECK(config.hidden_size % out.conv_group_size == 0,
+               "qwen3_dflash: conv_group_size must divide hidden_size");
+      // `conv_block_size` IS DELIBERATELY NOT SEEDED HERE, and this is the
+      // SPEC-DFLASH2 W4 (#1314) discharge of `## Owed` O5's first item.
+      //
+      // Through W3 this read `dflash_config.block_size` off the checkpoint so a
+      // direct caller had "a usable value". That is exactly what made
+      // `LoadDflashDraft`'s `draft->weights.conv_block_size = draft->k + 1;`
+      // ungateable: deleting that line left a PLAUSIBLE block behind -- the
+      // checkpoint's default -- so the conv masked its taps against the wrong
+      // one, which is acceptance-only and token-invisible, and W2 measured every
+      // suite staying green under exactly that mutation.
+      //
+      // Upstream never reads the key for this either: it sizes the conv from
+      // `1 + speculative_config.num_speculative_tokens`
+      // (`DFlash2Qwen3DecoderLayer.__init__` @ vllm-project/vllm#52816 head
+      // `66e5414c6d75a8529473d977f7458c140bbab8a0`). So the field is left at 0,
+      // the caller that knows the resolved `k` is the only writer, and
+      // `Qwen3DFlashModel`'s existing `VT_CHECK(weights.conv_block_size > 0)`
+      // turns a dropped assignment into a LOUD failure on the first DFlash2
+      // forward instead of a quiet wrong answer. Same remedy W3 applied to the
+      // `lm_head_dequantized` carry: remove the mutation's shape rather than add
+      // a test that has to reach an unreachable function.
+    }
+    // SPEC-DFLASH2 W3 (#1314): the CANDIDATE SELECTOR's geometry and the two
+    // output scalars, read off the same dflash_config. A DFlash2 checkpoint
+    // carries both mechanisms, so these are required whenever the conv keys are
+    // present rather than optional beside them.
+    if (has_taps) {
+      VT_CHECK(dflash.contains("selector_rank") && dflash.at("selector_rank").is_number() &&
+                   dflash.contains("selector_top_k") &&
+                   dflash.at("selector_top_k").is_number(),
+               "qwen3_dflash: this draft declares the DFlash2 convolution keys but no "
+               "selector_rank/selector_top_k; a DFlash2 draft declares both mechanisms "
+               "(SPEC-DFLASH2 W3, #1314)");
+      out.candidate_selector.rank = dflash.at("selector_rank").get<int64_t>();
+      out.candidate_selector.top_k = dflash.at("selector_top_k").get<int64_t>();
+      VT_CHECK(out.candidate_selector.rank > 0 && out.candidate_selector.top_k > 0,
+               "qwen3_dflash: selector_rank and selector_top_k must be > 0");
+      VT_CHECK(out.candidate_selector.top_k <= config.vocab_size,
+               "qwen3_dflash: selector_top_k must not exceed the vocabulary");
+      // `float(draft_config.get("output_multiplier", 1.0))` and
+      // `float(draft_config.get("final_logit_softcapping") or 0.0)`, then
+      // disabled unless > 0 -- upstream's own defaults
+      // (`DFlash2Qwen3ForCausalLM.__init__` @ the PR head). Both are ABSENT from
+      // `z-lab/Qwen3.8-27B-DFlash2` and PRESENT on
+      // `z-lab/Muse-Glimmer-30B-DFlash2` (#1327), so a gate built from the 27B
+      // draft alone measures the default path only.
+      if (dflash.contains("output_multiplier") && dflash.at("output_multiplier").is_number())
+        out.candidate_selector.output_multiplier =
+            static_cast<float>(dflash.at("output_multiplier").get<double>());
+      if (dflash.contains("final_logit_softcapping") &&
+          dflash.at("final_logit_softcapping").is_number()) {
+        const float cap =
+            static_cast<float>(dflash.at("final_logit_softcapping").get<double>());
+        out.candidate_selector.final_logit_softcapping = cap > 0.0f ? cap : 0.0f;
+      }
+      // INPUT EMBEDDING SCALE is REFUSED BY NAME when it is declared and is not
+      // upstream's default. Upstream applies it inside `embed_input_ids`
+      // (`DFlash2Qwen3Model.embed_input_ids` @ the PR head), which is a third
+      // call site in each of this engine's three layer bodies; NEITHER published
+      // DFlash2 draft declares the key, so implementing it would land three
+      // unreachable call sites, and IGNORING it would run a quietly different
+      // model on the first checkpoint that sets it -- acceptance-only and
+      // token-invisible, because the verify is lossless. The polarity is the one
+      // W2 set for `dflash_config.attention_sink_bias` (spec `## Owed` O4b): a
+      // value equal to upstream's default is upstream's own no-op and is not
+      // refused. Owed: `## Owed` O9.
+      if (dflash.contains("input_embedding_scale") &&
+          dflash.at("input_embedding_scale").is_number()) {
+        const double scale = dflash.at("input_embedding_scale").get<double>();
+        VT_CHECK(scale == 1.0,
+                 "qwen3_dflash: this draft declares dflash_config.input_embedding_scale "
+                 "!= 1.0, and this engine does not apply it. Upstream scales the draft's "
+                 "token embedding by it (DFlash2Qwen3Model.embed_input_ids, "
+                 "vllm/model_executor/models/qwen3_dflash2.py @ "
+                 "vllm-project/vllm#52816 head "
+                 "66e5414c6d75a8529473d977f7458c140bbab8a0). Loading without it would "
+                 "succeed and draft worse tokens with no visible symptom, because the "
+                 "verify is lossless and only acceptance falls. Owed by row SPEC-DFLASH2 "
+                 "(.agents/specs/dflash2-spec-decode.md `## Owed` O9), issue #1314 "
+                 "(https://github.com/mudler/vllm.cpp/issues/1314).");
+      }
+    }
+  }
+
   // embed_tokens + lm_head are SHARED from the target (the draft ckpt omits them,
   // see TryLoadBf16); load if present, else leave empty for the caller to fill.
   out.embed_tokens = TryLoadBf16(get, "embed_tokens.weight", /*nk=*/false);
@@ -299,7 +512,65 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
         ConcatRawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"}, "gate_up");
     layer.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
     layer.attn_mode = modes[static_cast<size_t>(i)];
+    // SPEC-DFLASH2 W2 (#1314): the two grouped convolutions, under the exact
+    // names the published checkpoint stores them under. Loaded only for a DFlash2
+    // draft; a DFlash1 checkpoint has no such tensor and asking for one would
+    // throw "tensor not found" on every existing drafter.
+    if (out.IsDflash2()) {
+      const int64_t groups = config.hidden_size / out.conv_group_size;
+      for (const char* which : {"attention_conv.", "mlp_conv."}) {
+        const std::string cp = base + which;
+        Qwen3DFlashConvWeights conv;
+        conv.base_kernel = LoadBf16Direct(get, cp + "base_kernel");
+        conv.kernel_projection = LoadBf16RawNK(get, cp + "kernel_projection.weight");
+        // SHAPES, asserted rather than assumed. `base_kernel` is
+        // [SIDES=2, taps, H] -- dim 0 is prepare/finish and NOT a tap, and on the
+        // published 27B draft both are 2, so nothing but this check separates a
+        // correct load from a transposed one. `kernel_projection` is
+        // [2*taps*num_groups, H]: one projection of the sublayer input carrying
+        // BOTH sides' deltas.
+        VT_CHECK(conv.base_kernel.rank == 3 && conv.base_kernel.shape[0] == 2 &&
+                     conv.base_kernel.shape[1] == out.conv_taps &&
+                     conv.base_kernel.shape[2] == config.hidden_size,
+                 "qwen3_dflash: " + cp + "base_kernel must be [2, conv_kernel_size, H]");
+        VT_CHECK(conv.kernel_projection.rank == 2 &&
+                     conv.kernel_projection.shape[0] == 2 * out.conv_taps * groups &&
+                     conv.kernel_projection.shape[1] == config.hidden_size,
+                 "qwen3_dflash: " + cp +
+                     "kernel_projection.weight must be [2*conv_kernel_size*num_groups, H]");
+        if (std::string(which) == "attention_conv.") {
+          layer.attention_conv = std::move(conv);
+        } else {
+          layer.mlp_conv = std::move(conv);
+        }
+      }
+    }
     out.layers.push_back(std::move(layer));
+  }
+
+  // SPEC-DFLASH2 W3 (#1314): the candidate selector's three tensors, under the
+  // exact names the published checkpoint stores them under. Loaded only for a
+  // DFlash2 draft; a DFlash1 checkpoint has none of them and asking would throw
+  // "tensor not found" on every existing drafter.
+  if (out.IsDflash2()) {
+    Dflash2SelectorWeights& sel = out.candidate_selector;
+    const int64_t rank = sel.rank;
+    sel.hidden_projection =
+        LoadBf16RawNK(get, "candidate_selector.hidden_projection.weight");
+    sel.predecessor_codebook = LoadBf16Direct(get, "candidate_selector.predecessor_codebook");
+    sel.successor_codebook = LoadBf16Direct(get, "candidate_selector.successor_codebook");
+    // SHAPES, asserted rather than assumed. `hidden_projection` is a
+    // ReplicatedLinear [rank <- H] and the codebooks are [vocab, rank]; on the
+    // published 27B draft rank 256 differs from every other axis, so a
+    // transposed load would be caught here rather than by a wrong answer.
+    VT_CHECK(sel.hidden_projection.rank == 2 && sel.hidden_projection.shape[0] == rank &&
+                 sel.hidden_projection.shape[1] == config.hidden_size,
+             "qwen3_dflash: candidate_selector.hidden_projection.weight must be [rank, H]");
+    for (const OwnedTensor* book : {&sel.predecessor_codebook, &sel.successor_codebook})
+      VT_CHECK(book->rank == 2 && book->shape[0] == config.vocab_size &&
+                   book->shape[1] == rank,
+               "qwen3_dflash: candidate_selector.{predecessor,successor}_codebook must be "
+               "[vocab, rank]");
   }
 
   // fc input width validation: [H, H*num_taps].
@@ -328,6 +599,116 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
     return it->second->Get(key);
   };
   return LoadQwen3DFlash(get, config, num_taps, mask_token_id);
+}
+
+void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
+                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4) {
+  VT_CHECK(head_bf16 != nullptr, "qwen3_dflash: shared lm_head needs a bf16 owner");
+  *head_bf16 = OwnedTensor{};
+  if (head_fp4 != nullptr) *head_fp4 = Nvfp4Weight{};
+
+  // The PACKED arm, taken by asking the target's own routing question rather
+  // than by testing the stored dtype. A lane with nowhere to put a packed head
+  // (`head_fp4 == nullptr`, DSpark) never asks it and falls through to the bf16
+  // read, which then refuses the checkpoint by name.
+  if (head_fp4 != nullptr) {
+    std::unordered_map<std::string, const SafetensorsFile*> where;
+    for (const SafetensorsFile& shard : shards)
+      for (const std::string& name : shard.Names()) where[name] = &shard;
+    const TensorResolver get = [&where](const std::string& name) -> const StTensor& {
+      auto it = where.find(name);
+      VT_CHECK(it != where.end(), "qwen3_dflash: target tensor not found: " + name);
+      return it->second->Get(name);
+    };
+    const std::function<bool(const std::string&)> has =
+        [&where](const std::string& name) { return where.count(name) != 0; };
+    if (DenseLmHeadTakesNvfp4(has, "lm_head")) {
+      // LIFETIME. Unlike the bf16 arm below, this one can BORROW the shard's
+      // mapping rather than copy it (`BorrowStTensorBytes`), and the draft
+      // outlives the `SafetensorsFile` objects the caller passes -- both live
+      // inside `FromModelDir`, the draft does not. That is safe by construction
+      // and not by luck: `OwnedBytes::Borrow` takes `StTensor::mapping` as a
+      // keep-alive, so the mapping cannot be unmapped out from under the borrowed
+      // bytes (qwen3_5_weights.h, "THE MECHANISM").
+      OwnedTensor unused_bf16;
+      LoadDenseLmHead(get, has, "lm_head", unused_bf16, *head_fp4);
+      VT_CHECK(!head_fp4->Empty() && unused_bf16.Empty(),
+               "qwen3_dflash: the target's NVFP4 lm_head did not take the packed "
+               "arm of LoadDenseLmHead");
+      // A true-W4A4 head -- NVFP4 with the activation divisor in force under
+      // VT_MODELOPT_W4A4=1 -- is refused by `DflashLogitsF32D` and NOT a second
+      // time here. A startup refusal would read better, and it was written here
+      // first; this row's own mutation pass then showed the two copies could not
+      // be told apart by any test, which is the "two descriptions of one rule"
+      // failure AGENTS.md `## Changing the rules or a checker` names. The
+      // surviving guard is the one a gate reaches, and the refusal arriving at
+      // the first propose rather than at load is the polarity
+      // `## Risks/decisions` D10 already set for this lane.
+      return;
+    }
+  }
+
+  for (const SafetensorsFile& s : shards) {
+    for (const std::string& n : s.Names()) {
+      if (n != "lm_head.weight") continue;
+      const StTensor& t = s.Get(n);
+      VT_CHECK(t.dtype == "BF16",
+               "dflash: target tensor " + n + " is not BF16 (got " + t.dtype + ")");
+      // SPEC-DFLASH2 W9 (#1849): borrow-first. The bf16 head is a whole-range
+      // verbatim read the draft never mutates, so it QUALIFIES for the
+      // fail-closed direct-upload seam exactly as the target's own head does
+      // (`LoadBf16Direct`); on a real target the copy this replaces is a
+      // ~2.54 GB anonymous buffer whose content is the mapping's, byte for
+      // byte. `BorrowStTensorBytes` fails closed (synthetic StTensor, size
+      // mismatch, `VT_LOAD_DIRECT_UPLOAD=0`) and the memcpy below stays the
+      // fallback. Memory only: both GEMM reads move the same bytes per step
+      // regardless of how many host copies exist.
+      OwnedTensor borrowed;
+      if (BorrowStTensorBytes(borrowed, t, vt::DType::kBF16, t.shape)) {
+        borrowed.nk = true;
+        *head_bf16 = std::move(borrowed);
+        return;
+      }
+      *head_bf16 = MakeOwned(vt::DType::kBF16, t.shape);
+      head_bf16->nk = true;
+      VT_CHECK(t.nbytes == head_bf16->bytes.size(),
+               "qwen3_dflash: byte-size mismatch for " + n);
+      std::memcpy(head_bf16->bytes.data(), t.data, t.nbytes);
+      return;
+    }
+  }
+}
+
+OwnedTensor LoadDflashSharedEmbedBf16(const std::vector<SafetensorsFile>& shards,
+                                      const std::string& name) {
+  // SPEC-DFLASH2 W9 (#1849): the SHARED embedding table, borrow-first. This is
+  // the read `SharedHeadSource::LoadInto` used to make through the loader-local
+  // `LoadNamedBf16` memcpy — on a real target a ~2.54 GB anonymous copy of a
+  // gather table the draft never mutates (a draft declaring
+  // `input_embedding_scale != 1.0` is refused by name at load, so no in-place
+  // scale exists on any reachable path). Exported, not file-local, because the
+  // borrow is a lever a deletion mutation could remove silently otherwise: the
+  // gate must reach the exact function production calls. Same lookup, same
+  // refusal text, same EMPTY-on-absence contract as the read it replaces;
+  // `nk` stays false — the [vocab, H] gather-table orientation.
+  for (const SafetensorsFile& s : shards) {
+    for (const std::string& n : s.Names()) {
+      if (n != name) continue;
+      const StTensor& t = s.Get(n);
+      if (t.dtype != "BF16") {
+        throw std::runtime_error("dflash: target tensor " + name +
+                                 " is not BF16 (got " + t.dtype + ")");
+      }
+      OwnedTensor out;
+      if (BorrowStTensorBytes(out, t, vt::DType::kBF16, t.shape)) return out;
+      out = MakeOwned(vt::DType::kBF16, t.shape);
+      VT_CHECK(t.nbytes == out.bytes.size(),
+               "qwen3_dflash: byte-size mismatch for " + name);
+      std::memcpy(out.bytes.data(), t.data, t.nbytes);
+      return out;
+    }
+  }
+  return OwnedTensor{};
 }
 
 }  // namespace vllm

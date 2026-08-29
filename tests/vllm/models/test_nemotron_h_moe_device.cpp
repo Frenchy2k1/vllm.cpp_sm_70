@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"
 #include "vllm/model_executor/models/nemotron_h_forward.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -47,6 +48,12 @@ namespace {
 
 using vllm::NemotronHBlock;
 using vllm::NemotronHExpertWeights;
+// A2-Q2b: the lm_head cases below name this type UNQUALIFIED. It was missing
+// from this block on the first submission and the file never compiled on any
+// platform, which is why `vllm_cpp_add_test(test_nemotron_h_moe_device)` is
+// registered with NO CUDA guard: the CPU build is what makes a case that
+// SKIPS at run time still have to parse and type-check.
+using vllm::NemotronHHostWeights;
 using vllm::NemotronHMoeWeights;
 using vllm::NemotronHOwned;
 using vllm::NemotronHParams;
@@ -342,4 +349,173 @@ TEST_CASE("NemotronH A2-Q2a: the device MoE arm refuses a dense expert rather th
 
   const std::vector<float> x = SynthVec(static_cast<size_t>(T * H), 78, 0.5F);
   CHECK_THROWS(vllm::NemotronHMoeBlockDeviceHostIO(w, p, x, T, dt, dq));
+}
+
+// ═══ A2-Q2b (#810): the DEVICE `lm_head` arm ════════════════════════════════
+//
+// The cheap local arm in front of the real-checkpoint gate, for exactly the
+// reason the preamble of this file gives for the MoE arm: three GB10 windows
+// on this row were VOID for reasons a synthetic case catches for free.
+//
+// ── THE GEOMETRY IS NOT ARBITRARY (same rule as the MoE fixture) ────────────
+// Marlin refuses a shape it has no thread config for: `is_valid_config` needs
+// `prob_k % thread_k == 0 && prob_n % thread_n == 0` over {128,128,256},
+// {64,128,128}, {128,64,128}. `lm_head` is [V, H] consumed as K=H, N=V, so
+// H=256 / V=512 resolves on {128,128,256} (256%128==0, 512%128==0). The real
+// checkpoint's H=2688 / V=131072 also resolves, on more than one config —
+// which is precisely why the real-checkpoint arm is still owed and this case
+// does not stand in for it (spec §2: "the other Marlin thread configs").
+//
+// H is also divisible by 16, so the group-scale grid is [V, H/16] exactly.
+namespace {
+
+NemotronHParams LmHeadParams() {
+  NemotronHParams p = MoeParams();
+  p.hidden_size = 256;
+  p.vocab_size = 512;
+  return p;
+}
+
+// The host weights this arm needs, and NOTHING else: `NemotronHDeviceLmHead`
+// reads `lm_head` and `lm_head_marlin`, and the host reference reads
+// `lm_head` and `act_dtype`. Building a whole model here would test the model.
+NemotronHHostWeights LmHeadWeights(const NemotronHParams& p, DType dt, bool nvfp4) {
+  NemotronHHostWeights h;
+  h.act_dtype = dt;
+  h.lm_head = nvfp4 ? MakeNvfp4(p.vocab_size, p.hidden_size, 77, dt)
+                    : OwnF32(SynthVec(static_cast<size_t>(p.vocab_size * p.hidden_size), 5, 0.2F),
+                             dt, {p.vocab_size, p.hidden_size});
+  h.materialized = true;
+  return h;
+}
+
+}  // namespace
+
+// NO COMMA IN THIS NAME (doctest `-tc` splits filters on commas -> `0 cases ran`
+// + `SUCCESS!`; the case-count assertion below is the other half of that guard).
+TEST_CASE("NemotronH A2-Q2b: the device lm_head matches the host projection on the same rows") {
+  Queue dq{Device{DeviceType::kCPU, 0}, nullptr};
+  if (!TryCudaQueue(&dq)) {
+    NoteDeviceSkip("device lm_head vs host projection");
+    return;
+  }
+  const NemotronHParams p = LmHeadParams();
+  Queue hq{Device{DeviceType::kCPU, 0}, nullptr};
+  const DType dt = DType::kBF16;  // Marlin's a/c contract (ops.cpp:879)
+  const int64_t H = p.hidden_size;
+  const int64_t V = p.vocab_size;
+  const NemotronHHostWeights host = LmHeadWeights(p, dt, /*nvfp4=*/true);
+
+  // ★ T == 1 IS THE DECODE SHAPE, and it is the one this projection spends its
+  // whole life in: `lm_head` runs once per step over the GATHERED rows, and a
+  // decode step gathers exactly one. The width loop keeps a prefill shape
+  // beside it so a config that resolves only at one M cannot hide.
+  for (int64_t R : {static_cast<int64_t>(1), static_cast<int64_t>(3)}) {
+    CAPTURE(R);
+    const std::vector<float> rows = SynthVec(static_cast<size_t>(R * H), 11, 0.5F);
+
+    // The HOST reference, through the SAME entry point the production fallback
+    // takes — not a hand-rolled dequant-and-multiply, which would be a second
+    // implementation for this case to agree with.
+    const std::vector<float> want = vllm::NemotronHHostLmHead(host, p, rows, R, hq);
+    REQUIRE(want.size() == static_cast<size_t>(R * V));
+
+    // ── ★ THE ONE DEFECT CLASS A VALUE COMPARISON CANNOT SEE ────────────────
+    //
+    // Everything below this line compares NUMBERS, and the shared dispatcher's
+    // naive redundant-dequant fallback computes the SAME numbers as Marlin. So
+    // if `DeviceLmHeadEligible` and `dense_nvfp4::MarlinW4A16Selects` ever
+    // disagree, every assertion in this case still passes while the arm
+    // re-uploads the whole [vocab, hidden] operand on every single call —
+    // `LmHeadNvfp4View` hands out a stack temporary, so `ResidentNvfp4`'s
+    // weight-keyed cache can never hit. That is the shape of the defect this
+    // row shipped in its first submission (the predicate restated the
+    // dispatcher's clauses and dropped `MarlinW4A16Enabled()`).
+    //
+    // The counter is the seam's own, and it is DEMONSTRABLY ARMED rather than
+    // assumed: `test_qwen3_forward.cpp:497` asserts on CPU that
+    // `fallback_gemms` reaches exactly `5 * num_hidden_layers` when the
+    // dispatcher does fall back. An absent hook reads exactly like an armed one.
+    vllm::dense_nvfp4::ResetW4A16Stats();
+    const std::vector<float> got = vllm::NemotronHDeviceLmHead(host, p, rows, R, dq);
+    const vllm::dense_nvfp4::Nvfp4W4A16Stats st = vllm::dense_nvfp4::GetW4A16Stats();
+    MESSAGE("R=" << R << " W4A16 counters: marlin_gemms=" << st.marlin_gemms
+                 << " fallback_gemms=" << st.fallback_gemms
+                 << " dense_gemms=" << st.dense_gemms);
+    CHECK(st.fallback_gemms == 0);
+    CHECK(st.marlin_gemms + st.dense_gemms >= 1);
+
+    // ★ THE COUNT IS ASSERTED AGAINST THE GEOMETRY, never against either
+    // buffer's own size — a buffer that agrees with itself proves nothing, and
+    // a maximum over zero elements is 0.0, which is also exactly what a
+    // bit-exact comparison prints (this file's MaxRel note, and A2-Q2a's first
+    // GB10 run, which printed `worst relative deviation: 0` from a mute loop).
+    REQUIRE(got.size() == static_cast<size_t>(R * V));
+    int64_t examined = 0;
+    const double dev = MaxRel(got, want, &examined);
+    REQUIRE(examined == R * V);
+
+    // ── THE BAND IS MEASURED IN THE CASE, AND THE GUARD IS A PROPERTY ───────
+    // (spec §3, and A2-Q2a's §5.2, both paid for on this row: a hard-coded
+    // bf16 band of 3e-2 once sat ABOVE a 2.11e-2 defect and accepted a wrong
+    // answer.)
+    //
+    // `separation` is what this comparison could possibly resolve: the worst
+    // deviation between the reference and a DELIBERATELY WRONG answer built by
+    // the same arithmetic — here the reference with its rows rotated by one,
+    // which is a real failure mode of a gathered projection (an off-by-one row
+    // gather) and not a synthetic perturbation.
+    std::vector<float> rotated(want.size());
+    for (int64_t r = 0; r < R; ++r)
+      for (int64_t c = 0; c < V; ++c)
+        rotated[static_cast<size_t>(r * V + c)] =
+            want[static_cast<size_t>(((r + 1) % R) * V + c)];
+    int64_t sep_examined = 0;
+    const double separation = MaxRel(rotated, want, &sep_examined);
+    // Agreement, separation and the guard MUST report the same count or the
+    // band between them is fiction (spec §3).
+    REQUIRE(sep_examined == examined);
+
+    if (R > 1) {
+      // `separation > 0` is REQUIRED, not assumed: `separation / 2` with a
+      // separation of 0 is a band of 0, and `<` against it rejects even exact
+      // agreement. A2-Q2a's first band collapsed on exactly this and failed on
+      // the BEST possible outcome.
+      REQUIRE(separation > 0.0);
+      MESSAGE("R=" << R << " examined=" << examined << " deviation=" << dev
+                   << " separation=" << separation << " band=" << (separation / 2.0));
+      // Strict `<`, never `<=`: `<=` admits a band of 0.
+      CHECK(dev < separation / 2.0);
+    } else {
+      // R==1 cannot be row-rotated, so there is no measured separation to build
+      // a band from and this width reports agreement WITHOUT a band rather than
+      // borrowing R=3's. Said out loud, because a case that quietly compares
+      // nothing at the decode width is the one failure this file exists to stop.
+      MESSAGE("R=1 examined=" << examined << " deviation=" << dev
+                              << " (no row-rotation separation exists at R=1)");
+      CHECK(examined == V);
+    }
+  }
+}
+
+TEST_CASE("NemotronH A2-Q2b: the device lm_head refuses a DENSE weight rather than reading garbage") {
+  Queue dq{Device{DeviceType::kCPU, 0}, nullptr};
+  if (!TryCudaQueue(&dq)) {
+    NoteDeviceSkip("device lm_head dense refusal");
+    return;
+  }
+  const NemotronHParams p = LmHeadParams();
+  // A DENSE `lm_head` is a different arm. The eligibility predicate must route
+  // it to the host projection rather than handing dense bf16 elements to a
+  // kernel that reads them as packed nibbles — plausible garbage, finite, and
+  // completely invisible to a token comparison.
+  const NemotronHHostWeights host = LmHeadWeights(p, DType::kBF16, /*nvfp4=*/false);
+  CHECK_FALSE(vllm::NemotronHDeviceLmHeadEligible(host, DType::kBF16, dq));
+  // ...and the NVFP4 one IS eligible on the same queue, so the predicate is
+  // discriminating rather than constantly false (which would pass the line
+  // above while disabling the whole arm).
+  const NemotronHHostWeights q = LmHeadWeights(p, DType::kBF16, /*nvfp4=*/true);
+  CHECK(vllm::NemotronHDeviceLmHeadEligible(q, DType::kBF16, dq));
+  // An f32 activation is not Marlin's contract either.
+  CHECK_FALSE(vllm::NemotronHDeviceLmHeadEligible(q, DType::kF32, dq));
 }

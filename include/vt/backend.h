@@ -26,6 +26,15 @@ class Backend {
   // Returns memory aligned to at least 64 bytes; StepArena depends on this.
   virtual void* Alloc(size_t bytes) = 0;
   virtual void Free(void* p) = 0;
+  // The DevicePool hands a RETAINED block back out (DevicePool::Get free-list
+  // hit). The block's contents are undefined and its PREVIOUS tenant's device
+  // residency — any state the backend keyed on the pointer — must be dropped
+  // before the new tenant is used. Default no-op suits backends that keep no
+  // per-pointer residency; Tenstorrent overrides, because its f32 device
+  // shadows are keyed by the host pointer (RegisterHostBuffer) and a stale
+  // shadow would otherwise be downloaded into (or committed over) an
+  // unrelated tensor.
+  virtual void OnScratchBlockAcquired(void* p) { (void)p; }
   virtual void Memset(Queue& q, void* p, int value, size_t bytes) = 0;
   // Same-device or host<->device transfer; on CPU this is memcpy.
   virtual void Copy(Queue& q, void* dst, const void* src, size_t bytes) = 0;
@@ -43,9 +52,10 @@ class Backend {
 
   // Drains any deferred submission WITHOUT a Queue in hand. Needed because the
   // portable CPU reference tier (op_provider.cpp) runs a HOST kernel directly
-  // over device memory on a unified-memory backend, and must not observe bytes
-  // a batched-but-uncommitted GPU submission has not written yet. Default no-op
-  // suits every backend that submits eagerly; Metal overrides it (M3c-1).
+  // over device memory on a backend that reports DeviceMemoryIsHostAddressable(),
+  // and must not observe bytes a batched-but-uncommitted GPU submission has not
+  // written yet. Default no-op suits every backend that submits eagerly; Metal
+  // overrides it (M3c-1).
   virtual void FlushPending() {}
 
   // True when host and device share one memory space (CPU, GB10, Apple).
@@ -249,7 +259,8 @@ Backend& GetBackend(DeviceType type);
 // registered. `GetBackend` throws for the unregistered case, which forces every
 // "is this device present?" caller into a try/catch; this is the answer without
 // one. Used by the portable reference tier (op_provider.cpp) to read a device's
-// UnifiedMemory() property without assuming the device exists in this build.
+// DeviceMemoryIsHostAddressable() property without assuming the device exists in
+// this build.
 Backend* TryGetBackend(DeviceType type);
 // Threading contract: all registration must complete before main() runs
 // (backends register via static initializers). After that, GetBackend is

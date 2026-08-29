@@ -16,7 +16,7 @@
 //   RmsNormRows (q/k norm)    -> vt::RmsNorm
 //   LayerNormRows             -> vt::LayerNorm (weight = bias = nullptr)
 //   GeluTanh                  -> vt::GeluTanh
-//   self-attention            -> vt::Attention(causal=false)
+//   self-attention            -> vt::AttentionDenseFa2(causal=false)
 //   cross / biased attention  -> vt::AttentionCross
 //   AdaValue / AdaZero affine -> kLtx2 glue table
 //   PostSelfAttention / gates -> kLtx2 glue table (add_gated)
@@ -54,9 +54,11 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -312,7 +314,37 @@ struct AttnArgsDev {
   const DevFreqs* k_pe = nullptr;
   const Tensor* bias = nullptr;  // f32 [batch * bias_rows, S]
   int64_t bias_rows = 0;
+  // `all_perturbed` (attention.py:557, `use_attention = not all_perturbed`). The
+  // device twin of `Ltx2AttentionArgs::all_perturbed` (ltx2.h:460-476), with the
+  // same meaning and the same port boundary: the PARTIAL blend at
+  // `attention.py:573` is not ported and is degenerate at the one batch size this
+  // port runs.
+  bool all_perturbed = false;
 };
+
+// attention.py:576-579 — everything the ordinary path and the STG-perturbed path
+// share, which is the per-head gate and `to_out`. Factored out rather than
+// duplicated for the reason `ltx2.cpp:825-829` gives on the host arm: a perturbed
+// pass that skipped `to_out` returns a tensor of the right shape in the wrong
+// width-space, the block would add it to the residual, and it would render.
+DBuf AttentionEpilogueDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, DBuf attn,
+                          const AttnArgsDev& a) {
+  const int64_t batch = a.batch, tq = a.tokens;
+  const int64_t heads = a.heads, dim_head = a.dim_head;
+  const int64_t inner = heads * dim_head;
+
+  // PytorchGatedAttention (ops.py:94-106), applied to the attention output BEFORE
+  // `to_out` (attention.py:576-579) and driven by the RAW input `x`.
+  if (w.to_gate_logits.weight.data != nullptr) {
+    DBuf logits(c.d, c.s, {batch * tq, heads});
+    LinearDev(c, x, batch * tq, a.query_dim, w.to_gate_logits, logits.t());
+    c.k->gate_heads(c.d.q, attn.t().data, logits.t().data, batch * tq, heads, dim_head, c.s);
+  }
+
+  DBuf out(c.d, c.s, {batch * tq, a.query_dim});
+  LinearDev(c, attn.t(), batch * tq, inner, w.to_out, out.t());
+  return out;
+}
 
 // Attention.forward (attention.py:520-579). `context` is null for self-attention
 // (upstream's `context = x if context is None else context`).
@@ -328,6 +360,34 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
   // attention.py:559-565: v first, then q and k.
   DBuf v(c.d, c.s, {batch * s, inner});
   LinearDev(c, ctx, batch * s, ctx_dim, w.to_v, v.t());
+
+  // attention.py:557 / :561-562 — `use_attention = not all_perturbed`, and when
+  // it is false `out = v`. The STG arm computes `to_v` and NOTHING else of the
+  // attention: no `to_q`, no `to_k`, no q/k RMSNorm, no RoPE, no scores. Written
+  // as an early exit rather than a chain of `if (!perturbed)` guards, exactly as
+  // the host arm is (ltx2.cpp:873-893), so the skipped work is visibly skipped —
+  // a guarded form that still projected q and threw the result away would be
+  // numerically identical and would hide the whole point of the perturbation,
+  // which is that the query/key path does not run.
+  if (a.all_perturbed) {
+    // The host arm's own refusal (ltx2.cpp:880-886), mirrored rather than
+    // dropped. `Ltx2DitPerturbation` carries no cross-attention SELF-perturbation
+    // type: the two CROSS types are `cross_attn_skip_all` booleans that skip the
+    // whole branch (transformer.py:335, :367), not a rule applied inside it.
+    VT_CHECK(context == nullptr,
+             "ltx2 attention (device): `all_perturbed` is upstream's SELF-attention STG "
+             "perturbation (guidance/perturbations.py:8-16 names SKIP_VIDEO_SELF_ATTN and "
+             "SKIP_AUDIO_SELF_ATTN). The CROSS-attention perturbations reach a whole-branch "
+             "guard rather than this rule, so a cross call carrying this flag is refused "
+             "rather than served the self-attention substitution");
+    // `s == tq` here, because a self-attention call is the only one that reaches
+    // this branch, so `v` already has the [batch * tq, inner] shape the epilogue
+    // reads. Asserted rather than assumed: a future cross caller that slipped
+    // past the check above would otherwise run `to_out` over the wrong row count.
+    VT_CHECK(s == tq, "ltx2 attention (device): a perturbed pass must be square");
+    return AttentionEpilogueDev(c, w, x, std::move(v), a);
+  }
+
   DBuf qb(c.d, c.s, {batch * tq, inner});
   LinearDev(c, x, batch * tq, a.query_dim, w.to_q, qb.t());
 
@@ -360,7 +420,146 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       vt::AttentionArgs args;
       args.scale = scale;
       args.causal = false;
-      vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      // The FAST dense op, not `vt::Attention` (#1549). `vt::Attention` is frozen
+      // on `vt::cuda::AttentionKernel`, which its own header calls
+      // "Correctness-grade (M0.9)": one 256-thread block per (query, head), a
+      // 256-wide shared-memory tree reduction per key, and no K/V tiling, so K
+      // and V are re-read from global once per (query, head). At 768x448/49f the
+      // video stream is 2352 tokens x 32 heads = 75,264 blocks each looping 2352
+      // keys, x 48 layers, and ONE DiT forward measured 47.84 s on GB10. That
+      // freeze is deliberate and correct — it is what keeps text decode
+      // byte-identical (cuda_ops.cu:3119-3121) — but it means the fast kernels
+      // are SEPARATE OPS a caller opts into BY NAME, with no shape routing and no
+      // fallback notice. A model that never opts in gets correct output at
+      // roughly 500x the cost and nothing anywhere says so.
+      //
+      // BOTH LTX STREAMS FIT THIS OP AT THE PRODUCTION DTYPE, and it is worth
+      // writing the arithmetic down rather than citing the advertised bound. The
+      // flash kernel's K/V tile is `2 * kFlashBc(64) * head_dim * sizeof(Tin)`
+      // and it never opts into more than the 49,152 B of dynamic shared memory
+      // every CUDA architecture guarantees. At the stream dtype this model
+      // actually renders in — bf16, per the VT_CHECK in
+      // `Ltx2StreamDitToDevice` — that is 32,768 B for the video stream's
+      // head_dim 128 and 16,384 B for the audio stream's 64. Both fit, so no
+      // cap-raise is needed here and #1549 does not make one; the op's
+      // ADVERTISED head_dim domain is a separate defect owned by #1578.
+      //
+      // The f32 arm is the L2 parity reference, not a serving path, and at
+      // head_dim 128 its tile is 65,536 B and does NOT fit. It is exercised at
+      // the fixture's reduced dimensions, where it does fit; at production
+      // geometry it now REFUSES rather than running slowly. It refuses LOUDLY in
+      // either world -- today a throw from `Check(cudaGetLastError(),
+      // "attention-dense-flash launch")` at cuda_ops.cu:3352, which names the op
+      // but not the head_dim, and once #1578 lands a VT_CHECK that names the
+      // head_dim too. Never silently, which is why this is a disclosure and not
+      // a blocker. Recorded under `## Owed` in
+      // .agents/specs/ltx25-dit-attn-flash.md and tracked by #1612.
+      //
+      // The square-problem contract holds here by construction: this branch is
+      // entered only when `context == nullptr`, which is exactly when `s == tq`
+      // above.
+      //
+      // NOT bit-identical to `vt::Attention` on CUDA, at either fast rung and for
+      // two DIFFERENT reasons. The flash-tiled kernel groups the head_dim partial
+      // sums across 32 lanes instead of a 256-thread block, so the same f32
+      // online softmax associates differently. FA-2 goes further: `mma.sync`
+      // reassociates BOTH the QK^T and the P.V reductions, and it exponentiates
+      // with `exp2f` on a log2-scaled score where the scalar kernels use `expf` on
+      // a linearly-scaled one. Every rung IS byte-identical on CPU, where all
+      // three ops resolve to the same registered kernel. The binding gates are the
+      // CUDA host-vs-device parity case in test_ltx2_device.cpp and, for the
+      // FA-2-versus-flash deviation at this model's own geometry, the head_dim-128
+      // cases in tests/vt/test_ops_attention_dense_fa2.cpp.
+      //
+      // THE DEFAULT IS NOW `vt::AttentionDenseFa2` (#1551), and the rung above
+      // `AttentionDenseFlash` is the point of it. `AttentionDenseFlash` removed
+      // the redundant global K/V traffic, but it is still a SCALAR recurrence:
+      // one warp per query walking the keys through a dependent online-softmax
+      // chain, with no tensor core anywhere in it. `AttentionDenseFa2` runs the
+      // vendored FlashAttention-2 forward, whose QK^T and P.V are `mma.sync`
+      // block reductions — the kernel vLLM itself dispatches for a dense
+      // non-causal self-attention. Until #1551 that op refused every head dim but
+      // 64, so LTX's head_dim-128 video stream could not reach it at all.
+      //
+      // CALLING IT UNCONDITIONALLY IS SAFE BY THE OP'S OWN CONTRACT, and that is
+      // why there is no shape test here. `vt::AttentionDenseFa2` is TOTAL: its
+      // fast path is bf16 / head_dim {64,128} / non-causal / MHA with the
+      // vendored kernels compiled, and every other shape falls through to
+      // `AttentionDenseFlash` BIT-exactly (cuda_ops.cu, and the four fall-through
+      // cases in tests/vt/test_ops_attention_dense_fa2.cpp). Both LTX streams are
+      // inside the fast path at the production dtype — video 32 heads x 128,
+      // audio 32 heads x 64, bf16, non-causal, h_k == h — and the f32 parity arm
+      // and the CPU backend take the fall-through and are unchanged by this. A
+      // shape test written here would be a SECOND copy of the op's domain, and
+      // the copy is what goes stale when the instantiation set moves.
+      //
+      // THE A/B KNOB IS THREE-WAY, because a two-arm knob cannot measure a
+      // three-rung ladder. Each value selects a DIFFERENT vt:: op, so each arm
+      // states which rung it ran in its own `VT_OP_PROVIDER_STATS=1` log rather
+      // than being inferred from its timing — which is the quantity under
+      // measurement and cannot also be the evidence:
+      //
+      //   unset (default)  vt::AttentionDenseFa2      kAttentionDenseFa2
+      //   "flash"          vt::AttentionDenseFlash    kAttentionDenseFlash
+      //   "0"              vt::Attention              kAttention
+      //
+      // `=0` keeps exactly the meaning #1549 gave it and docs/ENVIRONMENT.md
+      // records, so the 47.84 s denominator remains reachable from this binary.
+      // "flash" is the arm #1551's ratio is taken against. Read FRESH rather than
+      // cached, so a test can flip it inside one process.
+      //
+      // EVERY ARM IS AN EXACT MATCH AND A FOURTH VALUE IS REFUSED (#1751). This
+      // read used to test the naive arm with `arm[0] == '0'` — a PREFIX — while
+      // the flash arm used `strcmp`, and everything matching neither fell into a
+      // bare `else` that ran the FA-2 default in silence. Two consequences, and
+      // both of them make a measurement say the wrong thing rather than fail:
+      // `0x`, `07` and `0flash` selected the naive rung, and `falsh`, `FLASH`,
+      // `flash ` with a trailing space, `naive`, `1` or an empty value selected
+      // the DEFAULT. `flash` is the DENOMINATOR of #1551's 2.74x, so a mistyped
+      // denominator ran the NUMERATOR's kernel a second time and yielded ~1.00x
+      // — which is also exactly what "no speedup" looks like, so the number could
+      // not report its own failure. A knob whose whole purpose is to say which
+      // rung ran must not answer a question it was not asked, so an unrecognised
+      // value is REFUSED BY NAME, in the shape AGENTS.md requires of an
+      // unimplemented arm.
+      //
+      // AN EMPTY VALUE IS REFUSED, not treated as unset, and that is the one
+      // choice here that is not forced. `export VLLM_LTX2_DIT_FLASH_ATTN=$ARM`
+      // with an unset `ARM` produces exactly this, and it is the case where the
+      // operator most believes they selected an arm. Silently defaulting is what
+      // this whole change exists to remove.
+      //
+      // UNSET STILL MEANS FA-2, and that is deliberate rather than inherited:
+      // it is the shipped default and the only serving arm (docs/ENVIRONMENT.md),
+      // so requiring the variable would make every production render — none of
+      // which sets it — refuse.
+      const char* arm = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
+      if (arm == nullptr) {
+        vt::AttentionDenseFa2(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else if (std::strcmp(arm, "0") == 0) {
+        // VT-ATTN-NAIVE: the naive arm of a same-binary A/B, not a serving path.
+        // The default is `vt::AttentionDenseFa2` in the unset branch above, and
+        // this call exists so every arm of the 47.84 s / 7.680 s / FA-2
+        // measurement runs from ONE build — the shape `VT_FA2_DENSE`
+        // (cuda_ops.cu) already takes. Deleting it would not remove a naive call
+        // from production; it would remove the control that proves the fast one
+        // is what runs.
+        vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else if (std::strcmp(arm, "flash") == 0) {
+        // The #1549 default, kept as the DENOMINATOR arm of #1551's ratio. Not a
+        // serving path either: it is the rung this change claims to beat, and a
+        // claim measured against a rung nobody can still run is not measurable.
+        vt::AttentionDenseFlash(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else {
+        throw std::invalid_argument(
+            std::string("VLLM_LTX2_DIT_FLASH_ATTN=\"") + arm +
+            "\" is not a rung of the LTX-2.5 DiT attention A/B. It accepts exactly three "
+            "values: unset selects vt::AttentionDenseFa2, the shipped default and the only "
+            "serving arm; \"flash\" selects vt::AttentionDenseFlash, the denominator arm; "
+            "\"0\" selects vt::Attention, the naive arm. REFUSED rather than defaulted, "
+            "because a value that quietly falls back runs one rung under another rung's "
+            "name and makes a same-binary A/B measure the same kernel twice.");
+      }
     } else {
       vt::AttentionCrossArgs args;
       args.scale = scale;
@@ -372,17 +571,7 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
     }
   }
 
-  // PytorchGatedAttention (ops.py:94-106), applied to the attention output BEFORE
-  // `to_out` (attention.py:576-579) and driven by the RAW input `x`.
-  if (w.to_gate_logits.weight.data != nullptr) {
-    DBuf logits(c.d, c.s, {batch * tq, heads});
-    LinearDev(c, x, batch * tq, a.query_dim, w.to_gate_logits, logits.t());
-    c.k->gate_heads(c.d.q, attn.t().data, logits.t().data, batch * tq, heads, dim_head, c.s);
-  }
-
-  DBuf out(c.d, c.s, {batch * tq, a.query_dim});
-  LinearDev(c, attn.t(), batch * tq, inner, w.to_out, out.t());
-  return out;
+  return AttentionEpilogueDev(c, w, x, std::move(attn), a);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +667,17 @@ struct BlockArgsDev {
   const DevFreqs* audio_pe = nullptr;
   const DevFreqs* video_cross_pe = nullptr;
   const DevFreqs* audio_cross_pe = nullptr;
+  // This block's four perturbation flags, the device twin of `Ltx2BlockArgs`'s
+  // (ltx2.h:653-675). `BlockPerturbationsProcessor` (transformer_args.py:99-118)
+  // resolves them per block from the batched config; at `batch == 1`
+  // `all_in_batch` is the flag itself.
+  bool video_self_attn_perturbed = false;
+  bool audio_self_attn_perturbed = false;
+  // `cross_attn_skip_all` on the VIDEO args, i.e. SKIP_A2V_CROSS_ATTN. The flag
+  // rides on the stream being WRITTEN (model.py:442-458), so this one gates the
+  // audio->video direction.
+  bool video_cross_attn_skip_all = false;
+  bool audio_cross_attn_skip_all = false;
 };
 
 // One stream's text cross-attention (transformer.py:223-252 + :420-447), the
@@ -598,6 +798,7 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     a.pe = args.video_pe;
     a.bias = args.video_self_bias;
     a.bias_rows = args.video_self_bias_rows;
+    a.all_perturbed = args.video_self_attn_perturbed;
     DBuf msa = AttentionDev(c, w.attn1, norm_vx.t(), nullptr, a);
 
     // PytorchPostSAFunction (ops.py:72-82): x + y * gate, then rms_norm of that sum.
@@ -633,6 +834,7 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     a.pe = args.audio_pe;
     a.bias = args.audio_self_bias;
     a.bias_rows = args.audio_self_bias_rows;
+    a.all_perturbed = args.audio_self_attn_perturbed;
     DBuf msa = AttentionDev(c, w.audio_attn1, norm_ax.t(), nullptr, a);
 
     c.k->add_gated(c.d.q, audio_x->data, msa.t().data, gate.t().data, rows, adim, 1, c.s);
@@ -673,7 +875,14 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
                          /*mod_index=*/0);
     };
 
-    if (run_a2v) {
+    // `if run_a2v and not video.cross_attn_skip_all` (transformer.py:335). The
+    // guard is INSIDE the `run_a2v || run_v2a` block, exactly as upstream's is, so
+    // a pass that skips one direction still took the `vx_pre` / `ax_pre` snapshot
+    // above and the surviving direction reads the PRE-cross state. Hoisting it
+    // into the outer condition would be equivalent only while both directions are
+    // always skipped together, which is true of the one caller today and is not a
+    // property of the flag.
+    if (run_a2v && !args.video_cross_attn_skip_all) {
       DBuf scale_v = av_scale(w.scale_shift_table_a2v_ca_video, *args.video_cross_scale_shift, tv,
                               dim, 0);
       DBuf shift_v = av_scale(w.scale_shift_table_a2v_ca_video, *args.video_cross_scale_shift, tv,
@@ -700,7 +909,8 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
       c.k->add_gated(c.d.q, video_x->data, out.t().data, gate.t().data, batch * tv, dim, tv, c.s);
     }
 
-    if (run_v2a) {
+    // `if run_v2a and not audio.cross_attn_skip_all` (transformer.py:367).
+    if (run_v2a && !args.audio_cross_attn_skip_all) {
       DBuf scale_a = av_scale(w.scale_shift_table_a2v_ca_audio, *args.audio_cross_scale_shift, ta,
                               adim, 2);
       DBuf shift_a = av_scale(w.scale_shift_table_a2v_ca_audio, *args.audio_cross_scale_shift, ta,
@@ -1112,7 +1322,8 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
                                     const Ltx2DitWeights& weights,
                                     const Ltx2ModalityInput* video,
                                     const Ltx2ModalityInput* audio, vt::DType compute_dtype,
-                                    Ltx2PromptKvCache* cache) {
+                                    Ltx2PromptKvCache* cache,
+                                    const Ltx2DitPerturbation* perturbations) {
   VT_CHECK(compute_dtype == vt::DType::kF32 || compute_dtype == vt::DType::kBF16,
            "ltx2: the device forward computes in bf16 (the production stream, which is what "
            "Ltx2StreamDitToDevice puts on the device) or f32 (the L2 parity arm)");
@@ -1141,6 +1352,18 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
            "ltx2: audio_cross_attention_dim must equal the audio stream width");
   VT_CHECK(static_cast<int64_t>(weights.blocks.size()) == params.num_layers,
            "ltx2: the bound block count does not match num_layers");
+  // `perturbations` (model.py:493), checked exactly as the host forward checks it
+  // (ltx2_dit.cpp:837-842). A vector that is not exactly `num_layers` long is
+  // REFUSED rather than indexed defensively: a config built for another layer
+  // count would otherwise perturb a prefix of the blocks and leave the rest
+  // alone, which is a legal-looking STG pass over the wrong blocks and renders.
+  if (perturbations != nullptr) {
+    for (const std::vector<uint8_t>* v :
+         {&perturbations->video_self_attn, &perturbations->audio_self_attn}) {
+      VT_CHECK(v->empty() || static_cast<int64_t>(v->size()) == params.num_layers,
+               "ltx2: a perturbation vector is neither empty nor one entry per block");
+    }
+  }
   CheckWeightsResident(weights, queue.device);
 
   vt::Backend& backend = vt::GetBackend(queue.device.type);
@@ -1198,6 +1421,17 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
     a.audio_pe = &as.pe;
     a.video_cross_pe = &vs.cross_pe;
     a.audio_cross_pe = &as.cross_pe;
+    // `_process_transformer_blocks` (model.py:442-458): the SELF types are per
+    // block and the CROSS types ride whole. An EMPTY vector is "no block", which
+    // is what `PerturbationConfig.empty()` reaches the forward as.
+    if (perturbations != nullptr) {
+      a.video_self_attn_perturbed = !perturbations->video_self_attn.empty() &&
+                                    perturbations->video_self_attn[static_cast<size_t>(i)] != 0;
+      a.audio_self_attn_perturbed = !perturbations->audio_self_attn.empty() &&
+                                    perturbations->audio_self_attn[static_cast<size_t>(i)] != 0;
+      a.video_cross_attn_skip_all = perturbations->video_cross_attn_skip_all;
+      a.audio_cross_attn_skip_all = perturbations->audio_cross_attn_skip_all;
+    }
     BlockForwardDev(c, weights.blocks[static_cast<size_t>(i)], a, &vs.x->t(), &as.x->t());
   }
 

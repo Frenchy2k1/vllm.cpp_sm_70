@@ -27,10 +27,10 @@ class TenstorrentPlatform final : public Platform {
   DeviceType device_type() const override { return DeviceType::kTENSTORRENT; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kTENSTORRENT); }
 
-  // interface.py:409-415 get_device_capability. Tenstorrent's Tensix cores
-  // have no CUDA-SM-shaped "compute capability" to report; the base {0, 0}
-  // ("no meaningful compute capability", backend.h) is the honest answer,
-  // same as CPU.
+  // interface.py:420-431 get_device_capability, whose unit is an NVIDIA SM
+  // version. Tenstorrent's Tensix cores have no SM version to report, so ABSENT
+  // is the honest answer — same as CPU, and the same answer Metal and Vulkan
+  // give since #1823.
   DeviceCapability get_device_capability() const override { return DeviceCapability{}; }
 
   // OPT-125m runs BF16 weights/activations with F32 logits. The adapter
@@ -50,12 +50,16 @@ class TenstorrentPlatform final : public Platform {
   // was the first bring-up; Qwen3-dense is the second (same OPT→Qwen3 sequence
   // Metal used for M3a/M3b). Mistral-7B-v0.3 is the third: it reuses the
   // Qwen3-dense forward verbatim (qk-norm skipped, plain rope, untied lm_head),
-  // so every op is already registered — no new kernel. Anything else falls back
-  // to CPU via SelectQueue.
+  // so every op was already registered — no new kernel. Qwen3.5 (GDN hybrid)
+  // is the fourth: its op delta (kGdnPostConv, kSigmoidGateBf16,
+  // kAttnQkNormRopeGate, the GDN decode set) landed in the GDN/Qwen35 rows,
+  // with the bf16 mamba-cache arms enabled by the backend's compressed-state
+  // capabilities. Anything else falls back to CPU via SelectQueue.
   bool supports_model_architecture(std::string_view architecture) const override {
     return architecture == "OPTForCausalLM" ||
            architecture == "Qwen3ForCausalLM" ||
-           architecture == "MistralForCausalLM";
+           architecture == "MistralForCausalLM" ||
+           architecture == "Qwen3_5ForConditionalGeneration";
   }
 
   // kPagedAttention + kReshapeAndCache are registered against the NHD
@@ -66,13 +70,21 @@ class TenstorrentPlatform final : public Platform {
     return {"FLASH_ATTN"};
   }
 
-  // HOST-FREE-FORWARD R1 measurement (local, gated on VT_TT_HOST_FREE_DECODE):
-  // enable the shared decode-graph framework so we can probe whether the
-  // RmsNorm+RoPE threshold flip gets capture past the to_vector fatal.
-  // NOT for shipping as-is: a real flip belongs to R4 and must be unconditional
-  // only once the forward is host-free end-to-end.
+  // HOST-FREE-FORWARD R5 flip (#1604): host-free decode is now the DEFAULT
+  // (VT_TT_HOST_FREE_DECODE unset or any value except "0"). Set
+  // VT_TT_HOST_FREE_DECODE=0 to opt out and restore the pre-flip default path.
+  //
+  // CAPTURE stays opt-in via VT_TT_DECODE_CAPTURE: the captured 27.1 tok/s arm
+  // hangs deterministically on the FIRST multi-request run (16-prompt
+  // test_qwen3_paged_engine, plain and VT_TT_RECAPTURE_EVERY=8 alike; one
+  // tt-metal worker spins at 100%, main thread blocked), while single-request
+  // captured legs and the whole host-free EAGER path (11.0 tok/s warm, gate
+  // green in 35 s) never hit it. Declining capture by default keeps the
+  // default hang-free; flipping THIS default belongs to the capture-hang
+  // issue.
   bool support_static_graph_mode() const override {
-    return std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+    return vt::tenstorrent::HostFreeDecodeEnabled() &&
+           std::getenv("VT_TT_DECODE_CAPTURE") != nullptr;
   }
 };
 

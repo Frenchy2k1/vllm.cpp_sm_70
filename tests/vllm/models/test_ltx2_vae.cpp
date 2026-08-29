@@ -28,6 +28,11 @@
 // work-stealing cursor, reached via -I src the way every other threading A/B in
 // this tree does (tests/vt/test_ops_conv2d.cpp:25).
 #include "vt/cpu/cpu_threadpool.h"
+// VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads the geometry it claims
+// rather than assuming it (src/vt/cpu/cpu_conv1d_block.h), same reach as above.
+#include "vt/cpu/cpu_conv1d_block.h"
+#include "vt/op_provider.h"
+#include "vt/ops.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
@@ -754,6 +759,141 @@ TEST_CASE("ltx2 vae: the legacy resblock-1 vocoder arm matches upstream ltx_core
   CHECK(err <= kLtx2GoldenTol);
 }
 
+TEST_CASE("ltx2 vae: the vocoder is exact ACROSS a time block boundary") {
+  // WHY THIS CASE EXISTS (#1684). The `vt::Conv1d` CPU provider cuts its work
+  // into (time block, output row) pairs (#1664, src/vt/cpu/cpu_conv1d_block.h).
+  // Until this case existed THIS suite reached that provider at SINGLE-BLOCK
+  // shapes only -- every arm above runs at `kLtx2VocFrames`, far too few to fill
+  // one work unit's 512 KiB activation budget -- so a defect confined to the
+  // second axis reddened the op's own suite and nothing else: a sign flip
+  // applied only where `blocks > 1` left eight of the ten consumer suites green.
+  // This is LTX-2.5's own arm of that gate, entering through
+  // `Ltx2VocoderForward` at a mel long enough that conv_pre blocks.
+  //
+  // WHY THE EXPECTATION IS TWO SHORTER VOCODES AND NOT A GOLDEN. Every stage of
+  // the vocoder is a LOCAL, shift-equivariant operator -- zero-padded
+  // convolutions, a strided transpose, anti-aliased Snake, residual adds and a
+  // mean -- so vocoding a WINDOW of the mel reproduces the long vocode sample
+  // for sample except within the window's own edge, and two windows whose
+  // interiors overlap cover the whole waveform. Each window is short enough that
+  // its convolutions take ONE block, so the comparison is the blocked arithmetic
+  // against the unblocked arithmetic, BIT FOR BIT: a cell's reduction is `seed`,
+  // then `ic`, then `k`, and none of that mentions the block. A golden would
+  // need upstream re-run at a 512 KiB activation and would gate nothing extra.
+  //
+  // AND THE SECOND WINDOW IS THE ONE THAT MATTERS: the boundary always falls at
+  // the block length, which is the longest a single-block reference can be, so a
+  // prefix window alone can never reach it.
+  constexpr int64_t kMelBins = 64;   // conv_pre's input width is 2 x 64, hardcoded upstream
+  constexpr int64_t kChannels = 2;
+  constexpr int64_t kRefFrames = 992;    // == the conv_pre block length, asserted below
+  constexpr int64_t kLongFrames = 1472;  // > kRefFrames, so the long vocode blocks
+  constexpr int64_t kUpsample = 2;
+  constexpr int64_t kEdge = 192;  // >4x the chain's ~44-sample receptive field
+
+  vllm::Ltx2VocoderConfig cfg;
+  cfg.resblock_kernel_sizes = {3};
+  cfg.upsample_rates = {kUpsample};
+  cfg.upsample_kernel_sizes = {4};
+  cfg.resblock_dilation_sizes = {{1, 3, 5}};
+  cfg.upsample_initial_channel = 8;
+  cfg.amp = true;
+  cfg.snakebeta = true;
+  cfg.use_tanh_at_final = true;
+  cfg.apply_final_activation = true;
+  cfg.use_bias_at_final = true;
+  cfg.output_sampling_rate = 16000;
+  cfg.prefix = "ltx2.vocblk.";
+
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(kChannels * kMelBins, /*kernel=*/7, /*stride=*/1,
+                               /*dilation=*/1, kLongFrames);
+  INFO("conv_pre block=" << block << " long=" << kLongFrames << " ref=" << kRefFrames);
+  REQUIRE(block < kLongFrames);  // TEETH: the long vocode really blocks
+  REQUIRE(block == kRefFrames);  // TEETH: the references really do not
+  REQUIRE(block % vt::cpu::kConv1dPosTile == 0);
+
+  ParamBag bag;
+  PutVocoderParams(bag, cfg);
+
+  // [channels, frames, mel_bins], channel-major.
+  const std::vector<float> mel_long =
+      Ltx2Input("ltx2.vocblk.input", kChannels * kLongFrames * kMelBins, 1.0);
+  int64_t long_samples = 0;
+  const std::vector<float> wave_long = vllm::Ltx2VocoderForward(
+      cfg, bag.weights, mel_long, kChannels, kLongFrames, kMelBins, &long_samples);
+  REQUIRE(long_samples == kUpsample * kLongFrames);
+  REQUIRE(wave_long.size() == static_cast<size_t>(kChannels * long_samples));
+
+  int64_t compared = 0;
+  int64_t wrong = 0;
+  int64_t first_wrong = -1;
+  double worst = 0.0;
+  double peak = 0.0;
+  float lo = wave_long[0];
+  float hi = wave_long[0];
+  auto window = [&](int64_t start, int64_t frames, bool trim_left, bool trim_right) {
+    REQUIRE(start % kUpsample == 0);  // the transpose is equivariant on its own grid only
+    REQUIRE(frames <= block);         // TEETH: a reference that blocked would prove nothing
+    std::vector<float> mel(static_cast<size_t>(kChannels * frames * kMelBins));
+    for (int64_t s = 0; s < kChannels; ++s) {
+      for (int64_t t = 0; t < frames; ++t) {
+        for (int64_t b = 0; b < kMelBins; ++b) {
+          mel[static_cast<size_t>((s * frames + t) * kMelBins + b)] =
+              mel_long[static_cast<size_t>((s * kLongFrames + start + t) * kMelBins + b)];
+        }
+      }
+    }
+    int64_t samples = 0;
+    const std::vector<float> wave = vllm::Ltx2VocoderForward(cfg, bag.weights, mel, kChannels,
+                                                             frames, kMelBins, &samples);
+    REQUIRE(samples == kUpsample * frames);
+    const int64_t base = kUpsample * start;
+    const int64_t from = trim_left ? kEdge : 0;
+    const int64_t to = samples - (trim_right ? kEdge : 0);
+    REQUIRE(to > from);
+    for (int64_t s = 0; s < kChannels; ++s) {
+      for (int64_t i = from; i < to; ++i) {
+        const float a = wave_long[static_cast<size_t>(s * long_samples + base + i)];
+        const float b = wave[static_cast<size_t>(s * samples + i)];
+        ++compared;
+        if (a != b) {
+          if (first_wrong < 0) first_wrong = s * long_samples + base + i;
+          ++wrong;
+          worst = std::max(worst, std::abs(static_cast<double>(a) - static_cast<double>(b)));
+        }
+        peak = std::max(peak, std::abs(static_cast<double>(a)));
+        lo = std::min(lo, a);
+        hi = std::max(hi, a);
+      }
+    }
+    return std::pair<int64_t, int64_t>{base + from, base + to};
+  };
+
+  const auto span_a = window(0, kRefFrames, /*trim_left=*/false, /*trim_right=*/true);
+  const auto span_b =
+      window(kLongFrames - kRefFrames, kRefFrames, /*trim_left=*/true, /*trim_right=*/false);
+  // COVERAGE, asserted rather than assumed.
+  CHECK(span_a.first == 0);
+  CHECK(span_b.second == long_samples);
+  CHECK(span_b.first <= span_a.second);
+  const int64_t boundary = kUpsample * block;
+  INFO("spans [" << span_a.first << "," << span_a.second << ") and [" << span_b.first << ","
+                 << span_b.second << "), boundary at sample " << boundary);
+  CHECK(boundary > span_b.first);
+  CHECK(boundary < span_b.second);
+
+  INFO("samples compared=" << compared << " differing=" << wrong << " first at " << first_wrong
+                           << " worst|diff|=" << worst);
+  CHECK(wrong == 0);
+  // A saturated tanh, or a constant waveform, would make the comparison vacuous.
+  CHECK(peak < 0.999);
+  CHECK(hi - lo > 0.1F);
+  MESSAGE("ltx2 vocoder across a block boundary: " << compared
+                                                   << " samples compared bit for bit, peak "
+                                                   << peak << ", span " << (hi - lo));
+}
+
 TEST_CASE("ltx2 vae: the BWE vocoder chain matches upstream ltx_core") {
   // The hann-sinc resampler window is a DIFFERENT filter from the kaiser one the
   // activations use, and is likewise computed rather than loaded (persistent=False).
@@ -1340,6 +1480,52 @@ TEST_CASE("ltx2 vae: the decode DISPATCHES its convolutions to the CPU threadpoo
   const double err = MaxAbsDiff(got.data, want.data(), got.data.size());
   INFO("threaded decode max|out - 7| = " << err);
   CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the decode DISPATCHES its convolutions through the vt::Conv3d seam") {
+  // REACHABILITY, #1007 / LTX25-DEVICE-RESIDENCY W5. The decode's convolution no
+  // longer lives in ltx2_video_vae.cpp; it is `vt::Conv3d` on the queue the
+  // engine hands down, and this case is what proves the SHIPPING path reaches
+  // that seam rather than that the op works.
+  //
+  // THE INSTRUMENT is the op provider's own selection counter
+  // (include/vt/op_provider.h `GetOpProviderStats`), which counts resolutions
+  // through `GetOp` once per-call counting is on. It is a direct observation of
+  // "this op executed", not an inference from an output value: a decode that
+  // reverted to a private host loop would produce the SAME pixels and still read
+  // zero here. The `REQUIRE` before the decode is its own positive control — the
+  // counter demonstrably reads zero when nothing has dispatched.
+  //
+  // THE COUNT IS PINNED, and the number is a property of the fixture rather than
+  // of the seam: `MakeLtx2ThreadFixture` sets `decoder_blocks = {}`, so the
+  // decode issues exactly TWO convolutions, `conv_in` and `conv_out`. A pin
+  // rather than `>= 1` because it also catches a decode that grew or lost a
+  // convolution — the count and the pixels are independent observations.
+  //
+  // WHAT IT DOES NOT NEED TO PROVE, because the structure rules it out: that
+  // every one of the nine `CausalConv3d` call sites routes. All nine share ONE
+  // dispatch, `Conv3dThroughSeam` inside `CausalConv3d`
+  // (src/vllm/model_executor/models/ltx2_video_vae.cpp), so "some sites kept a
+  // private path" is not a reachable state. Deleting that one call is the
+  // mutation, and it reds this case and every video golden in this file.
+  const Ltx2ThreadFixture f = MakeLtx2ThreadFixture();
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kCPU);
+  REQUIRE(vt::GetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kCPU).selections == 0);
+
+  int64_t chunks = 0;
+  const vllm::Ltx2VideoFrames got = Ltx2ThreadDecode(f, &chunks);
+  const vt::OpProviderStats stats =
+      vt::GetOpProviderStats(vt::OpId::kConv3d, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+
+  REQUIRE(chunks == 1);
+  REQUIRE(!got.data.empty());
+  INFO("kConv3d dispatches through the production decode = " << stats.selections);
+  CHECK(stats.selections == 2u);
+  REQUIRE(stats.last_selected != nullptr);
+  CHECK(std::string(stats.last_selected) == std::string(vt::kNativeProviderName));
 }
 
 TEST_CASE("ltx2 vae: the decode is BIT-IDENTICAL across thread counts") {

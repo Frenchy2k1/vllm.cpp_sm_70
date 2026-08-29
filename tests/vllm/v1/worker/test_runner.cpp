@@ -505,11 +505,13 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
 
   // M3: the runner resolves the ENGINE-level attention backend at init, per
   // attention group. On CPU the dense priority walk (cpu.cpp) is
-  // [CPU_ATTN (unregistered), FLASH_ATTN] so it lands on FLASH_ATTN —
-  // behavior-preserving, and the proof that selection is now part of the
-  // runtime path, not just the registry test. One name per attention layer.
+  // [CPU_ATTN, FLASH_ATTN] and, since #1371 registered it, lands on CPU_ATTN —
+  // upstream's own CPU answer (cpu.py:75-87). This is the proof that selection
+  // is part of the runtime path, not just the registry test: the name below is
+  // resolved inside GPUModelRunner::initialize_kv_cache. One name per attention
+  // layer.
   REQUIRE(runner.attn_backend_names().size() == 1);
-  CHECK(runner.attn_backend_names()[0] == "FLASH_ATTN");
+  CHECK(runner.attn_backend_names()[0] == "CPU_ATTN");
 
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);
@@ -1478,8 +1480,11 @@ TEST_CASE("runner: sample_tokens_async decode is token-identical to sync") {
     GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
                           kMaxModelLen, 64);
     runner.set_async_input_combine(async_output);
-    // The runner advertises async support exactly when the async path is on.
-    CHECK(runner.runner_supports_async() == async_output);
+    // SPEC-DFLASH2 W7 (#1824): runner_supports_async() is the env/backend
+    // capability predicate and no longer tracks the input-combine lever (async
+    // SCHEDULING must survive a spec engine whose combine is vetoed — I5e).
+    // The lever this case toggles is the combine itself:
+    CHECK(runner.async_input_combine() == async_output);
     std::vector<int32_t> tokens;
 
     auto sample = [&]() -> int32_t {
@@ -1577,5 +1582,54 @@ TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") 
   // (not an uncatchable OOB), which proves the runner's GDN path was skipped.
   CHECK_THROWS_WITH_AS(runner.execute_model(s1),
                        doctest::Contains("qwen3_5 dense paged forward"),
+                       std::runtime_error);
+}
+
+// ─── M3: THE BLOCK-SIZE CONTRACT AT ITS PRODUCTION CALL SITE ─────────────────
+//
+// The runner must refuse a non-multiple-of-16 block size at its production
+// call site — the same failure the server's --block-size validation and the
+// bench rounding exist to prevent at the entry points.
+//
+// WHICH guard fires, and why this case says `runtime_error` (#1608). The
+// refusal happens during backend SELECTION, before any backend is constructed:
+// no candidate declares support for block_size 8, so
+// `SelectAttentionBackendName` exhausts the platform's priority list and throws
+// `std::runtime_error` naming every rejected candidate with its reason
+// ("block_size not supported"). `get_kv_cache_shape`'s own
+// `std::invalid_argument` sits BEHIND that and is not reached from here.
+//
+// This case previously asserted that `invalid_argument`, which made it
+// host-dependent and red on every CPU build. The cause was not the assertion
+// but `RocmAttentionBackend`: it omitted upstream's
+// `get_supported_kernel_block_sizes() == MultipleOf(16)`
+// (rocm_attn.py:181-190), inheriting the base MultipleOf(1), so on ROCm alone
+// the registry ACCEPTED block_size 8 and the failure surfaced later out of
+// `get_kv_cache_shape`. Declaring it made every host agree.
+//
+// OWED, and deliberately not papered over: with the registry consistent, the
+// `CheckKvCacheShape` install inside `initialize_kv_cache` is no longer
+// reachable from here, so deleting that install again leaves this case green —
+// the #1065 Owed item this case was written for. Restoring it needs inputs that
+// pass selection and then fail the shape comparison, i.e. an MLA spec with
+// `num_kv_heads != 1` (TritonMLABackend refuses that in `get_kv_cache_shape`).
+// A CPU build cannot express it: `CpuPlatform::get_attn_backend_priority`
+// returns {CPU_ATTN, FLASH_ATTN} and registers no MLA backend, so this needs a
+// CUDA-capable host or a test-only backend registration.
+TEST_CASE("runner: initialize_kv_cache refuses a non-multiple-of-16 block size") {
+  const HfConfig c = MakeDenseOnlyConfig();
+  const Qwen3_5DenseWeights w = MakeDenseOnlyWeights(c);
+
+  KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+  kv.kv_cache_groups[0].kv_cache_spec = std::make_shared<FullAttentionSpec>(
+      /*block_size=*/8, static_cast<int>(c.num_key_value_heads),
+      static_cast<int>(c.head_dim), vllm::v1::ResolveKvCacheDType());
+
+  auto make_runner = [&]() {
+    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+  };
+  CHECK_THROWS_WITH_AS(make_runner(),
+                       doctest::Contains("block_size not supported"),
                        std::runtime_error);
 }

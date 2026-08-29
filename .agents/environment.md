@@ -40,9 +40,16 @@ collision below, in which two mutexes could not see each other.
 
 **This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
 in this file still describe.** Read a historical recipe as evidence of what ran
-at the time, not as an instruction for what to run now. The file mutex is still
-real and still required, and it now lives INSIDE a lease rather than instead of
-one.
+at the time, not as an instruction for what to run now.
+
+**"The file mutex is still real and still required" is the stale half of this
+paragraph, and the Jetson Thor profile below now contradicts it.** On a FLEET
+device the lease IS the mutex — `rc` hands the whole device to one job — so a
+job that also takes `${GPU_LOCK}` serialises against nobody. That profile
+deletes the `flock` wrapper from its recipe for exactly that reason. The file
+mutex stays real and required on a GPU that is NOT a fleet device, which is the
+conditional form `AGENTS.md` states, and where both apply it runs inside the
+lease rather than instead of one.
 
 **The bypass has already voided a measurement, so this is a measured cost and
 not a rule for its own sake.** `.agents/specs/minimax-music3.md` §13.10 records
@@ -185,6 +192,84 @@ c1 pairing even though the cross-arm rule passed perfectly. Two arms measured in
 a lease may not be dividable, so budget for absolutes and say so in advance
 rather than discovering it after the GPU time is spent.
 
+**The missing capability is `CAP_SYS_ADMIN`, and it is missing from the BOUNDING
+set. Measured 2026-08-21 inside leases on `thor:gpu0` and `orin:gpu0`.**
+`/proc/self/status` in the worker reads `CapEff = CapPrm = CapBnd =
+0x00000000a80425fb` on both boxes, byte-identical -- the default 14-capability
+OCI set, which holds neither `CAP_SYS_ADMIN` nor `CAP_PERFMON` nor
+`CAP_SYS_NICE`. Those three are the whole Linux privilege surface of the NVIDIA
+open kernel module: at tag `580.173.02`, `grep -n 'capable(\|CAP_'` over
+`kernel-open/common/inc/nv-linux.h` and `kernel-open/nvidia/os-interface.c`
+returns `NV_IS_SUSER() == capable(CAP_SYS_ADMIN)` at `nv-linux.h:537`,
+`capable(CAP_PERFMON)` at `os-interface.c:390`, and `capable(CAP_SYS_NICE)` at
+`os-interface.c:397`, and nothing else. **`CapBnd` is why no job can route around
+it**: a capability absent from the bounding set cannot be regained by `setcap`,
+by a setuid binary, or by re-execing, so this is container configuration and not
+job authorship. `thor:gpu0` reproduced the refusal itself on driver `595.78`
+(`LGC_RC=4`), so the refusal is measured on two boxes and two driver versions.
+`/proc/driver/nvidia/params` reads `RmProfilingAdminOnly: 1` in the lease, which
+governs PROFILING COUNTERS and is a different gate -- do not reach for an `NVreg`
+knob expecting `-lgc` to start working. The ask, the acceptance test that
+falsifies it, and the cost are in
+[`lease-gpu-capability.md`](specs/lease-gpu-capability.md).
+
+**Clock pinning DOES work from the leased HOST, and the pod path is still
+refused. Measured 2026-08-21.** Under an `rc hold` lease on `dgx:gpu0`, over
+`ssh` to the host, `sudo -n nvidia-smi -pm 1` then `-lgc 2100` held **0.29%**
+SM-clock spread over a ten-minute decode load (120 samples, min 2080, max 2086),
+against the 12.92%-26.36% the unpinned windows above recorded. **That path needs
+an authorization most rows do not have**: `.agents/developer-preferences.md`
+scopes `rc hold` plus `ssh` to the `BENCH-QWEN38-27B-SOTA` campaign and leaves
+the standing rule unchanged for every other row. So a ratio is derivable on that
+box by that path, and the pod path -- the only path for every other row -- still
+returns `LGC_RC=4`. Two caveats travel with the host path: persistence mode had
+to be enabled first, and it can be lost when the last GPU client detaches, so
+**verify the clock DURING the run and never only before it**; and the recorded
+`-lgc 2100` recipe is about 69% of this device's 3003 MHz maximum SM clock, which
+is right for a RATIO and wrong for an ABSOLUTE.
+
+**`nvidia-smi -pm 1` DOES work inside the pod, and it is a DIFFERENT knob from
+`-lgc`. Measured 2026-08-22 on `dgx:gpu0`.** The `SPEC-DFLASH2` speed gate (job
+`ec9cf6cd-0aaf-4323-806d-6a12da2bd08f`) found `persistence_mode: Disabled` when
+it opened, because the box had rebooted — `boot_id` moved from `db4ca4f3-...` to
+`302145bc-4c57-4f78-803c-f9d644a24b9d` — and a reboot resets the driver setting.
+The job ran `nvidia-smi -pm 1` INSIDE the lease, as a normal leased job with no
+`ssh` and no host access, and it SUCCEEDED: "Enabled persistence mode via daemon
+for GPU 0000000F:01:00.0." Both arms then sampled `persistence_mode: Enabled`.
+`-lgc` in the same job still returns 4, so this does not weaken #1354 and does
+not make clock pinning reachable; the two are separate driver operations and
+only one of them is refused.
+
+**Why this matters enough to write down: without it the lease produces
+NOTHING.** `gpu_clock_state.clock_reasons` appends a refusal for any record
+whose `persistence_mode` is not `Enabled`, so both arms of a two-hour paired
+measurement would have been discarded on a setting one command fixes. **Read
+persistence mode at the START of a leased measurement and set it if it is off**,
+rather than discovering it in the refusal. Evidence:
+`/mnt/nas_share/rc/dflash2-1673/out-n1673b/m-pm.log` and the `DEVICE STATE`
+paragraph of `/mnt/nas_share/rc/dflash2-1673/RUN-PROVENANCE.txt`.
+
+**A settle-and-hold procedure CAN reach the clock gate on this box, and what
+controls it is the window's REQUEST COUNT. Measured 2026-08-23 on `dgx:gpu0`.**
+Without any pin, a window holding **one** request of 1024 input and 950 output
+tokens cleared the 5% spread rule and the throttle rule together in 2 of 3
+attempts. A window holding **six** requests of 1024 input and 128 output tokens
+cleared them in 0 of 3. Each request carries one SM-clock excursion about 3.6 s
+after its own start, and the excursion carries a non-benign throttle bit with
+probability 0.476, so a window's chance of being clean falls as `(1-p)^requests`.
+Heat is not the discriminator: the labelled-sample rate is flat at 0.9-1.0 per
+minute over the last three quarters of the job, whose busy rows span 69 C to
+85 C.
+**No pairing was established**, because a pairing needs both arms clean and
+because that run never set persistence mode. Two traps travel with it. The job's
+own thermal summary printed every 63rd row and therefore showed 0 of the 34
+throttle-labelled rows, a 77 C maximum against the true 85 C and a 43.9 W
+maximum against the true 81.1 W, so read `thermal.csv` and never the summary
+printed from it. And a window shaped to satisfy the gate measures a different
+workload than the one a ratio owes. Evidence and derivation:
+[`specs/clock-gate-route.md`](specs/clock-gate-route.md) §The 2026-08-23 settle
+run, raw files at `/mnt/nas_share/rc/clk1354/out/settle-20260823T004328Z/`.
+
 **A model DOES run inside a lease.** The same series ran the pinned oracle
 `0.1.dev1+g555967922` as a server on a 52 GiB bf16 checkpoint from a lease, no
 `ssh` and no container image, and it served three clean benchmark legs. That
@@ -194,8 +279,12 @@ still unreachable is the image-based path SGLang used
 ([#1265](https://github.com/mudler/vllm.cpp/issues/1265)). A wheel route around
 it is specified by row `SGLANG-ORACLE-LEASE-WHEEL` in
 [`sglang-wheel-in-lease.md`](specs/sglang-wheel-in-lease.md), which needs no
-source build and no image. That route is specified and NOT run, so the SGLang
-oracle stays `gateable = no`.
+source build and no image. **That route RAN on 2026-08-23**: two `rc` jobs on
+`dgx:gpu0` installed the pinned wheels, asserted the installed tree against a
+3338-file manifest at `IDENTITY_RC=0`, served Qwen3.8-27B bf16 to readiness in
+454 s and completed a c1 leg with 6 of 6 requests, 0 errors and exactly 768
+output tokens. The SGLang oracle is `gateable = yes` again, on the wheel route
+and not on the image. The image path stays forbidden.
 
 **And one instrument rule, paid for in the same series.** A guard whose
 threshold sits inside the guarded configuration's own operating point
@@ -256,6 +345,30 @@ one of those names except the CUDA toolkit, and a job apt-installs `nvcc` from
 for staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`. **The
 `thor:gpu0` worker produces one as well**, because it is root and carries
 `apt-get` and `gcc`. That is the section below.
+
+**Checkpoints: stage NAS -> local ONCE through `scripts/rc-stage-checkpoint.sh`,
+never read a gate model off `/workspace`** (developer direction 2026-08-23,
+[#1807](https://github.com/mudler/vllm.cpp/issues/1807)). A 22 GB or 67 GB
+safetensors checkpoint read over CIFS pays the bandwidth on every shard every
+run, and the HF-cache layout cannot live on the share at all (no symlink). The
+gate checkpoints are staged under `/mnt/nas_share/rc/ckpt/<name>/` in HF
+`--local-dir` layout (plain files), which a lease sees as
+`/workspace/ckpt/<name>/`, each beside a `SHA256SUMS` manifest written once with
+`scripts/rc-stage-checkpoint.sh --make-manifest /mnt/nas_share/rc/ckpt/<name>`.
+A job then runs
+
+```sh
+scripts/rc-stage-checkpoint.sh /workspace/ckpt/<name> /tmp/ckpt/<name>
+export VT_QWEN36_SNAPSHOT=/tmp/ckpt/<name>   # or the gate's own override
+```
+
+and the copy is idempotent and verified: a second run with a complete local
+copy reads only the manifest and exits 0 (`ALREADY STAGED ... nothing read`),
+a killed copy resumes from the files that verified, a local file whose bytes
+differ is replaced, and a directory with no manifest is refused rather than
+trusted. Staged on the NAS this way: `qwen36-35b-a3b-nvfp4`
+(`nvidia/Qwen3.6-35B-A3B-NVFP4` @ `491c2f1ea524c639598bf8fa787a93fed5a6fbce`)
+and `qwen36-35b-a3b-bf16` (`Qwen/Qwen3.6-35B-A3B`), both for the 35B gates.
 
 **This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
 not close it.** The HOST venv at `~/venvs/vllm-oracle-pin-555967922` stays
@@ -370,6 +483,34 @@ which names the version and denies the toolkit in one line. **The `rc` worker
 container is REUSED between jobs**, so a repair inside a staging branch is
 skipped on the next run and reports `nvcc already in place`. Write an
 environment repair unconditionally, and assert its postcondition.
+
+### Two packages a DFlash2 oracle lease needs, and the lease variable that exists, measured 2026-08-22
+
+Measured on `dgx:gpu0` across leases `11cee02a`, `52ac5673` and `a03f34e4`
+([#1660](https://github.com/mudler/vllm.cpp/issues/1660)). This is the "install
+what you lack" instruction above, made specific for the one job that has paid
+for the gap.
+
+**`cuda-libraries-dev-13-0`, and the failure arrives 12 minutes late.**
+DFlash2's `compute_candidates` -> `_topk` -> `flashinfer.topk` JIT-compiles
+`topk.cu`, which includes `<curand.h>`. The `cuda-toolkit-13-0` metapackage does
+NOT install that header. Leg B died on it INSIDE `profile_run`, after a
+12-minute model load, and it presented as a model failure rather than as a
+missing header; leg C installed `cuda-libraries-dev-13-0` and got past it. A job
+that compiles CUDA therefore installs both, not just the metapackage.
+
+**`python3-dev`, and it lies about what failed.** Without it Triton's driver JIT
+fails, and the failure surfaces as
+`Model architectures ['Qwen3_5ForConditionalGeneration'] failed to be inspected`
+— which names the model and not the toolchain. The `thor:gpu0` staging recipe
+two sections above already installs it for the same reason.
+
+**`RC_LEASE_ID` DOES NOT EXIST on this fleet.** The leased worker carries
+`RC_DEVICE`, `RC_JOB_ID` and `RC_TOKEN`. A script that defaults a lease id from
+`$RC_LEASE_ID` therefore reads empty and refuses, which is what
+`scripts/dflash2-speed-gate.sh` did when the `## Owed` O26 recipe was run
+verbatim. Take `$RC_JOB_ID`. Read the variable off the worker rather than out of
+a document, including this one: the fleet is not ours and the names can change.
 
 ### The `flock` orphan hazard that motivated the replacement
 
@@ -608,208 +749,805 @@ environment:
   — NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, 14 CPU cores, ~122 GB
   UNIFIED memory. `nvidia-smi --query-gpu=compute_cap` returns **11.0**. Host of
   the first non-GB10 runtime proof (`CLAIM-CUDA-SM110-RUNTIME`, 2026-07-27).
-  - **REIMAGED, re-verified 2026-08-11.** The box is now hostname
-    **`kairos-4db2`** (Ubuntu 24.04 under Kairos), driver **595.78**, and there is
-    **NO host CUDA toolkit, no cmake, no nvcc, no huggingface_hub** — the JetPack
-    R38 / `/usr/local/cuda-13.0` profile described here before is GONE. **The GPU
-    is usable only from inside a container** (developer statement, confirmed on
-    box). There is also no `local-ai-worker` container and no `~/gpu.lock`; the
-    worker-restore discipline below does not apply in this state.
-  - **Working container recipe** (each element was required; all three failed
-    first):
-    - `docker` needs `sudo` (the user is in group `admin`, not `docker`).
-    - Use **`--runtime=nvidia`**, NOT `--gpus all`: the hook refuses the latter
-      outright ("invoking the NVIDIA Container Runtime Hook directly ... is not
-      supported").
-    - Add **`-e NVIDIA_DISABLE_REQUIRE=1`**. The image's `NVIDIA_REQUIRE_CUDA`
-      enumerates BOUNDED driver ranges topping out at `driver<576`, so driver
-      595.78 — which is NEWER and forward-compatible — reads as unsupported.
-    - Image already present: `nvidia/cuda:13.0.1-devel-ubuntu24.04` (nvcc
-      **13.0.88**). Install `cmake ninja-build` inside; build
-      `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=OFF`,
-      no cutlass (every sm_110 fast-path cell resolves EMPTY). **VERIFIED
-      2026-08-11: configure + build of `vllm-cli` both exit 0.**
-    - `nsys` from `nsight-systems-cli` in that image is **2024.2.3 and cannot
-      trace CUDA here** ("does not contain CUDA trace data"). Do not plan a
-      graph/kernel-count measurement on Thor without first installing a newer one.
-  - **★ PROVISIONED AS A BUILD-AND-TEST HOST, 2026-08-15**
-    (`dots3-note` W0.5, issue [#699](https://github.com/mudler/vllm.cpp/issues/699)).
-    The recipe below was executed end to end that day: toolchain, CUDA-ON build
-    for sm_110, a kernel that ran on the device, and a full `ctest` baseline.
-    Copy it rather than re-deriving it.
+  - **REIMAGED, re-verified 2026-08-11.** The box is hostname **`kairos-4db2`**
+    (Ubuntu 24.04 under Kairos), driver **595.78**, and there is **NO host CUDA
+    toolkit, no cmake, no nvcc, no huggingface_hub** — the JetPack R38 /
+    `/usr/local/cuda-13.0` profile described here before is GONE. **The GPU is
+    usable only from inside a container** (developer statement, confirmed on
+    box), and the leased `rc` worker IS that container. There is no
+    `local-ai-worker` container on the host; the worker-restore discipline below
+    does not apply in this state.
+  - **The hand-run `sudo -n docker` recipe that used to sit here is DELETED, not
+    demoted to an alternative, because this FILE ALREADY FORBIDS IT.** The
+    section that opens this document — "Reaching a GPU: claim a lease, never
+    `ssh`" — says to claim `thor:gpu0` with `rc run` or `rc hold` and never to
+    `ssh` to a GPU box to run work. The Thor profile then taught the opposite in
+    four places, so the document contradicted its own header, and a reader who
+    scrolled to the profile for a recipe was taught to break the rule they had
+    read twenty lines in. Bringing this section into line with its own file is
+    the whole of the change; `rc` is not a new local convention.
 
-    **Why a container and not a host toolchain.** `/` is a **read-only** 4.4 G
-    `ext2` loop (`/dev/loop0`, 1.3 G free) — `kairos-4db2` is an immutable
-    Kairos image, so `apt install` into `/` is not available at all. `/home` is
-    the only writable volume (918 G, ~362 G free). A `/home`-prefix CUDA
-    runfile install would work but would have to be re-derived after every
-    reimage; the container carries the whole toolchain in one pinned digest and
-    the NVIDIA container runtime injects the host driver, so it survives
-    reimages.
+    What the deleted recipe said, kept as history because it was measured and
+    true on 2026-08-11, and because a future host-side operator may need it:
+    `docker` needed `sudo` (the user is in group `admin`, not `docker`); the run
+    needed `--runtime=nvidia` and NOT `--gpus all`, because the hook refuses the
+    latter outright; and it needed `-e NVIDIA_DISABLE_REQUIRE=1`, because the
+    image's `NVIDIA_REQUIRE_CUDA` enumerates bounded driver ranges topping out
+    at `driver<576` while this box runs 595.78, which is newer and forward
+    compatible. None of that is a procedure to follow now. Take `thor:gpu0` with
+    `rc run`; the section below is the whole recipe.
+  - **"Every sm_110 fast-path cell resolves EMPTY" was wrong, and it mattered.**
+    Configure on `[110]` DISABLES `fp4-mma`, `cutlass-nvfp4`,
+    `cutlass-nvfp4-sm100`, `cutlass-fp8`, `scaledmm-c3x-sm90`,
+    `scaledmm-c3x-sm100` and `fa2`, and prints
+    `CUDA feature marlin-nvfp4: ENABLED for [110]`. Read live at `944d7d947` on
+    2026-08-22 and **re-read unchanged at `6756f9131` on 2026-08-23**
+    (`/mnt/nas_share/rc/thor-w05-955/out/configure.log:16-23`, all eight cells in
+    one place). Seven of eight is not eight, and the difference is the whole of
+    [#962](https://github.com/mudler/vllm.cpp/issues/962): a Marlin NVFP4 kernel
+    that disagrees with itself across block sizes ON THIS ARCH. The wrong line
+    makes a live kernel defect read as an absent feature, which is exactly
+    backwards. `.agents/backend-matrix.md` has said "FOUR of the five fast-path
+    cells resolve EMPTY; `marlin-nvfp4` resolves `ENABLED for [110]`" since
+    2026-08-11, so this line was already contradicted by another record.
+  - `nsys` from `nsight-systems-cli` in the `nvidia/cuda:13.0.1` image was
+    **2024.2.3 and could not trace CUDA here** ("does not contain CUDA trace
+    data"). That was a property of that image. In the leased worker `nsys` is
+    ABSENT altogether (measured 2026-08-22), so a graph or kernel-count
+    measurement on Thor still needs one installed, and still needs a newer one.
+  - **★ BUILD AND TEST IT INSIDE A LEASE — `rc run -d thor:gpu0`**
+    (`dots3-note` W0.5, issue
+    [#699](https://github.com/mudler/vllm.cpp/issues/699)). One job configures,
+    builds CUDA-ON for sm_110, runs kernels on the device and produces the
+    `ctest` baseline. Copy it rather than re-deriving it.
 
-    **1. Toolchain image.** Build it once from a 4-line Dockerfile pinned to the
-    base image *by digest* (not by tag — the `13.0.1` tag moves):
+    **This REPLACES the `ssh` + `sudo -n docker build` + `sudo -n docker run`
+    recipe W0.5 landed on 2026-08-15, and replaces it rather than joining it.**
+    Two things were wrong with that recipe, and only the first is a rule.
 
-    ```dockerfile
-    FROM nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92
-    ENV DEBIAN_FRONTEND=noninteractive
-    RUN apt-get update -qq \
-     && apt-get install -y -qq --no-install-recommends \
-          cmake ninja-build git python3 python3-dev ca-certificates \
-     && rm -rf /var/lib/apt/lists/*
-    ```
+    It reached a fleet device outside its lease. `thor:gpu0` is in the fleet, so
+    a job that arrives by `ssh` makes `rc` report the box FREE while a build is
+    on it — and this file's own opening section already said not to do that. The
+    contradiction was internal, not a matter of taste: a reader who took the
+    header seriously and a reader who scrolled to this profile for a recipe were
+    given opposite instructions.
 
-    That digest is `nvidia/cuda:13.0.1-devel-ubuntu24.04` as resolved on Thor on
-    2026-08-15. `sudo -n docker build -t vllmcpp-thor:cuda13.0.1 .` (docker
-    needs `sudo`; the user is in group `admin`, not `docker`). Inside:
-    **nvcc 13.0.88, cmake 3.28.3, ninja 1.11.1, python 3.12.3**. A live copy of
-    the Dockerfile and the three driver scripts sits in `/home/mudler/thor-w05/`
-    on the box; the repo is the authority if they disagree.
+    And the digest-pinned image was never needed — though NOT for the reason an
+    earlier draft of this section gave. It claimed the leased worker already
+    supplies everything the image did, **and for the CUDA toolkit that is
+    FALSE**; see "The toolkit is not in the image" below. The image is
+    unnecessary because a job installs the toolkit itself in one step, which is
+    what `dgx:gpu0` jobs already do
+    ([#1213](https://github.com/mudler/vllm.cpp/issues/1213)), not because the
+    toolkit is waiting there.
 
-    **2. Every container invocation needs the same three flags:**
-    `--runtime=nvidia` (NOT `--gpus all`), `-e NVIDIA_DISABLE_REQUIRE=1`, and
-    `sudo -n`. The pre-existing `/home/mudler/_build_thor.sh` says the runtime
-    "REFUSES this image on its driver" and therefore omits `--runtime`; that is
-    **wrong, and it is wrong only because it also omits
-    `NVIDIA_DISABLE_REQUIRE=1`**. With the flag, `cudaGetDeviceCount` returns 1,
-    `cudaGetDeviceProperties` reports `NVIDIA Thor sm_110`, and a hand-written
-    `nvcc -arch=sm_110` kernel launches and returns correct values.
+    What the worker DOES supply, measured 2026-08-22 in `rc run -d thor:gpu0` job
+    `55810add-082e-461b-828b-b7cfe4dbb645` (log and artifacts under
+    `/mnt/nas_share/rc/thor-w05-repair/`, which the worker sees as
+    `/workspace/thor-w05-repair/`):
 
-    **3. Source transfer.** `git archive --format=tar HEAD` from the dev box,
-    `scp`, untar into a FRESH directory under `/home` (never rsync — see
-    [[dgx-transfer-git-archive-not-rsync]]). Record the base SHA beside it.
+    | | |
+    |---|---|
+    | user | `uid=0(root) gid=0(root)` in the k3s pod `rc-worker-<id>`, 14 CPUs, aarch64 |
+    | present | `bash sh git curl wget gcc/g++ 13.3.0 make cmake 3.28.3 ninja 1.11.1 pkg-config python3 3.12.3 pip flock` — this list is exactly what was probed, and `readelf`/`objdump` were NOT among them |
+    | `nvcc` | **NOT part of the image. Install it.** Both of this lane's jobs happened to find `/usr/local/cuda-13.0` and nvcc 13.0.88 already there, and that was another job's leftover — see below |
+    | ABSENT | **`shellcheck`**, **`cuobjdump`**, **`nsys`**, `sudo`, `docker` — and `cuobjdump` stays absent after the `PATH` prepend, which matters below |
+    | `nvidia-smi` | plain, no `sudo`, **exit 0 with ZERO bytes on stderr**, reporting `NVIDIA Thor`, driver 595.78, `compute_cap 11.0` |
+    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` sees, and `/mnt/nas_share/rc` on the devbox. NOT shared with `orin`. `rc` copies nothing for you |
+    | `/tmp` | the worker's own overlay, 918 G — but it was **94% used with 58 G free** on 2026-08-22. Read "Disk is shared" below before you build |
+    | swap | **30.7 G of `zram`** (`/dev/zram0`, PRIO 100), with `vm.overcommit_memory=1`. Compressed RAM, not a backing store — see the reboot warning below |
+    | reuse | **the container is REUSED between jobs**, so `/tmp` carries other jobs' trees and your own from last week |
 
-    **4. Configure and build** (bind-mount the checkout, no GPU needed to
-    compile but the flags are harmless):
+    **★ The toolkit is not in the image, and BOTH of this lane's jobs were
+    fooled by leftover state.** The `rc describe thor:gpu0` usage sheet says it
+    plainly: *"There is no CUDA toolkit (no `nvcc`). The driver is injected and
+    `nvidia-smi` works, but compiling CUDA needs the toolkit — install it, or
+    keep the build on the host."* The worker container is LONG-LIVED, so one
+    job's `apt-get` is still sitting there for the next job, and the
+    `leasing-a-gpu` skill warns about exactly that leak.
+
+    The chain is visible inside this file. The 2026-08-19 job ran in pod
+    `rc-worker-hqfj4` and found nvcc 13.0.88 already present. The pod was then
+    recreated — the `#1380` note further down records that the NEXT worker,
+    `rc-worker-m4d7t`, had lost `/tmp` **and `/usr/local/cuda-13.0`, "so the job
+    had to `apt-get` the toolkit again"**. The 2026-08-22 job then ran in
+    `rc-worker-m4d7t` and found the toolkit present. It was present because that
+    other job had just installed it. Neither observation is a property of the
+    image, and the pod has since been recreated again by `worker_lost`, so
+    neither is true now.
+
+    **So install it as a step and assert the postcondition.** Never write a
+    recipe whose first requirement is that somebody else ran a job on the same
+    pod first. This is the same shape as the `shellcheck` defect this section
+    already documents: a recipe that works only because of undocumented state on
+    the box, which the next reader cannot reproduce.
+
+    **Probe it with `command -v` and an explicit else-branch, never with
+    `tool --version | tail -1`.** `nvcc --version 2>/dev/null | tail -1 || echo absent`
+    prints nothing and exits 0 when `nvcc` is missing, because `tail` succeeds on
+    empty input and the `||` never fires. That reads as "present but quiet" and
+    it nearly put a false line in this table.
+
+    **1. Stage the tree where the worker can see it.** `rc` copies nothing.
 
     ```sh
-    sudo -n docker run --rm --runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1 \
-      -v "$SRC":/src -w /src vllmcpp-thor:cuda13.0.1 \
-      cmake -S /src -B /src/build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
-    sudo -n docker run --rm --runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1 \
-      -e CMAKE_BUILD_PARALLEL_LEVEL=4 -v "$SRC":/src -w /src \
-      vllmcpp-thor:cuda13.0.1 cmake --build /src/build-cuda -j 4
+    # WHERE THE SHARE IS MOUNTED DEPENDS ON THE HOST YOU TYPE THIS ON.
+    # On the devbox it is /mnt/nas_share/rc; on the dgx HOST that path is GONE
+    # and the share is /usr/local/nas_share/rc (see the DGX profile). Resolve it,
+    # never assume it -- staging to a stale path silently stages nothing, and the
+    # job then fails for a reason that looks unrelated.
+    for c in /mnt/nas_share/rc /usr/local/nas_share/rc; do [ -d "$c" ] && NAS=$c && break; done
+    test -n "${NAS:-}" || { echo "FATAL: no NAS mount on this host"; exit 96; }
+    D=$NAS/<your-dir>                       # the worker always sees this as /workspace/<your-dir>
+    mkdir -p "$D"
+    git rev-parse HEAD > "$D/BASE_SHA"      # a baseline with no SHA beside it is not a baseline
+    git archive --format=tar HEAD | gzip -1 > "$D/src.tar.gz"
     ```
 
-    **`-j4` is deliberate** — see the overcommit warning below. 1460/1460
-    targets in **~20 minutes** at `-j4`, peak host memory ~6 GB of 122 GB, so
-    the conservative setting costs almost nothing here.
+    A `git clone` inside the worker also works — it has `git` and egress, and
+    other rows use it — but only for a branch you have pushed. The archive is how
+    you test a tree that is not on the remote.
 
-    **5. Prove the build is really a CUDA build, because a silent CPU fallback
-    is the failure mode.** Three independent checks, all measured 2026-08-15:
-    - configure prints `CUDA target architectures: 110` and finds
-      `/usr/local/cuda/bin/nvcc` (NVIDIA 13.0.88);
-    - **30 `*.cu.o` objects** are compiled and every one of them contains
-      exactly one cubin, `sm_110` —
-      `for f in $(find build-cuda -name '*.cu.o'); do cuobjdump --list-elf $f; done | grep -o 'sm_[0-9]*' | sort | uniq -c`
-      reads `30 sm_110`. 30 of the tree's 53 `.cu` files is CORRECT, not a
-      partial build: configure says `feature TUs narrowed by
-      VT_CUDA_FEATURE_TABLE`, and on sm_110 `fa2`, `cutlass-nvfp4`,
-      `cutlass-nvfp4-sm100`, `cutlass-fp8`, `scaledmm-c3x-sm90`,
-      `scaledmm-c3x-sm100` and `fp4-mma` all resolve DISABLED. Only
-      `marlin-nvfp4` is ENABLED for `[110]`. CUTLASS is absent and supplying it
-      would change nothing — the cells are arch-gated, not CUTLASS-gated.
-    - `ldd build-cuda/libvllm.so` resolves `libcudart.so.13` and
-      `libcublasLt.so.13`.
+    **2. Submit one bounded job, and NAME the device.**
 
-    **6. Runtime proof, on the device.** `./tests/test_cuda_backend` under
-    `--runtime=nvidia` reports `CUDA compute capability: sm_110` and
-    `pageable=1 integrated=1 UnifiedMemory=true`, 6/6 cases and 25/25
-    assertions. `test_cuda_ops` executes the op kernels themselves.
+    ```sh
+    rc run -d thor:gpu0 --max-runtime 120m \
+      -- bash /workspace/<your-dir>/run.sh      # the job prints a heartbeat; see below
+    ```
 
-    **7. `nvidia-smi` on the host** works under `sudo -n` and only under it —
-    unprivileged it dies with `NvRmMemInitNvmap failed: error Permission
-    denied`, which is a PRIVILEGE problem and was previously mis-recorded as a
-    broken driver. Its memory columns read `[N/A]`: this is an integrated GPU
-    with no separate VRAM counters, the same shape as
+    Name it rather than selecting on `class=train`, which also matches `dgx:gpu0`
+    and `orin:gpu0` and neither of those is sm_110; `gpu_model=NVIDIA-Thor` is
+    the only selector that means this box. Naming queues you behind whoever holds
+    it, which is the lease working. Never select on `vram` — it reads `[N/A]`
+    here and matches nothing.
+
+    **`--idle-timeout` counts the job's OWN stdout, and a build that logs to a
+    file is silent for its whole duration.** A `cmake --build` redirected into a
+    log prints nothing for twenty minutes, and the idle killer does not care why.
+
+    **Print a heartbeat. That is the remedy that was actually proven here, and
+    `--idle-timeout 0` is NOT a second way to do the same thing.**
+    `rc run --help` reads
+    `--idle-timeout duration   kill the job if it produces no output for this long (0 = device default)`,
+    so zero selects the DEVICE DEFAULT rather than disabling the kill. An earlier
+    draft of this section prescribed `--idle-timeout 0` as the fix, which would
+    hand a future agent a long quiet build and a false belief that it is
+    protected. A one-line background loop is the whole of it:
+
+    ```sh
+    ( while true; do sleep 60; echo "### hb $(date -u +%H:%M:%S)"; done ) &
+    HB=$!
+    # ... the quiet work ...
+    kill "$HB" 2>/dev/null; wait "$HB" 2>/dev/null
+    ```
+
+    The margin this closes is not theoretical. The 2026-08-19 run built for
+    22 min 44 s in silence against `--idle-timeout 25m` and survived with about
+    two minutes to spare. **`--max-runtime` is the bound that matters and it is
+    not optional**; the heartbeat is what stops the idle killer from firing
+    inside it.
+
+    **3. What the job does.**
+
+    **This script is the whole recipe, including the disk discipline the prose
+    below mandates.** An earlier draft printed a shorter version and left the
+    disk rules to the prose; "copy it rather than re-deriving it" means the
+    script is what actually gets run, so a guard that lives only in a paragraph
+    is a guard nobody executes.
+
+    ```sh
+    #!/bin/bash
+    set -u
+    SRC=/tmp/src
+    # NEED_GB is no longer a guess, and it is deliberately NOT set to the
+    # measured figure. A finished tree + build-cuda is 25 GiB (`du -sh /tmp/src`
+    # at 6756f9131, 2026-08-23; /tmp went 116 G -> 92 G across that job). 60
+    # keeps a ~2.4x margin for the other lanes' trees that share this
+    # reused overlay, which is the thing that actually varies. The other data
+    # points: a build that COMPLETED with 154 G free (2026-08-19), one that did
+    # NOT complete with 58 G free (2026-08-22, worker lost, so disk is a
+    # hypothesis rather than a proven cause), and one that COMPLETED with 116 G
+    # free (2026-08-23).
+    NEED_GB=${NEED_GB:-60}
+    free_gb() { df -BG --output=avail /tmp | tail -1 | tr -dc '0-9'; }
+
+    # --- clean up on ANY exit, including the kill. A job that dies holding its
+    # --- tree is what took this box out of the pool.
+    cleanup() { rm -rf "$SRC"; kill "${HB:-}" 2>/dev/null; wait "${HB:-}" 2>/dev/null; }
+    trap cleanup EXIT INT TERM
+
+    ( while true; do sleep 60; echo "### hb $(date -u +%H:%M:%S) disk=$(free_gb)G"; done ) &
+    HB=$!
+
+    # --- DISK, before anything else. The container is REUSED, so other jobs'
+    # --- trees are still here and the free space is shared with them.
+    df -h /tmp
+    du -sh /tmp/* 2>/dev/null | sort -rh | head -10
+    rm -rf /tmp/src /tmp/thor-w05-src*          # reclaim this lane's old trees, not just mine
+    if [ "$(free_gb)" -lt "$NEED_GB" ]; then
+      echo "REFUSING: /tmp has $(free_gb) GiB free, below the NEED_GB=${NEED_GB} floor."
+      echo "The floor is MEASURED, not a placeholder: a finished tree + build-cuda"
+      echo "is 25 GiB (6756f9131, 2026-08-23). 60 is a deliberate ~2.4x margin for"
+      echo "the other lanes' trees that share this REUSED overlay -- that is what"
+      echo "varies, not the build. Reclaim space before lowering NEED_GB."
+      echo "A CUDA build that runs out of space fails as unrelated compile errors."
+      exit 95
+    fi
+
+    # --- The CUDA toolkit is NOT in the worker image. Install it UNCONDITIONALLY.
+    # --- `command -v nvcc` is NOT a sufficient precondition: a partial leftover
+    # --- puts nvcc on PATH while `include`/`lib64` are missing, and CMake then
+    # --- dies with "Could NOT find CUDA (missing: CUDA_INCLUDE_DIRS
+    # --- CUDA_CUDART_LIBRARY)", which names the version and denies the toolkit
+    # --- in one line. apt-get is idempotent, so paying it every run costs
+    # --- seconds and removes the whole class.
+    # `cuda-toolkit-13-0` is NOT in Ubuntu's own archive. Add NVIDIA's repo
+    # first, or the install fails to resolve on a freshly recreated pod -- and
+    # succeeds on a pod where some earlier job already added it, which is the
+    # same leftover-state trap in a second guise.
+    apt-get update -qq
+    apt-get install -y -qq wget ca-certificates gnupg
+    wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb -O /tmp/ck.deb
+    dpkg -i /tmp/ck.deb
+    apt-get update -qq
+    apt-get install -y -qq cuda-toolkit-13-0
+    export PATH=/usr/local/cuda/bin:$PATH
+    CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+
+    # --- Assert the POSTCONDITION the build actually needs, not the binary.
+    command -v nvcc >/dev/null   || { echo "FATAL: no nvcc after install"; exit 90; }
+    test -f "$CUDA_HOME/include/cuda_runtime.h" \
+      || { echo "FATAL: nvcc present but no cuda_runtime.h under $CUDA_HOME"; exit 90; }
+    ls "$CUDA_HOME"/targets/*/lib/libcudart.so* >/dev/null 2>&1 \
+      || ls "$CUDA_HOME"/lib64/libcudart.so*    >/dev/null 2>&1 \
+      || { echo "FATAL: no libcudart under $CUDA_HOME"; exit 90; }
+    nvcc --version | tail -2                    # record WHICH toolkit built this
+
+    # --- the cubin reader, installed unconditionally and asserted with an
+    # --- explicit else-branch. An absent cuobjdump piped into `grep -o` looks
+    # --- exactly like a clean empty histogram; that is how 2026-08-19 recorded
+    # --- an empty one without noticing.
+    apt-get install -y -qq cuda-cuobjdump-13-0
+    if command -v cuobjdump >/dev/null; then CUOBJ=1; else
+      CUOBJ=0; echo "### cuobjdump ABSENT after install -- cubin proof stays OWED"
+    fi
+
+    mkdir -p "$SRC"
+    tar -xzf /workspace/<your-dir>/src.tar.gz -C "$SRC"
+    test -f "$SRC/CMakeLists.txt" || { echo "FATAL: untar"; exit 92; }
+
+    cmake -S "$SRC" -B "$SRC/build-cuda" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+    cmake --build "$SRC/build-cuda" -j 4
+
+    # --- PROVE it is a CUDA build before you believe any test result.
+    ldd "$SRC/build-cuda/libvllm.so" | grep -Ei 'cudart|cublas'
+    find "$SRC/build-cuda" -name '*.cu.o' | wc -l          # the DENOMINATOR
+    if [ "$CUOBJ" -eq 1 ]; then
+      for o in $(find "$SRC/build-cuda" -name '*.cu.o'); do
+        echo "== $o"; cuobjdump --list-elf "$o"
+      done > /tmp/cubin.log 2>&1
+      grep -o 'sm_[0-9]*' /tmp/cubin.log | sort | uniq -c  # expect N sm_110
+      echo "objects scanned: $(grep -c '^== ' /tmp/cubin.log)"
+    fi
+    ( cd "$SRC/build-cuda" && ./tests/test_cuda_backend )
+
+    ( cd "$SRC/build-cuda" && ctest -j1 --timeout 1800 --output-on-failure )
+
+    # --- MEASURE what this actually cost. 25 GiB at 6756f9131; re-read it
+    # --- rather than trusting that, because the tree grows.
+    du -sh "$SRC" "$SRC/build-cuda"
+    echo "### /tmp free at end: $(free_gb) GiB"
+    # cleanup() removes $SRC on the way out, on success AND on the kill path.
+    ```
+
+    **`cuda-toolkit-13-0` is the package, and a bare `cuda-nvcc-13-0` is NOT a
+    usable fallback.** An earlier draft of this script fell back to it when the
+    full toolkit failed, and that fallback is worse than no fallback: it
+    satisfies `command -v nvcc`, so the guard passes, and then
+    `CMakeLists.txt:1717` runs `find_package(CUDAToolkit REQUIRED)` and `:1719`
+    links `CUDA::cudart CUDA::cublasLt`, neither of which a compiler-only package
+    supplies. The build dies at configure with the same misleading
+    missing-CUDA line as a partial leftover. This build's own `ldd` resolves
+    `libcudart.so.13` and `libcublasLt.so.13`, so those are requirements and not
+    conveniences. If you must install a minimal set rather than the metapackage,
+    it is `cuda-nvcc-13-0 cuda-cudart-dev-13-0 libcublas-dev-13-0` — and the
+    postcondition assertions above are what tell you whether you got it right.
+
+    **The `sbsa` path in that keyring URL is the aarch64 one**, and it is what
+    both this box and `dgx` need; an `x86_64` URL resolves and then installs
+    nothing usable here. The concurrent `gate-fp8-thorbuild` job took the same
+    route on 2026-08-22 and its configure reported
+    `The CUDA compiler identification is NVIDIA 13.0.88` at
+    `/usr/local/cuda-13.0/bin/nvcc`, which is independent corroboration of both
+    the package and the version.
+
+    **cuRAND is NOT among the requirements**, in case a reader reaches for it:
+    `grep -rn curand src include CMakeLists.txt cmake` returns nothing, so this
+    tree never uses it. The `curand` mention elsewhere in this file belongs to
+    DFlash2's flashinfer JIT on `dgx`, which is a different lane.
+
+    Build in `/tmp` or `/root`, never on `/workspace`: the share is CIFS with
+    `nounix`, so it stores no symlink and presents no exec bit, and `chmod +x`
+    there fails with `Operation not permitted`. Write every environment repair
+    UNCONDITIONALLY and assert its postcondition, because the container is reused
+    and a conditional repair is skipped on the second job and then reports
+    success. Copy what you want to keep back to `/workspace`.
+
+    **★ Disk is shared, and getting this wrong took the box out of the pool.**
+    A run on 2026-08-22 wiped only its own tree, left an earlier tree of this
+    same lane in place, and built on an overlay that was already 94% used with
+    58 G free. Partway through the build `thor:gpu0` went
+    `unhealthy (no contact)` with `out of the pool: worker_lost`, and the job
+    died at SIGTERM. Host memory was NOT the cause — the sampler read 116 GiB
+    available one minute before contact was lost, so this is not the
+    overcommit-collapse signature below. **`worker_lost` did not self-heal
+    QUICKLY, and it did eventually clear.** The device still read
+    `unhealthy (no contact 2h38m)` two and a half hours later; by 2026-08-22 it
+    was `ready` again with `disk_free_bytes` back to about 123 GiB. Do not clear
+    a quarantined device yourself — that needs an admin token and is a human's
+    call — and do plan for hours rather than minutes, because there is no second
+    sm_110 device to fall back to and an sm_110 gate simply stops meanwhile. **Report free space, reclaim every tree
+    the lane has left behind rather than only your own, refuse rather than build
+    into a nearly full disk, and remove your tree when you finish.** A CUDA build
+    that runs out of space surfaces as unrelated compile errors, which is the
+    [[enospc-makes-checkers-emit-false-policy-refusals]] shape.
+
+    No CUTLASS directory is passed, and that is correct rather than lazy: every
+    CUTLASS-dependent cell is arch-gated off for `[110]`, so supplying CUTLASS
+    changes nothing here. `-DVLLM_CPP_TRITON=OFF` is deliberate — the vendored
+    Triton-AOT path has never been built for sm_110, and turning it on is a
+    separate measurement rather than a default.
+
+    **4. Prove the build is really a CUDA build, because a silent CPU fallback
+    is the failure mode this exercise exists to catch.** Configure at
+    `6756f9131` on 2026-08-23 prints `CUDA target architectures: 110` and
+    resolves `/usr/local/cuda/bin/nvcc` (NVIDIA 13.0.88), and that build's
+    `ldd build-cuda/libvllm.so` resolves `libcudart.so.13` and
+    `libcublasLt.so.13` out of `/usr/local/cuda-13.0/targets/sbsa-linux/lib`,
+    over **33** `*.cu.o` objects. It read 32 objects at `0764ded2b`; the count
+    moves with the tree and is not a constant to assert.
+
+    **The cubin check is no longer owed. It was RUN, with the reader present and
+    asserted, and it reads 33 objects and 33 `sm_110` cubins — one each.**
+    Measured 2026-08-23 at `6756f9131`
+    (`/mnt/nas_share/rc/thor-w05-955/out/cubin.log`, histogram in
+    `cubin-histogram.txt`): `cuobjdump --list-elf` over every `*.cu.o` yields
+    `33 sm_110` and nothing else, over `33` objects scanned. That retires the
+    unverified 2026-08-15 claim of "30 objects, one `sm_110` cubin each" — the
+    shape was right and the count was stale.
+
+    **Keep the two guards that made it trustworthy, because the absent-reader
+    trap is what cost the earlier readings.** `cuobjdump` was recorded ABSENT on
+    2026-08-22 even after prepending `/usr/local/cuda/bin`, and an absent tool
+    piped into `grep -o` with stderr discarded looks exactly like a clean empty
+    result — which is how a run on 2026-08-19 recorded an empty histogram
+    without noticing. So: **`apt-get install -y cuda-cuobjdump-13-0`
+    unconditionally, `command -v cuobjdump` with an explicit else-branch, and
+    COUNT the objects you scanned beside the histogram.** A histogram with no
+    denominator cannot tell "33 of 33" from "33 of 300".
+    **What is still unresolved is WHY it was absent before.** This job found it
+    at `/usr/local/cuda/bin/cuobjdump` after an `apt-get` that produced no output
+    under `-qq`, on a pod whose CUDA toolkit was already installed by an earlier
+    job, so whether the explicit install supplied it or the leftover toolkit did
+    cannot be separated from this log. The step is what makes it reproducible
+    either way; do not read this run as evidence that the metapackage always
+    carries it.
+
+    **5. Runtime proof, on the device.** At `6756f9131`,
+    `./tests/test_cuda_backend` reported `CUDA compute capability: sm_110`,
+    `pageable=1 integrated=1 UnifiedMemory=true` and
+    `DeviceMemoryIsHostAddressable=false`, **7/7 cases, 26/26 assertions,
+    exit 0** (`out/test_cuda_backend.log`). It read 6/6 and 25/25 at
+    `0764ded2b`; the suite grew a case.
+
+    **`UnifiedMemory=true` with `DeviceMemoryIsHostAddressable=false` is the
+    pair that matters, and it is the axis two of this baseline's entries turn
+    on** — see the FP8 rows in the table below. Unified memory does not imply
+    the host can dereference a device pointer, and on this box it cannot.
+
+    A hand-written `nvcc -arch=sm_110` kernel also compiles and runs in the
+    worker: `kernel_returned=1234 err=no error`, exit 0 (measured `0764ded2b`,
+    not re-run here).
+
+    **6. Parallelism, and what is actually measured.** Build at **`-j 4`**, run
+    `ctest` at **`-j 1`**.
+
+    `ctest -j1` is not caution; it is the same rule the GB10 profile above
+    states, for the same reason. Memory here is UNIFIED, so a model gate's
+    `gpu_memory_utilization` reservation is HOST RAM, concurrent gates stack into
+    the same ~122 GB, and this box reboots rather than OOM-kills. Serial costs
+    **632.35 s** for 598 tests at `6756f9131` (it was 419.97 s for 553 at
+    `0764ded2b`), so there is nothing to buy by stacking them, and
+    it means the shipped baseline IS a `-j1` reading rather than a `-j4` reading
+    with a separate `-j1` re-run asserted beside it.
+
+    **The two numbers the earlier record used to justify `-j4` are corrected
+    here.** It claimed "all 14 reproduced at `-j1`" and "peak host memory ~6 GB
+    of 122 GB". The `-j1` claim's artifact
+    ([#955](https://github.com/mudler/vllm.cpp/issues/955) cites
+    `/home/mudler/thor-w05/ctest-j1-rerun.log`) is on the Thor HOST, which a
+    lease cannot read, so it can no longer be checked; the ~6 GB figure had no
+    artifact at all. Re-measured with a 2-second `MemAvailable` sampler beside
+    the job:
+
+    | Phase | `MemAvailable` min | max | own footprint |
+    |---|---|---|---|
+    | build `-j4`, 1364 s (`0764ded2b`) | 114.3 GiB | 117.8 GiB | ~3.5 GiB |
+    | `ctest -j1`, 420 s (`0764ded2b`) | 111.2 GiB | 118.6 GiB | ~7.4 GiB |
+    | whole job, build + `ctest`, 2338 s (`6756f9131`) | 111.4 GiB | 118.8 GiB | ~7.4 GiB |
+
+    The `6756f9131` row is one sampler across both phases rather than two, so it
+    bounds the run without splitting it; its min matches the earlier `ctest`
+    min to a tenth of a GiB, which is the corroboration that matters. Artifact
+    `/mnt/nas_share/rc/thor-w05-955/out/memsample.txt`.
+
+    Neither phase goes near the wall, so `-j4` for the build is cheap and now has
+    an artifact.
+
+    **Disk cost is measured now, so `NEED_GB` need not stay a guess.** At
+    `6756f9131` the extracted tree plus a completed `build-cuda` is **25 GiB**
+    (`du -sh /tmp/src`), and `/tmp` went from **116 GiB free to 92 GiB** across
+    the job — a 24 GiB delta that agrees with the `du`. The `NEED_GB=60` floor
+    in the script is therefore conservative by better than a factor of two, and
+    the honest thing is to say so rather than to lower it silently: 60 leaves
+    room for the other lanes' trees that share this overlay, and it refused
+    nothing on a box that had 116 GiB. **That is a statement about a BUILD and a unit suite and it
+    transfers to nothing else** — a model load here is what took the box down
+    three times, and the whole-tree build that correlates with a later
+    `unknown (no contact)` on this device is
+    [#1380](https://github.com/mudler/vllm.cpp/issues/1380), recorded further down this same profile.
+
+    **7. `nvidia-smi`, corrected.** The earlier record said it "dies"
+    unprivileged with `NvRmMemInitNvmap failed: error Permission denied`, works
+    only under `sudo -n`, and reads `[N/A]` in its memory columns. Three
+    corrections, with different provenance, so read which is which.
+
+    **Measured here, in the lease:** it runs with no `sudo`, **exit 0 and ZERO
+    bytes on stderr** — not one `NvRm` line — reporting `NVIDIA Thor`, driver
+    595.78, CUDA 13.2. Inside a leased worker there is no privilege problem to
+    work around at all.
+
+    **Reported by the developer from the HOST, and deliberately NOT re-measured
+    here, because doing so needs the `ssh` this recipe refuses to take:** an
+    unprivileged host call also exits 0 and prints the table, with the `NvRm`
+    lines going to STDERR beside a successful report. On that reading, "it
+    refuses" was stderr being taken for a verdict.
+
+    **The memory field has two spellings, both in the same job's output:** the
+    table column reads `Not Supported`, while
+    `--query-gpu=memory.total,memory.used --format=csv` reads `[N/A]`. Either way
+    this is an integrated GPU with no separate VRAM counters, the same shape as
     [[gb10-has-no-dram-counters-ncu-memory-pct-is-a-lie]]. Do not build a
-    memory-headroom check on `nvidia-smi` here; read `free -g` instead.
+    memory-headroom check on `nvidia-smi` here; read `free -g` or
+    `/proc/meminfo`, which is what the sampler above does.
 
-    **`~/gpu.lock` EXISTS again** (the 2026-08-11 line above saying it does not
-    is stale). Wrap GPU work as
-    `flock /home/mudler/gpu.lock -c '<docker run ...>'`. A host `./local-ai
-    worker` process is also back and was running throughout this baseline; it
-    was idle and did not perturb it, but stop it before any measurement.
+    **The `flock ${GPU_LOCK}` wrapper this section used to prescribe is gone
+    with the `ssh` recipe.** On a fleet device the LEASE is the mutex — `rc`
+    hands the whole device to one job. The file mutex is for a GPU that is not a
+    fleet device, and taking one over `ssh` while another session holds the box
+    through `rc` is precisely the two-mutex collision recorded at the top of this
+    file, which already retained a speed axis as VOID.
 
-    **8. `ctest` BASELINE — `2daa3287f`, 2026-08-15, `ctest -j4 --timeout 1800`
-    inside the image above, 103.35 s wall:**
+    **8. `ctest` BASELINE — `6756f9131`, 2026-08-23, `ctest -j1 --timeout 1800
+    --output-on-failure` inside an `rc run -d thor:gpu0` lease, 632.35 s wall:**
 
     ```text
-    485 tests: 468 passed | 2 skipped | 15 FAILED
+    598 tests: 573 passed | 3 skipped | 22 FAILED
     ```
 
-    Skipped: `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e`,
-    both for an absent checkpoint. Reproduce with
-    `/home/mudler/thor-w05/ctest.sh`. These are the sm_110 baseline and are NOT
-    to be "fixed" by a row that merely builds here; **a row is a regression on
-    Thor only if it lengthens this list.** Recorded as
+    **Artifacts, because this section indicts earlier records for citing none.**
+    Job `8bf39567-9334-4f7e-aa27-43a2aa867bb7` on `thor:gpu0`, pod
+    `rc-worker-kk96r`, written to `/mnt/nas_share/rc/thor-w05-955/out/` (the
+    worker sees it as `/workspace/thor-w05-955/out/`): `ctest-j1.log` carries
+    every failure with `--output-on-failure`, `failures.txt` is the
+    `(name, mode)` list, `ctest-N.log` the 598-test enumeration, `build.log`
+    (`-j4`, 1643 s, exit 0), `configure.log`, `ldd.log`, `cu_o_count.txt`,
+    `cubin.log` + `cubin-histogram.txt` (the cubin proof), `test_cuda_backend.log`,
+    `memsample.txt` (2 s `MemAvailable`), and `ctest-shellcheck.log` — the
+    single-test re-run after installing `shellcheck`, which is a CONTROL here
+    rather than a fix; see below. `run.sh` is the exact script that produced all
+    of it and `rc-job-stdout.log` the whole job's stdout, both copied in beside
+    the outputs so the recipe and the readings cannot drift apart. `BASE_SHA`
+    and `src.tar.gz` in the parent directory are the
+    staged input. **This is scratch on a shared NAS and may be reaped**, which is
+    a reason to quote the numbers here as well as the paths, not a reason to omit
+    the paths.
+
+    The previous baseline was `0764ded2b`, 2026-08-19, **553 tests, 534 passed /
+    3 skipped / 16 red**, 419.97 s, job `1b2512f0-0a43-44cb-b4a4-b54c22b59bd9`
+    under `/mnt/nas_share/rc/thor-w05-repair/out/`. Its numbers are kept here
+    only as the far side of the diff below.
+
+    **The 22 FAILED tests in the table below are the sm_110 baseline, and are NOT
+    to be "fixed" by a row that merely builds here.**
+
+    Separately, three tests are Skipped for an absent checkpoint, unchanged
+    across both runs: `test_modelopt_mixed_precision_checkpoint`,
+    `test_voxtral_e2e`, `test_qwen35_paged_engine`. They are not part of the 22,
+    and `Skipped` ranks BELOW `Failed` — see the mode ranking below.
+
+    **★ ZERO SEGFAULTS. Every one of the 22 is mode `Failed`.** All three crashes
+    the previous baseline recorded are gone, and none of them was replaced by a
+    worse mode elsewhere. That is the single largest movement this lane has seen,
+    and the mechanism is named below.
+
+    **The gate is `(name, failure mode)` PAIRS. A row regresses on Thor when it
+    adds a NAME, or when it changes a recorded MODE FOR THE WORSE.** Counting
+    names is provably too
+    weak, and this baseline's own history is the proof: between `5a0ffe9e3` and
+    `2daa3287f` five tests went `Failed` → `SEGFAULT` with no name change, and
+    the list lengthened by one only because the same upstream change also shipped
+    a new test file — so a name-counting gate would have scored
+    [#960](https://github.com/mudler/vllm.cpp/issues/960) GREEN on five of the
+    six crashes it introduced. The Mode column is part of the baseline, not
+    decoration, and it costs no extra measurement because `ctest` prints the mode
+    beside every failure. Recorded as
     [#955](https://github.com/mudler/vllm.cpp/issues/955), the sm_110
     counterpart of [#907](https://github.com/mudler/vllm.cpp/issues/907).
 
-    | # | Test | First failing assertion | Root cause |
+    **Direction matters, and an earlier draft of this gate left it out.** Two
+    kinds of movement are IMPROVEMENTS and must not be scored as regressions.
+    A name LEAVING the list is one. A mode getting BETTER is the other, and it
+    is not hypothetical: this run saw three of them.
+
+    Rank the modes, worst first: **`SEGFAULT` / `Subprocess aborted` / `Timeout`,
+    then `Failed`, then `Skipped` / `Not Run`, then PASSING.** A crash becoming a
+    clean assertion failure is progress, because a crash takes the rest of its
+    binary's cases with it — at `0764ded2b` `test_capi` reported `61 skipped`
+    behind its SIGSEGV, and at `6756f9131` the same binary runs all 66 cases.
+    Only movement DOWN that ranking, or a new name, is a regression. Record every
+    move in either direction; score only the bad ones.
+
+    **`Skipped` sits BELOW `Failed` on that list and is NOT an improvement, which
+    is the trap in ranking at all.** Three tests already skip on this host for an
+    absent checkpoint, so the mode is live in this very baseline: a red test that
+    starts skipping has stopped being measured, not started passing, and a
+    checkpoint that quietly goes missing looks exactly like a fix. **So a name
+    that LEAVES the failure list is only an improvement when you have seen it
+    PASS.** No name left the list this time, so nothing needed that check here —
+    but the previous run did need it and did it, confirming `test_ops_fp8_cpu`
+    and `test_ops_fused_chain` `Passed` in the same log rather than assuming.
+    A departure you cannot show green is an unexplained change, and it goes in
+    the report as one.
+
+    **The table is keyed on NAME, never on the `ctest` ordinal.** Ordinals move
+    whenever a test file is added, and they moved between every pair of runs this
+    lane has taken. **The first-failing-assertion LINE NUMBERS move too** — this
+    run alone moved `test_platform` `:307`→`:420` and
+    `test_gguf_device_fit_reach` `:278`→`:463` with the assertion unchanged — so
+    read the line as a pointer to re-derive, not as part of the key.
+
+    | Test | Mode | First failing assertion | Cause |
     |---|---|---|---|
-    | 80 | `test_platform` | `test_platform.cpp:307` `CHECK(cu.is_device_capability_family(120))` false | the TEST hardcodes the sm_12x family. Thor is 11.0 |
-    | 82 | `test_linear_method` | `:246` `after == before + 1` → `0 == 1`, case "MXFP4 fused gate_up … fused path ran" | the MXFP4 fused path does not run on sm_110. Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
-    | 86 | `test_qwen3_5_gdn_spec_routing` | **SEGFAULT** | FP8 fallback crash, [#960](https://github.com/mudler/vllm.cpp/issues/960) |
-    | 91 | `…_glue_fuse_off` | **SEGFAULT** | same |
-    | 92 | `…_fused_chain_off` | **SEGFAULT** | same |
-    | 124 | `test_deepseek_v2_forward` | `:559` THREW `cuda mla_prefill_attention: built without the vendored FlashAttention-2` | no FA-2 on sm_110 |
-    | 335 | `test_capi` | `test_capi.cpp:487` SIGSEGV | pre-existing, arch-independent; same crash on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
-    | 381 | `test_ops_fp8_cutlass` | **SEGFAULT** | FP8 fallback crash, [#960](https://github.com/mudler/vllm.cpp/issues/960) |
-    | 382 | `test_ops_fp8_cpu` | `:279` SIGSEGV in "G2: CPU QuantFp8Static equals CUDA QuantFp8Static byte for byte" | same, and this is the test that names the mechanism |
-    | 385 | `test_ops_moe_grouped` | `:1144` `bitdiff == 0` → `15`, logged `NVFP4 block8-vs-block16 M=8 K=4096 N=4096 bitdiff=15/32768` | **the one substantive standing sm_110 finding.** `marlin-nvfp4` IS enabled for `[110]`, so this is a live kernel disagreeing with itself across block sizes, not an absent feature |
-    | 390 | `test_ops_fused_chain` | **SEGFAULT** | FP8 fallback crash, [#960](https://github.com/mudler/vllm.cpp/issues/960) |
-    | 415 | `test_ops_mla_prefill` | `:340`, `:437` FA-2 absent | no FA-2 on sm_110 |
-    | 416 | `test_ops_mla_chunked_context` | `:790` FA-2 absent | same |
-    | 418 | `test_mla_attention_block` | `:999`, `:1044` FA-2 absent | same |
-    | 433 | `test_op_parity` | `:2487` `output_cbor_sha256` mismatch in "qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle (**dgx-only**, CUDA)" | a dgx-captured golden replayed on Thor; the case names itself dgx-only and runs anyway |
+    | `test_serve_low_tools` | Failed | `tests/tools/test_dflash2_speed_harness.py` — 1 error + 3 failures of 517, `FAILED (failures=3, errors=1, skipped=1)` | **THE CAUSE CHANGED.** No longer the absent `shellcheck`; see the note under the table. Unattributed, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_platform` | Failed | `:413` `CHECK(cu.supports_fa2_attention())` false, then `:420` `CHECK(cu.is_device_capability_family(120))` false | the TEST hardcodes the sm_12x family and an FA-2 build. Thor is 11.0 with `fa2` DISABLED. Two failing assertions now, one before |
+    | `test_gguf_device_fit_reach` | Failed | `:463` `CHECK(Backend().queues_destroyed == destroyed_before + 1)` → `0 == 1`, case "device fit: the AUTO arm refuses when the accelerator queue CAN be created" | red and UNATTRIBUTED since 2026-08-15; folded into [#1802](https://github.com/mudler/vllm.cpp/issues/1802) rather than left to be re-noticed a fourth time |
+    | `test_linear_method` | Failed | `:247` `after == before + 1` → `0 == 1`, case "MXFP4 fused gate_up … fused path ran" | the MXFP4 fused path does not run on sm_110. Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
+    | `test_qwen3_5_gdn_spec_routing` | Failed | `:530` `CHECK(bad == 0)`, case "GDN merged FP8 qkvz == the two split fp8 GEMMs, bitwise", 8 failing assertions | unchanged from `0764ded2b`. Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) |
+    | `test_qwen3_5_gdn_spec_routing_glue_fuse_off` | Failed | same assertion, same case | same |
+    | `test_qwen3_5_gdn_spec_routing_fused_chain_off` | Failed | same assertion, same case | same |
+    | `test_deepseek_v2_forward` | Failed | `:559` THREW `cuda mla_prefill_attention: built without the vendored FlashAttention-2` | no FA-2 on sm_110 |
+    | `test_capi` | Failed | `:953` `CHECK((text == "1" \|\| text == "2"))`, case "capi: structured_choice constrains greedy decoding", and `:975` the streaming sibling. `66 cases \| 64 passed \| 2 failed \| 0 skipped` | **MODE IMPROVED from `SEGFAULT`.** The `:487` ABI-v8 SIGSEGV is gone and the whole binary now runs — the `61 skipped` [#994](https://github.com/mudler/vllm.cpp/issues/994) complained of is 0. What remains is two structured-output cases, which are NOT the recorded defect |
+    | `test_cuda_ops` | Failed | `:106` `CHECK(bad == 0)` → `6 == 0` and `7 == 0`, case "CUDA silu_and_mul matches CPU" | **NEW NAME.** Also red on GB10 ([#907](https://github.com/mudler/vllm.cpp/issues/907)) at 439/440, against 438/440 here. Tracked in [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_backend_cross_device` | Failed | `:2063` `CHECK(got == ref_b)` ("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") and `:2601` `CHECK(dout.Download() == ref_c)`. 80205/80207 assertions | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802). Elements differ in the last digit |
+    | `test_llama_embedding_fold` | Failed | `:254` `CHECK(engine[i] == doctest::Approx(direct[i]).epsilon(1e-5))` | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_mtp_depth` | Failed | `:738` `CHECK(st.capture_shapes == 0)`, 103/104 assertions | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_qwen3_dflash2_draft` | Failed | `:2574` `CHECK(r.generate_threw.empty())`, 352/353 assertions | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | `test_ops_attention_dense_fa2` | Failed | `:692` `CHECK(Mismatches(on, ref) > 0)` → `0 > 0`, case "attention-dense-fa2 VT_FA2_DENSE=0 restores the scalar kernel at hd-128" | **NEW NAME**, [#1802](https://github.com/mudler/vllm.cpp/issues/1802). Reads like a test arch-assumption rather than a kernel defect: the case asserts the knob-ON path DIFFERS from the scalar reference, and with `fa2` DISABLED for `[110]` they are the same kernel |
+    | `test_ops_fp8_cutlass` | Failed | `:191` and `:207` THREW `vt: no kernel for op MatmulFp8Cutlass (id 54) on device cuda (type 1), and the portable CPU reference tier is NOT eligible: this backend does not report its device memory host-addressable` | **MODE IMPROVED from `SEGFAULT`, and this is the answer to [#1725](https://github.com/mudler/vllm.cpp/issues/1725)'s first half.** The fall-through is gone; the op refuses loudly. See below |
+    | `test_ops_matmul_fp8_block_cuda` | Failed | `:521-523` `CHECK(what.find("N is 576"))`, `("multiple of 128")`, `("sm120")` all `npos`, and `:529` `CHECK(after.refused - before.refused == 1)` → `0 == 1`, case "G2 upstream's CUTLASS case is refused by name…". `5 cases \| 1 passed \| 4 failed` | **MODE IMPROVED from `SEGFAULT`**, but [#1725](https://github.com/mudler/vllm.cpp/issues/1725) is NOT closed by it: the refusal is the GENERIC provider one, not `BlockFp8Runnable`'s by-name refusal, so neither the message nor the `refused` counter is what the test asserts |
+    | `test_ops_moe_grouped` | Failed | `:1262` `CHECK(bitdiff == 0)`, logged at `:1260` as `NVFP4 block8-vs-block16 M=8 K=4096 N=4096 bitdiff=15/32768` | **the one substantive standing sm_110 finding, [#962](https://github.com/mudler/vllm.cpp/issues/962), and it REPRODUCED byte-identically** 176 commits later — same count, same shape, same line. `marlin-nvfp4` IS `ENABLED for [110]`, so this is a live kernel disagreeing with itself across block sizes, not an absent feature. Its MXFP4 sibling reads `bitdiff=0/32768` at `:1173` in the same run |
+    | `test_ops_mla_prefill` | Failed | `:340` and `:437` THREW FA-2 absent | no FA-2 on sm_110 |
+    | `test_ops_mla_chunked_context` | Failed | `:790` THREW FA-2 absent | same |
+    | `test_mla_attention_block` | Failed | `:999` and `:1044` THREW FA-2 absent | same |
+    | `test_op_parity` | Failed | `:2490` `output_cbor_sha256` mismatch TWICE in "qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle (**dgx-only**, CUDA)" | dgx-captured goldens replayed on Thor; the case names itself dgx-only and runs anyway |
 
-    So the 15 collapse into four causes: **six** are
-    [#960](https://github.com/mudler/vllm.cpp/issues/960), **four** are the
-    missing vendored FA-2, **two** are tests that hardcode GB10
-    (`test_platform`'s capability family, `test_op_parity`'s dgx-only golden),
-    and **three** stand alone — `test_capi`'s segfault and `test_linear_method`,
-    both already red on GB10, plus `test_ops_moe_grouped`.
+    **What moved between 2026-08-19 (`0764ded2b`, 553 tests / 16 red) and
+    2026-08-23 (`6756f9131`, 598 tests / 22 red), 176 commits — 123 of them
+    touching `src/`, `include/`, `tests/` or `CMakeLists.txt`, 384 files and
+    +91,929 / -3,288 lines.** Expressed as the gate expresses it:
 
-    **The FIRST thing this lane found, and the argument for keeping it.** The
-    baseline was measured twice, at `5a0ffe9e3` and again at `2daa3287f` after a
-    rebase, and it MOVED. At the earlier SHA the FP8 group failed by throwing
-    `vt: no kernel for op QuantFp8Static (id 52) on device cuda` — a loud,
-    correct refusal, 484 tests / 14 red. At the later SHA the same request
-    silently takes the portable CPU reference tier and **segfaults**, 485 tests /
-    15 red. `cutlass-fp8` is ENABLED on GB10 and DISABLED for `[110]`, so on the
-    GB10 host the native kernel exists, the fallback is unreachable, and nothing
-    in CI could see it. Full detail and the attribution in
-    [#960](https://github.com/mudler/vllm.cpp/issues/960).
+    | | |
+    |---|---|
+    | names ARRIVED | **6** — `test_cuda_ops`, `test_backend_cross_device`, `test_llama_embedding_fold`, `test_mtp_depth`, `test_qwen3_dflash2_draft`, `test_ops_attention_dense_fa2`, all `Failed`, all [#1802](https://github.com/mudler/vllm.cpp/issues/1802) |
+    | names DEPARTED | **0** |
+    | modes IMPROVED | **3** — `test_capi`, `test_ops_fp8_cutlass`, `test_ops_matmul_fp8_block_cuda`, all `SEGFAULT` → `Failed` |
+    | modes WORSENED | **0** |
+    | `Skipped` set | unchanged, the same 3 absent-checkpoint tests |
 
-    Two lessons for whoever runs this next. **Re-measure the baseline whenever
-    the base SHA moves across `src/`, `tests/` or `CMakeLists.txt`** — a stale
-    baseline is worse than none, because the next agent reads a regression as
-    the floor. And an earlier full run at `5a0ffe9e3` confirmed all 14 failures
-    of that generation reproduced serially at `-j1`, so `ctest -j4` is not
-    producing starvation artefacts on this box; re-confirm that only if a NEW
-    name appears.
+    A count of names reads 16 → 22 and calls that six regressions. The pairs read
+    six arrivals, zero departures and three IMPROVEMENTS — including the
+    disappearance of every crash on the box — which is what actually happened.
+
+    **★ [#1725](https://github.com/mudler/vllm.cpp/issues/1725) MOVED, and the
+    prediction this file recorded was right.** The previous entry said
+    `cffe59b02` "rewrites the reference-tier dispatch … on the axis of unified
+    memory, and Thor is a unified-memory box", so both FP8 SEGFAULT rows were
+    "specifically suspect". They were. Neither op crashes now, and the exception
+    text names the mechanism itself, in full and with its own `file:line`:
+
+    ```text
+    vt: no kernel for op MatmulFp8Cutlass (id 54) on device cuda (type 1), and the
+    portable CPU reference tier is NOT eligible: this backend does not report its
+    device memory host-addressable, so a host kernel may not dereference what it
+    allocated (unified memory is true, which is a DIFFERENT property). Build a
+    native kernel for this op or run it on the CPU device
+    at src/vt/op_provider.cpp:563
+    ```
+
+    **Read the parenthesis.** The message distinguishes unified memory from
+    host-addressability *by name*, which is precisely the confusion `cffe59b02`
+    was written to remove, and Thor is the box where the two come apart:
+    `test_cuda_backend` reports `UnifiedMemory=true` with
+    `DeviceMemoryIsHostAddressable=false`. The tier is correctly refused
+    instead of being handed device pointers to dereference. That is the outcome
+    `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:56-58` asserts — an arch
+    outside the cell "keeps refusing by name … the honest answer and not the
+    #960/#844 fall-through" — and the source and the measurement now agree.
+
+    **It is HALF resolved, not resolved, and the residue is precise.**
+    `test_ops_fp8_cutlass` is down to the two cases that legitimately need the
+    kernel. `test_ops_matmul_fp8_block_cuda` still fails 4 of 5 cases, because
+    the refusal arrives through the GENERIC `op_provider` path rather than
+    `dense_fp8_block::BlockFp8Runnable`'s by-name refusal: its G2 case asserts
+    the message contains `N is 576`, `multiple of 128` and `sm120`, and that a
+    `refused` counter increments, and none of that happens. #1725 was therefore
+    RE-SCOPED rather than closed, on 2026-08-23, and its title now reads
+    "`kMatmulFp8BlockScaled` refuses GENERICALLY instead of by name outside
+    `VT_CUTLASS_FP8_ARCHS`". The original blind spot
+    is unchanged: `cutlass-fp8` is ENABLED on GB10, so no CI lane can see either
+    state.
+
+    **★ These two never belonged to #960, and the attribution is kept here
+    because it is provenance rather than superseded detail.**
+    [#960](https://github.com/mudler/vllm.cpp/issues/960) was CLOSED COMPLETED on
+    **2026-08-16** by `d607fec4c`, three days before the **2026-08-19**
+    `0764ded2b` measurement, and a closed issue cannot own a live crash. **Get
+    the direction of that timeline right**: the FIRST measurement, `2daa3287f` at
+    2026-08-15 20:34Z, predates #960's own creation at 21:03Z the same day — the
+    issue was filed BECAUSE of that run, so "closed before the first measurement"
+    is exactly backwards and was corrected on 2026-08-23.
+
+    **#960's fix was real, and this lane credits it.** `QuantFp8Static` moved
+    into an unconditional TU, `test_ops_fp8_cpu` went GREEN, and the three
+    `qwen3_5_gdn_spec_routing` tests improved `SEGFAULT` → `Failed` at
+    `0764ded2b`. But `kMatmulFp8Cutlass` and `kMatmulFp8BlockScaled` are
+    different ops, registered from TUs that `CMakeLists.txt:1790-1791` compiles
+    only for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so on sm_110 the same
+    fall-through shape survived that fix on two more ops. `cffe59b02` is what
+    finally closed it, and #1725 is what owns the residue. Do not read the
+    surviving fall-through as evidence that #960 was ineffective.
+
+    **★ [#962](https://github.com/mudler/vllm.cpp/issues/962) did NOT move, and
+    "byte-identically" is the word that makes this evidence rather than a second
+    sighting.** It reproduces at `bitdiff=15/32768` — same M/K/N, same count,
+    same line — 176 commits and four days later, with the MXFP4 sibling clean at
+    `0/32768` in the same binary.
+
+    **A bit-exact repeat rules out the explanations a bare repeat does not.** It
+    is not sampling noise, not a race, not a tolerance sitting near its edge, and
+    not a property of one build's scheduling: any of those would move the count.
+    A single observation of `15/32768` was one reading; two identical readings
+    across that much churn make it a deterministic, corroborated defect on a path
+    configure reports as `marlin-nvfp4: ENABLED for [110]`. It stays open, and it
+    remains the only substantive standing sm_110 numerical finding.
+
+    **The corollary for whoever fixes it:** the defect is reproducible on demand,
+    so it does not need a hunt for conditions. Build for `[110]`, run
+    `test_ops_moe_grouped`, and read `:1260`.
+
+    **★ The `shellcheck` entry is STALE AS AN EXPLANATION, and the decision it
+    justified has to be re-read.** This section used to say the canonical
+    baseline does not install `shellcheck` and carries `test_serve_low_tools` as
+    a named entry, because the failure was exactly
+    [#961](https://github.com/mudler/vllm.cpp/issues/961) — an absent instrument
+    reading as a code verdict — and the same job proved it by installing
+    `shellcheck` and re-running that test alone to green.
+
+    **That is no longer true.** `73ada0df8` (#1661/#1662) fixed the guard on
+    `main`: `tests/tools/test_online_gate_startup.py:263-267` now catches
+    `FileNotFoundError` and skips. The string `shellcheck` does not appear
+    anywhere in this run's `ctest-j1.log`. The test still fails, for an unrelated
+    reason — four cases in `tests/tools/test_dflash2_speed_harness.py`
+    (`ShellDriverTest`), 1 error and 3 failures of 517. **The control was run
+    again and it now falsifies the old conclusion instead of confirming it:**
+    after `apt-get install -y shellcheck` (0.9.0), the same single test re-run
+    reports `FAILED (failures=3, errors=1)` against the baseline's
+    `FAILED (failures=3, errors=1, skipped=1)` (`ctest-shellcheck.log` versus
+    `ctest-j1.log`) — **the same four cases, and the ONLY difference is the
+    vanished skip.** Installing the instrument changes nothing about the failure.
+
+    **That vanished `skipped=1` is itself the second proof, and it is worth
+    claiming rather than glossing.** The one test that skipped in the baseline is
+    the `shellcheck` guard; with the binary present it stopped skipping and
+    PASSED. So the control does not merely fail to reproduce the old
+    explanation — it independently demonstrates that the instrument was the only
+    thing the install changed, and that it changed nothing about the four live
+    failures.
+
+    So: the entry stays in the list, the "do not install `shellcheck`"
+    instruction stays (it costs nothing and #961 is armed on other hosts), and
+    the CAUSE column is now [#1802](https://github.com/mudler/vllm.cpp/issues/1802)
+    rather than #961. **#961 itself was CLOSED COMPLETED on 2026-08-23**, acting
+    on this record's own prompt to check whether it still described anything
+    live: `73ada0df8` had fixed its guard while referencing the sibling filing
+    #1661/#1662, which left #961 orphaned rather than resolved. The close was
+    verified against `origin/main` — the probe is wrapped in
+    `except FileNotFoundError` with `skipTest` in both arms — with this run as
+    independent corroboration that the failure mode is gone.
+    This is the [[the-state-was-not-the-one-you-believed]] shape: an entry whose
+    `(name, mode)` pair never moved while everything underneath it did.
+
+    **★ The `-j1` re-run artifact question from the previous baseline is
+    settled.** That record noted the older `-j1` claim cited
+    `/home/mudler/thor-w05/ctest-j1-rerun.log`, on the Thor HOST, which a lease
+    cannot read. This baseline is a `-j1` reading start to finish, taken inside
+    the lease, with its log on the shared NAS. Nothing here depends on a
+    host-side path any more.
+
+    **Re-measure whenever the base SHA moves across `src/`, `include/`,
+    `tests/` or `CMakeLists.txt`.** A stale baseline is worse than none, because
+    the next agent reads a regression as the floor.
 
     Two things NOT to conclude from this table. The FP8 and FA-2 groups are
     **feature absence surfacing as a thrown exception**, which is the loud
-    failure the seam is supposed to produce — they are not sm_110 numerical
+    failure the seam is supposed to produce, and they are not sm_110 numerical
     bugs. And the FA-2 message reads *"MLA prefill on **sm_121** IS
     FlashAttention"* while running on sm_110: the text is hardcoded to the GB10
     arch, so do not read an arch out of it.
 
-    **A trap this baseline walked into first.** `test_serve_low_tools` failed
-    the initial run with `FileNotFoundError: 'shellcheck'` —
-    `tests/tools/test_online_gate_startup.py:260` shells out to `shellcheck` and
-    raises rather than skipping when the binary is absent. That is an ABSENT
-    INSTRUMENT reading as a code verdict, and it was a property of the image,
-    not of Thor. `shellcheck` is in the Dockerfile above for exactly that reason
-    and the test passes; if you build the image without it, expect an extra
-    failure that means nothing. The harness defect is real and is NOT fixed by
-    that Dockerfile line — putting the binary in the image hides it here and
-    leaves it armed everywhere else.
+    **`shellcheck` is still ABSENT from the leased worker, and the standing
+    instruction is unchanged: the canonical baseline does NOT install it.** What
+    changed on 2026-08-23 is the REASON, and the paragraphs below are kept
+    because a reader who remembers the old one needs to see it withdrawn rather
+    than quietly replaced.
+
+    **What was true until `73ada0df8`.**
+    `tests/tools/test_online_gate_startup.py` shelled out to `shellcheck` and
+    RAISED rather than skipping when the binary was absent, which is an absent
+    instrument reading as a code verdict
+    ([#961](https://github.com/mudler/vllm.cpp/issues/961)). The baseline
+    therefore owned the entry rather than hiding it. In the deleted image the
+    test passed, so the 2026-08-15 list read 15 rather than 16 — and the record
+    explained that by saying "`shellcheck` is in the Dockerfile above", while the
+    Dockerfile printed directly above it installed `cmake ninja-build git
+    python3 python3-dev ca-certificates` and nothing else. The page designated
+    the repo copy authoritative, so the authority contradicted the behaviour it
+    was cited to explain. The 2026-08-19 job then proved the entry was exactly
+    the instrument, by installing `shellcheck` 0.9.0 and re-running only that
+    test: **`1/1 Passed, 27.88 s`**.
+
+    **That proof is now WITHDRAWN, because the same control was rerun and came
+    back the other way.** `73ada0df8` (#1661/#1662) fixed the guard —
+    `test_online_gate_startup.py:263-267` catches `FileNotFoundError` and skips
+    — so the instrument no longer reads as a verdict here at all, and the string
+    `shellcheck` appears nowhere in the `6756f9131` `ctest-j1.log`.
+    `test_serve_low_tools` is still red for an unrelated reason, and installing
+    `shellcheck` 0.9.0 and re-running that test alone now reports
+    `FAILED (failures=3, errors=1)` against the baseline's
+    `FAILED (failures=3, errors=1, skipped=1)` (`out/ctest-shellcheck.log`) —
+    the same four cases, differing only in the vanished skip, which is the
+    guard itself passing once its binary is present. **Installing the instrument
+    changes nothing about the failure.**
+
+    **So keep the instruction and drop the justification.** Not installing
+    `shellcheck` still costs nothing and still leaves #961's shape armed on hosts
+    that have not taken the fix, but it is no longer what this entry measures.
+    The entry's cause is [#1802](https://github.com/mudler/vllm.cpp/issues/1802).
+    **The general lesson is the durable part:** the `(name, mode)` pair for this
+    test did not move across 176 commits while its cause was replaced entirely,
+    which is [[the-state-was-not-the-one-you-believed]] — a green-looking gate
+    key over a changed world. Rerun a control; do not cite one.
+
+    **One `rc` detail worth carrying.** A job whose `trap ... EXIT` leaves a
+    background sampler running exits through
+    `killed: stragglers reaped after exit`, with a non-zero client exit code
+    AFTER `### ALL DONE` has already printed. Every phase result is on stdout by
+    then. Do not read that line as a failed measurement; `kill` and `wait` on
+    explicit PIDs if you want a clean code.
   - **★ THIS BOX REBOOTS INSTEAD OF OOM-KILLING — size every load for it.**
-    `vm.overcommit_memory=1` ("always overcommit") with **zero swap**: the kernel
+    `vm.overcommit_memory=1` ("always overcommit"): the kernel
     grants memory it cannot back, and touching those pages takes the WHOLE MACHINE
     down. Signature: container `exit=255`, `OOMKilled=false`, NO `dmesg`/journal OOM
     line, host reboot (`uptime` resets). Observed **three times on 2026-08-11**
@@ -822,6 +1560,22 @@ environment:
     this box: Qwen3-4B bf16 spec-off warm ~24.6 tok/s; Qwen3.6-27B bf16 spec-off
     warm 4.42 tok/s (portable kernels, no fast paths — absolute numbers are NOT
     comparable to GB10).
+
+    **The "zero swap" clause this warning used to carry is STALE as a reading of
+    `free`, and the warning is UNCHANGED in force.** Measured 2026-08-22 inside a
+    lease: `free -g` reads `Swap: 30 total, 0 used, 30 free`, and
+    `/proc/sys/vm/overcommit_memory` still reads `1`. But `swapon --show` names
+    what it is — **`/dev/zram0`, 30.7 G, PRIO 100** — and zram is a COMPRESSED
+    BLOCK DEVICE BACKED BY RAM. It adds no storage behind the 122 GiB; it trades
+    CPU for a compression ratio on pages that stay in the same physical memory,
+    and its own pool grows in RAM under pressure. So the original clause was
+    wrong about the literal reading and right about the thing it protected: there
+    is no backing store here. **Do not read 30 GiB as headroom.**
+    [#1363](https://github.com/mudler/vllm.cpp/issues/1363) still owes two
+    questions: whether it changes the observed failure mode at all, and when the
+    device appeared. Nobody has re-run the load that took the box down, and
+    nobody should do so casually. Run a `MemAvailable` sampler beside any load
+    here; `nvidia-smi` is blind to all of it.
   - **★ A BUILD CAN DO IT TOO, and the load list above is not the whole
     envelope. Measured 2026-08-19** ([#1380](https://github.com/mudler/vllm.cpp/issues/1380)).
     An `rc run` job on `thor:gpu0` ran `cmake --build <dir> -j 8` over the whole
@@ -853,7 +1607,10 @@ environment:
     ([[kairos-oem-rw-paths-change-cost-a-boot]]), and a host that did not reboot
     would falsify it and point at the worker pod instead.
     **The instruction that already existed is the one to follow.** The build
-    recipe above says `-j4` is deliberate, and every NAMED-TARGET build in that
+    recipe above prescribes `cmake --build ... -j 4`. It used to say "`-j4` is
+    deliberate"; that phrasing is gone, replaced by the measured sampler table
+    under "Parallelism, and what is actually measured", and the instruction is
+    unchanged. Every NAMED-TARGET build in that
     campaign — five jobs, `-j 8`, one to four targets each — completed without
     incident. It is the whole-tree build that correlates. Use `-j 4` for a full
     build, and prefer named targets.
@@ -866,13 +1623,20 @@ environment:
     job can enter is warranted by either occurrence alone. Whether the two share
     a cause is exactly what the boot list above would answer, and until somebody
     reads it, the count is a reason to keep looking rather than a finding.
-  - `k3s` runs here and is `enabled`; `sudo systemctl stop k3s` frees its pods
-    (5 containerd shims survive the stop). It was not the crash cause.
-  - Transfer code with `git archive` (NOT rsync — see
-    [[dgx-transfer-git-archive-not-rsync]]). Model weights move dgx→Thor over the
-    LAN with `tar -ch | ssh ... tar -x` into a FRESH directory; dgx reaches
-    192.168.68.23 directly. The reimage CHANGED THE HOST KEY, so dgx's
-    `known_hosts` needs `ssh-keygen -R 192.168.68.23` once.
+  - `k3s` runs here and is `enabled`. **The `rc` worker is one of its pods**, so
+    stopping `k3s` stops the lease mechanism itself and takes `thor:gpu0` out of
+    the fleet. The old note that `sudo systemctl stop k3s` frees its pods (5
+    containerd shims survive) is history from the host-toolchain era; do not run
+    it. It was not the crash cause.
+  - **Getting code and weights onto this box goes through the lease, not
+    `ssh`.** Source: `git archive` to `/mnt/nas_share/rc/<dir>` — never rsync,
+    see [[dgx-transfer-git-archive-not-rsync]] — or `git clone` inside the worker
+    for a branch you have pushed. Weights: `/workspace` is the SAME NAS folder
+    from `dgx` and from Thor, so a checkpoint placed there once is visible to
+    both and no host-to-host copy is needed at all. The recipe this replaced
+    moved weights dgx→Thor with `tar -ch | ssh ... tar -x`, which is the bypass;
+    its footnote that the reimage changed the host key is history rather than an
+    instruction.
   - **Oracle CAVEAT UPDATE (2026-08-12, `CLAIM-MM-SPEED-AUDIO-ENC-FA2`):** both venvs
     import cleanly now — `vllm-oracle-next` reports `0.23.1rc1.dev1511+g555967922`.
     That string is a **`setuptools_scm` nearest-ancestor-tag artefact, NOT an identity

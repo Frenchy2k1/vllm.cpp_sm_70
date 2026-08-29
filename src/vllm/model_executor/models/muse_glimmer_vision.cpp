@@ -16,7 +16,7 @@
 // is_neox_style=True, fp32 compute).
 //
 // Composed from the public vt:: ops (MatmulBT / Add / LayerNorm / GeluErf /
-// RopeFromCache / Attention / IndexSelect) and the shared merged-QKV seam
+// RopeFromCache / AttentionDenseFlash / IndexSelect) and the shared merged-QKV seam
 // vllm::models::FusedMergedQkvBiasSplit — no hand-rolled parallel path. The
 // host precomputes (patchify, positional interpolation, the 2D-RoPE cos|sin
 // table, the window permutation, the pixel shuffle) are deterministic f32, as
@@ -630,13 +630,29 @@ std::vector<float> MuseGlimmerVisionForward(const std::vector<MuseGlimmerVisionI
 
       int64_t off = 0;
       const vt::AttentionArgs aargs{scale, /*causal=*/false};
+      // KERNEL CHOICE — `vt::AttentionDenseFlash`, never `vt::Attention` (#1545,
+      // class issue #1544). `kAttention` is deliberately frozen on the kernel
+      // whose own header calls itself "Correctness-grade (M0.9)"
+      // (src/vt/cuda/cuda_ops.cu:1456-1460): one 256-thread block per
+      // (query, head), a 256-wide shared-memory tree reduction for EVERY key,
+      // and no K/V tiling. That freeze is right for text decode and wrong for a
+      // 50-layer non-causal vision tower, which has no other attention path.
+      // The flash-tiled op serves head_dim 96 — bf16 asks 2*64*96*2 = 24 KiB of
+      // dynamic shared memory, half the 48 KiB a launch gets by default — and it
+      // honours `args.causal`, so the per-segment slicing below is unchanged.
+      // On CPU both ops resolve to the SAME `AttentionKernel`
+      // (src/vt/cpu/cpu_ops.cpp:3750-3761), so every golden is byte-identical;
+      // on CUDA this is the rung whisper_audio.cpp:310-322 and
+      // qwen3_vl_vision.cpp:462-480 already default to. `AttentionDenseFa2` is
+      // NOT an option here: its fast path is head_dim 64 only
+      // (cuda_ops.cu:3396-3399) and every other shape falls through to this op.
       for (int32_t n : segments) {
         const int64_t seg = static_cast<int64_t>(n);
         Tensor qs = RowSlice(q3, off, seg);
         const Tensor ks = RowSlice(k3, off, seg);
         const Tensor vs = RowSlice(v3, off, seg);
         Tensor os = RowSlice(ao.tensor(), off, seg);
-        vt::Attention(q, os, qs, ks, vs, aargs);
+        vt::AttentionDenseFlash(q, os, qs, ks, vs, aargs);
         off += seg;
       }
     }

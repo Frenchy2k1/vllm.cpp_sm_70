@@ -4032,3 +4032,326 @@ TEST_CASE("ltx2 keyframe: all four generations resolve and nothing else does") {
   CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe", "2.5"));
   CHECK_THROWS((void)vllm::ResolveLtx2PipelineRecipe("keyframe_interp", "2.5"));
 }
+
+// ─── the CHECKPOINT CLASS (row LTX25-CHECKPOINT-CLASS, issue #1137) ─────────
+//
+// The defect this gates is SILENCE. A distilled transformer on a `Full` arm
+// loads, every shape matches, and the sampler runs a schedule the weights were
+// never trained for — returning a clip of the requested size, frame count and
+// sample rate. No pixel, RMS, windowed-energy or spectral check can see it.
+//
+// This file gates the TABLE and the DECISION. It does not gate reachability:
+// `test_ltx2_video` enters through `vllm_video_engine_load` for that, because a
+// case that calls `Ltx2CheckpointClassRefusal` by hand proves the function works
+// and never that anything reaches it.
+
+TEST_CASE("ltx2 checkpoint class: every resolving (kind, version) pair carries upstream's row") {
+  // Upstream's `Model` column, one row per pipeline
+  // (ltx-pipelines/CLAUDE.md:17-30 at fd4ded7f), reduced to its CHECKPOINT half.
+  // The LoRA half of a `Full + distilled LoRA` cell is `requires_distilled_lora`
+  // and is a different field.
+  struct Expected {
+    const char* kind;
+    vllm::Ltx2RequiredCheckpointClass required;
+  };
+  const Expected table[] = {
+      // `TI2VidOneStagePipeline`, `Full`.
+      {"one_stage", vllm::Ltx2RequiredCheckpointClass::kFull},
+      // `T2AOneStagePipeline`, `Full`, restated at t2a_one_stage.py:50.
+      {"t2a_one_stage", vllm::Ltx2RequiredCheckpointClass::kFull},
+      // `TI2VidTwoStagesPipeline`, `Full + distilled LoRA`.
+      {"ti2vid_two_stage", vllm::Ltx2RequiredCheckpointClass::kFull},
+      // `TI2VidTwoStagesHQPipeline`, `Full + distilled LoRA (both stages)`.
+      {"res2s_two_stage", vllm::Ltx2RequiredCheckpointClass::kFull},
+      // `A2VidPipelineTwoStage`, `Full + distilled LoRA`.
+      {"a2vid_two_stage", vllm::Ltx2RequiredCheckpointClass::kFull},
+      // `KeyframeInterpolationPipeline`, `Full + distilled LoRA`.
+      {"keyframe_interpolation", vllm::Ltx2RequiredCheckpointClass::kFull},
+      // `DFRPipeline`, `Keyframe-slot SFT + distilled LoRA`. NOT the distilled
+      // transformer, although this recipe runs the distilled sigmas.
+      {"dfr", vllm::Ltx2RequiredCheckpointClass::kKeyframeSlotSft},
+      // `DistilledPipeline`, `Distilled only`.
+      {"distilled_two_stage", vllm::Ltx2RequiredCheckpointClass::kDistilled},
+      // `RetakePipeline`, `Full or distilled`.
+      {"retake", vllm::Ltx2RequiredCheckpointClass::kFullOrDistilled},
+      // vLLM-Omni's `_PIPELINE_RECIPES` (ltx2_recipes.py:160-167 at a4ea67a2)
+      // has no `Model` column and Lightricks' table has no `dmd2` row, so
+      // NOTHING upstream states a class for it.
+      {"dmd2", vllm::Ltx2RequiredCheckpointClass::kUnstated},
+  };
+
+  // THE CROSS PRODUCT, not the table's own pairs, so a kind that gained a
+  // version row without gaining a requirement lands here.
+  const char* const versions[] = {"2", "2.3", "2.4", "2.5"};
+  int64_t resolved = 0;
+  for (const Expected& row : table) {
+    for (const char* version : versions) {
+      INFO("kind = " << row.kind << " version = " << version);
+      vllm::Ltx2PipelineRecipe recipe;
+      bool ok = false;
+      try {
+        recipe = vllm::ResolveLtx2PipelineRecipe(row.kind, version);
+        ok = true;
+      } catch (const std::exception&) {
+        ok = false;
+      }
+      if (!ok) continue;
+      ++resolved;
+      CHECK(recipe.checkpoint_class == row.required);
+    }
+  }
+  // The COUNT, so a new (kind, version) row cannot be added without this case
+  // being read. 4 one_stage + 4 t2a + 4 ti2vid + 1 res2s + 4 a2vid + 4 keyframe
+  // + 1 dfr + 2 distilled + 2 retake + 2 dmd2.
+  CHECK(resolved == 28);
+
+  // The CONTROLS: the four requirement values the table actually uses are all
+  // distinct, so a build that collapsed the enum onto one value fails here even
+  // though every row above would still compare equal to itself.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").checkpoint_class !=
+        vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").checkpoint_class);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("dfr", "2.5").checkpoint_class !=
+        vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").checkpoint_class);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("retake", "2.5").checkpoint_class !=
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").checkpoint_class);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("dmd2", "2").checkpoint_class !=
+        vllm::ResolveLtx2PipelineRecipe("retake", "2").checkpoint_class);
+
+  // And the CHECKPOINT half is not the ADAPTER half. `a2vid_two_stage` needs
+  // both; `one_stage` needs the class and no adapter. A build that keyed the new
+  // field off `requires_distilled_lora` fails this pair.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5").requires_distilled_lora);
+  CHECK_FALSE(vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").requires_distilled_lora);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("a2vid_two_stage", "2.5").checkpoint_class ==
+        vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5").checkpoint_class);
+}
+
+// ─── LTX25-DISTILLED-LORA-REQUIRED (#1445) ───────────────────────────────────
+//
+// THE ADAPTER HALF of the same table, and until this row nothing pinned it.
+// Three recipes set `requires_distilled_lora` and seven did not, and no case
+// asserted that the seven were RIGHT not to — so the two that were wrong
+// (`res2s_two_stage` and `dfr`) sat in the majority and looked like the rule.
+//
+// Upstream states the rule for the whole class in one sentence,
+// `ltx-pipelines/CLAUDE.md:48` at `fd4ded7f`: "Two-stage non-distilled pipelines
+// require `distilled_lora` (applied to stage 2 only in TI2Vid/A2Vid/Keyframe)".
+// The parenthetical scopes WHERE, and `:49` (HQ) and `:50-51` (DFR) scope the
+// other two. Neither weakens the requirement in the first half.
+TEST_CASE("ltx2 distilled LoRA: every resolving pair carries upstream's ADAPTER half") {
+  struct Expected {
+    const char* kind;
+    bool requires_adapter;
+    // How many of the recipe's phases run it. Asserted only where an adapter is
+    // required, because that is the only place the number means anything: the
+    // scope of an adapter the recipe never demands is not a claim about
+    // upstream.
+    int adapter_phases;
+  };
+  const Expected table[] = {
+      // `TI2VidOneStagePipeline` — one stage, `Full`, no `--distilled-lora` on
+      // `default_1_stage_arg_parser`.
+      {"one_stage", false, 0},
+      // `T2AOneStagePipeline` — one stage, `Full`.
+      {"t2a_one_stage", false, 0},
+      // `TI2VidTwoStagesPipeline` — `CLAUDE.md:48`'s "stage 2 only" case.
+      // `ti2vid_two_stages.py:140` builds stage 1 with `loras=tuple(loras)`
+      // against `:151`'s `(*loras, *distilled_lora)`.
+      {"ti2vid_two_stage", true, 1},
+      // `TI2VidTwoStagesHQPipeline` — `CLAUDE.md:49`, BOTH stages.
+      // `ti2vid_two_stages_hq.py:154` and `:165`, one strength each.
+      {"res2s_two_stage", true, 2},
+      // `A2VidPipelineTwoStage` — stage 2 only (a2vid_two_stage.py:107 against
+      // `:114`).
+      {"a2vid_two_stage", true, 1},
+      // `KeyframeInterpolationPipeline` — stage 2 only
+      // (keyframe_interpolation.py:104 against `:111`).
+      {"keyframe_interpolation", true, 1},
+      // `DFRPipeline` — `CLAUDE.md:50-51`, BOTH stages, because
+      // `dfr_pipeline.py:212` folds the adapter into the one `stage_loras` tuple
+      // that the shared `DiffusionStage` at `:217` carries through both.
+      {"dfr", true, 2},
+      // `DistilledPipeline` — `Distilled only`. The weights ARE the distilled
+      // ones, so there is nothing for an adapter to add. This is the row that
+      // makes "runs distilled sigmas" the wrong test and "non-distilled
+      // checkpoint" the right one.
+      {"distilled_two_stage", false, 0},
+      // `RetakePipeline` — ONE stage, and `Full or distilled`. Its full arm's
+      // condition is upstream's own "using distilled model or passing
+      // distillation lora with full model" (retake.py:71-73), which is a
+      // CONDITION on the class rather than a flat requirement, and
+      // `Ltx2CheckpointClassRefusal` already carries it.
+      {"retake", false, 0},
+      // vLLM-Omni's `dmd2` has no upstream `Model` column at all.
+      {"dmd2", false, 0},
+  };
+
+  // THE CROSS PRODUCT, matching the checkpoint-class case above, so a kind that
+  // gains a version row without gaining a requirement lands here.
+  const char* const versions[] = {"2", "2.3", "2.4", "2.5"};
+  int64_t resolved = 0;
+  for (const Expected& row : table) {
+    for (const char* version : versions) {
+      INFO("kind = " << row.kind << " version = " << version);
+      vllm::Ltx2PipelineRecipe recipe;
+      try {
+        recipe = vllm::ResolveLtx2PipelineRecipe(row.kind, version);
+      } catch (const std::exception&) {
+        continue;
+      }
+      ++resolved;
+      CHECK(recipe.requires_distilled_lora == row.requires_adapter);
+      if (!row.requires_adapter) continue;
+      int carrying = 0;
+      for (const vllm::Ltx2PhaseRecipe& phase : recipe.phases) {
+        if (phase.loras != vllm::Ltx2PhaseLoraScope::kNoAdapters) ++carrying;
+      }
+      CHECK(carrying == row.adapter_phases);
+      // ...and the requirement is never a scope of ZERO. A recipe that demands
+      // an adapter and hands it to no phase would refuse the load and then not
+      // use what it demanded.
+      CHECK(carrying > 0);
+    }
+  }
+  // The same 28 the checkpoint-class case counts, restated here rather than
+  // shared, because a helper that produced both numbers could be wrong once and
+  // agree with itself twice.
+  CHECK(resolved == 28);
+
+  // THE POLARITY CONTROL. `res2s_two_stage` and `dfr` were the two rows this
+  // row changed, and their neighbours in the same table did NOT change: the
+  // recipe `DfrRecipe` is built from — `distilled_two_stage` — still requires
+  // nothing, which is what says the flag tracks the CHECKPOINT rather than the
+  // schedule. Both run `Stage2DistilledSigmas()`.
+  CHECK(vllm::ResolveLtx2PipelineRecipe("dfr", "2.5").requires_distilled_lora);
+  CHECK_FALSE(
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").requires_distilled_lora);
+  CHECK(vllm::ResolveLtx2PipelineRecipe("dfr", "2.5").phases[1].sigmas ==
+        vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").phases[1].sigmas);
+}
+
+TEST_CASE("ltx2 checkpoint class: the three spellings parse and nothing else does") {
+  vllm::Ltx2CheckpointClass parsed = vllm::Ltx2CheckpointClass::kDistilled;
+  CHECK(vllm::Ltx2ParseCheckpointClass("full", &parsed));
+  CHECK(parsed == vllm::Ltx2CheckpointClass::kFull);
+  CHECK(vllm::Ltx2ParseCheckpointClass("distilled", &parsed));
+  CHECK(parsed == vllm::Ltx2CheckpointClass::kDistilled);
+  CHECK(vllm::Ltx2ParseCheckpointClass("keyframe_slot_sft", &parsed));
+  CHECK(parsed == vllm::Ltx2CheckpointClass::kKeyframeSlotSft);
+
+  // A rejected value leaves `*out` untouched, so a caller that ignores the
+  // return value cannot silently read a class it never supplied.
+  parsed = vllm::Ltx2CheckpointClass::kKeyframeSlotSft;
+  for (const char* text : {"", "Full", "DISTILLED", "dev", "distil", "keyframe", "full "}) {
+    INFO("text = " << text);
+    CHECK_FALSE(vllm::Ltx2ParseCheckpointClass(text, &parsed));
+    CHECK(parsed == vllm::Ltx2CheckpointClass::kKeyframeSlotSft);
+  }
+
+  // The names ROUND-TRIP, which is what makes a refusal quoting a class
+  // actionable: the string it prints is a string the parser takes back.
+  for (const vllm::Ltx2CheckpointClass value :
+       {vllm::Ltx2CheckpointClass::kFull, vllm::Ltx2CheckpointClass::kDistilled,
+        vllm::Ltx2CheckpointClass::kKeyframeSlotSft}) {
+    vllm::Ltx2CheckpointClass back = vllm::Ltx2CheckpointClass::kFull;
+    REQUIRE(vllm::Ltx2ParseCheckpointClass(vllm::Ltx2CheckpointClassName(value), &back));
+    CHECK(back == value);
+    // ...and the listing a message prints names every one of them, so a fourth
+    // class cannot be added without the messages following it.
+    CHECK(vllm::Ltx2CheckpointClassSpellings().find(vllm::Ltx2CheckpointClassName(value)) !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 checkpoint class: the refusal accepts exactly the upstream combinations") {
+  const vllm::Ltx2PipelineRecipe full = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe distilled =
+      vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5");
+  const vllm::Ltx2PipelineRecipe sft = vllm::ResolveLtx2PipelineRecipe("dfr", "2.5");
+  const vllm::Ltx2PipelineRecipe either = vllm::ResolveLtx2PipelineRecipe("retake", "2.5");
+  const vllm::Ltx2PipelineRecipe unstated = vllm::ResolveLtx2PipelineRecipe("dmd2", "2");
+
+  // ACCEPTED. Empty string means "this load may proceed".
+  CHECK(vllm::Ltx2CheckpointClassRefusal(full, "one_stage", "full", false).empty());
+  CHECK(vllm::Ltx2CheckpointClassRefusal(distilled, "distilled_two_stage", "distilled", false)
+            .empty());
+  CHECK(vllm::Ltx2CheckpointClassRefusal(sft, "dfr", "keyframe_slot_sft", false).empty());
+  CHECK(vllm::Ltx2CheckpointClassRefusal(either, "retake", "distilled", false).empty());
+  // `Full or distilled` on the FULL arm needs the adapter — retake.py:71-73.
+  CHECK(vllm::Ltx2CheckpointClassRefusal(either, "retake", "full", true).empty());
+  // `dmd2` is the one kind no reference states a class for, so it accepts an
+  // absent declaration as well as a present one.
+  CHECK(vllm::Ltx2CheckpointClassRefusal(unstated, "dmd2", "", false).empty());
+  CHECK(vllm::Ltx2CheckpointClassRefusal(unstated, "dmd2", "full", false).empty());
+
+  // REFUSED — the mismatch. The message names BOTH classes, which is what makes
+  // it actionable rather than a bare "wrong checkpoint".
+  {
+    const std::string msg = vllm::Ltx2CheckpointClassRefusal(full, "one_stage", "distilled", false);
+    INFO(msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find("'distilled'") != std::string::npos);      // what was supplied
+    CHECK(msg.find("FULL") != std::string::npos);             // what is needed
+    CHECK(msg.find("one_stage") != std::string::npos);        // which pipeline
+    CHECK(msg.find("CLAUDE.md:17-30") != std::string::npos);  // the upstream row
+  }
+  // ...and the other polarity, so the check is not a one-way test.
+  {
+    const std::string msg =
+        vllm::Ltx2CheckpointClassRefusal(distilled, "distilled_two_stage", "full", false);
+    INFO(msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find("'full'") != std::string::npos);
+    CHECK(msg.find("DISTILLED") != std::string::npos);
+  }
+  // A `full` transformer is NOT a keyframe-slot SFT one, although upstream's DFR
+  // schedule is the distilled one. Both near misses refuse.
+  CHECK_FALSE(vllm::Ltx2CheckpointClassRefusal(sft, "dfr", "full", true).empty());
+  CHECK_FALSE(vllm::Ltx2CheckpointClassRefusal(sft, "dfr", "distilled", true).empty());
+
+  // REFUSED — the ABSENT declaration. This is the case that carries the whole
+  // reason: the engine cannot detect the class, so it asks. The message has to
+  // name the extra, say why there is no detector, and give the spellings.
+  {
+    const std::string msg = vllm::Ltx2CheckpointClassRefusal(full, "one_stage", "", false);
+    INFO(msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find("checkpoint_class") != std::string::npos);
+    CHECK(msg.find("42,018,190,584") != std::string::npos);  // the measured size tie
+    CHECK(msg.find("byte-identical") != std::string::npos);  // the measured config tie
+    // The measured HEADER tie, which is the strongest of the three and the one
+    // a reader can act on: the two bf16 files declare the same 677,616 header
+    // bytes over the same 4349 tensor names. Pinned because the message is the
+    // only place this measurement reaches an operator, and an unpinned number
+    // in a string drifts silently.
+    CHECK(msg.find("677,616") != std::string::npos);
+    CHECK(msg.find("4349") != std::string::npos);
+    CHECK(msg.find("'full'") != std::string::npos);
+    CHECK(msg.find("'distilled'") != std::string::npos);
+    CHECK(msg.find("'keyframe_slot_sft'") != std::string::npos);
+  }
+
+  // REFUSED — an unparseable value. Refused rather than defaulted, because every
+  // default here picks a sampling regime for the caller.
+  {
+    const std::string msg = vllm::Ltx2CheckpointClassRefusal(full, "one_stage", "dev", false);
+    INFO(msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find("'dev'") != std::string::npos);
+    CHECK(msg.find("checkpoint_class") != std::string::npos);
+    // NOT the mismatch message: that one would name a class this engine knows.
+    CHECK(msg.find("42,018,190,584") == std::string::npos);
+  }
+
+  // REFUSED — `Full or distilled` declared FULL with no adapter. Upstream's own
+  // condition, and the reason the permissive enumerator is not an escape hatch.
+  {
+    const std::string msg = vllm::Ltx2CheckpointClassRefusal(either, "retake", "full", false);
+    INFO(msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find("retake.py:71-73") != std::string::npos);
+    CHECK(msg.find("lora_path") != std::string::npos);
+    // The adapter is what flips it, and nothing else: same recipe, same class.
+    CHECK(vllm::Ltx2CheckpointClassRefusal(either, "retake", "full", true).empty());
+  }
+}

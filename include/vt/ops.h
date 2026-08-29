@@ -113,6 +113,9 @@ enum class OpId : uint8_t {
   kAttentionDenseFa2,
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
+  kDFlashGroupedConv,
+  kDflash2SelectorEdges,
+  kDflash2PathWalk,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -123,6 +126,7 @@ enum class OpId : uint8_t {
   kApplyTemperature,
   kGreedyArgmax,
   kApplyTopKTopP,
+  kTopKValuesIndices,
   kComputeProbs,
   kComputeLogprobs,
   kRandomSample,
@@ -416,12 +420,14 @@ enum class OpId : uint8_t {
   //   * `vt` had NO transposed 1-D convolution of any kind. kCausalConv1dFwd is
   //     causal/stateful/SiLU-folded and kDepthwiseConv1d is centre-padded and
   //     depthwise; neither can express a scatter that GROWS the time axis.
-  //   * the ACCUMULATOR WIDTH differs and is part of the contract, not an
-  //     implementation detail. kDepthwiseConv1d accumulates in f32 and its
-  //     byte-exactness gate pins that; these two accumulate in f64, because f64
-  //     is what every committed `vocoder1d` golden was taken with. Widening or
-  //     narrowing either one moves a shipped model's numerics, so these are
-  //     SIBLINGS and kDepthwiseConv1d is untouched.
+  //   * the bias seeding and the zero-skip differ and are part of the contract,
+  //     not implementation detail — see vt::ConvTranspose1d clause (3), where
+  //     the skip decides the SIGN of a zero output cell. The ACCUMULATOR WIDTH
+  //     used to differ too and no longer does: kDepthwiseConv1d accumulates in
+  //     f32 and since #1474 so do these, because f32 is what torch accumulates
+  //     a float convolution in. Either one's width still moves a shipped
+  //     model's numerics, so they remain SIBLINGS and kDepthwiseConv1d is
+  //     untouched.
   // See vt::Conv1d / vt::ConvTranspose1d below for the exact contracts.
   // Appended before kCount so no existing op's id shifts.
   kConv1d,
@@ -444,6 +450,51 @@ enum class OpId : uint8_t {
   // them in the MAINLOOP. See vt::MatmulFp8BlockScaled below for the contract.
   // Appended before kCount so no existing op's id shifts.
   kMatmulFp8BlockScaled,
+  // --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007). The
+  // primitive `vt` has never had on ANY device, and the reason the LTX-2.5
+  // video VAE decode ran on the host while every oracle runs it GPU-resident.
+  // It is NOT a parameter of kConv2d, and the difference is the ACCUMULATION
+  // ORDER rather than the rank: kConv2d keeps one f32 accumulator over the whole
+  // (ic, kh, kw) sweep, while this op keeps one f32 PARTIAL PER INPUT CHANNEL —
+  // which is what torch's blocked-GEMM f32 convolution does, and what every
+  // committed LTX-2.5 video VAE golden was taken through. Same sibling
+  // relationship, and the same reason, as kConv1d vs kDepthwiseConv1d above.
+  // See vt::Conv3d below for the contract. Appended before kCount so no
+  // existing op's id shifts.
+  kConv3d,
+  // --- EXL3 (exllamav3 trellis) DEVICE kernels, MODEL-DSV4-EXL3 W2a/W2b. The
+  // W1a entries below (`Exl3TileCodeword` ..  `Exl3DequantLinear`) are plain
+  // host functions because they decode a CHECKPOINT FORMAT at load time. These
+  // two are ops, because they run per FORWARD on whatever device the queue names
+  // and are exactly what makes the trellis tower fast rather than merely
+  // readable. See vt::Exl3HadR128 / vt::Exl3Gemm below for the contracts.
+  // Appended before kCount so no existing op's id shifts.
+  kExl3HadR128,
+  kExl3Gemm,
+  // MODEL-DSV4-EXL3 W2d. The FUSED mixture-of-experts MLP: one call covers every
+  // routed expert of every token in a block, where `kExl3Gemm` alone costs one
+  // call per (token, expert, projection). A separate id and not a widening of
+  // `kExl3Gemm`, because upstream's `exl3_moe` is a separate entry point with a
+  // separate argument list (`exl3_moe.cuh:8-46`). See vt::Exl3MoeMlp below.
+  // Appended before kCount so no existing op's id shifts.
+  kExl3MoeMlp,
+  // --- The LTX-2.5 CONV VIDEO VAE's device-resident glue table
+  // (LTX25-VAE-DEVICE-RESIDENCY, #1451). The ten stages between the decode's
+  // convolutions that the shared `vt::` surface does NOT express: pixel-norm,
+  // GroupNorm over a channel-major volume, the ada-LN affine, the spatial-noise
+  // broadcast, depth-to-space, a frame slice, a channel repeat, a channel-major
+  // 1x1x1 linear, unpatchify, and the causal/spatial pad.
+  //
+  // It is LONGER than kLtx2's seven because a convolutional decoder is mostly
+  // SHAPE MOVEMENT and this tree has no `vt::` permute, transpose,
+  // depth-to-space or slice op at all, and no GroupNorm and no pixel-norm. What
+  // the decode does reuse is `vt::Conv3d`, kLtx2's `silu` and `vt::Add`.
+  //
+  // Registered on BOTH kCPU (cpu_ltx2_vae.cpp) and kCUDA (cuda_ltx2_vae.cu), so
+  // the RESIDENT STRUCTURE is exercised in CPU CI and a GPU is needed to gate
+  // the KERNELS rather than the port; resolved via ltx2_vae::Ltx2VaeDevice().
+  // Appended before kCount so no existing op's id shifts.
+  kLtx2Vae,
   kCount
 };
 
@@ -491,6 +542,153 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// ─── EXL3 device-kernel argument records — MODEL-DSV4-EXL3 W2 ────────────────
+// Ported from exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT). See
+// the vt::Exl3HadR128 / vt::Exl3Gemm contracts at the end of this header, and
+// `.agents/specs/model-dsv4-exl3.md` `## W2 design` for the parity contract,
+// the output dtype decision and the shape policy.
+
+// `had_r_128(input, output, pre_scale, post_scale, scale)`
+// (quant/hadamard.cuh:5-12). At most ONE of the two scale vectors may be set —
+// upstream instantiates the kernel as <pre_scale, post_scale> and never with
+// both true (hadamard.cu:112-172).
+struct Exl3HadArgs {
+  const Tensor* pre_scale = nullptr;   // fp16 [cols], multiplied BEFORE the transform
+  const Tensor* post_scale = nullptr;  // fp16 [cols], multiplied AFTER
+  float scale = 1.0f;                  // folded into r_scale = scale / sqrt(128)
+};
+
+struct Exl3GemmArgs {
+  int bits = 0;             // K, bits per weight (1..8); 3 for the 3.0bpw artifact
+  int codebook = 1;         // cb; 1 == mcg, the only codebook this row decodes
+  int force_shape_idx = 0;  // 0 == let Exl3SelectGemmShape decide (the default)
+  // MODEL-DSV4-EXL3 W2c. The m<=8 GEMV arm, mirroring upstream's own `force`
+  // parameter (`exl3_gemv.cu:105`, and the direct entry point at `:171-241`
+  // that sets it):
+  //   -1  let the envelope + VT_EXL3_GEMV decide  (the DEFAULT, and production)
+  //    0  never take it
+  //    1  take it wherever the HARD constraints allow, bypassing the heuristic
+  // Forcing bypasses the heuristic and never the hard constraints, exactly as
+  // upstream's does. It exists so a device gate measures the arm it names
+  // instead of whatever the occupancy query happened to choose.
+  int force_gemv = -1;
+};
+
+// ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
+//
+// Ported from `exl3_moe.cu:99-301` + `exl3_moe_kernel.cuh:17-283`. The contract
+// is at vt::Exl3MoeMlp below and the design is in
+// `.agents/specs/model-dsv4-exl3.md` `## W2cd design`.
+
+// `act_function` (`exl3_moe_common.cuh:6-8`), plus ONE value that is ours.
+enum class Exl3MoeAct : int {
+  kSilu = 0,          // MOE_ACT_SILU
+  kGelu = 1,          // MOE_ACT_GELU
+  kRelu2NoGate = 2,   // MOE_ACT_RELU2_NOGATE: the gate GEMM and staging are skipped
+  // vLLM's `SiluAndMulWithClamp` (`model_executor/layers/activation.py:197-201`),
+  // which is what DeepSeek-V4 uses and is NOT any of upstream's three. The clamp
+  // lands BEFORE the silu where upstream's lands after, and the limit is applied
+  // UNCONDITIONALLY where upstream guards it with `act_limit != 0.0f`
+  // (`hadamard_inner.cuh:110`) — a zero limit therefore means "clamp to zero"
+  // here and "no clamp" there. AGENTS.md makes vLLM the authority wherever it
+  // implements the behavior; exllamav3 is this format's oracle, not this model's.
+  kSiluAndMulClamp = 3,
+};
+
+// `exl3_moe_common.cuh:10-12` and `exl3_devctx.cuh:13`, plus
+// `block_sparse_mlp.py:19`'s TEMP_ROWS_FUSED. Named constants rather than
+// literals because the launch geometry, the buffer shape and the "too many
+// tokens for the fused kernel" cut all read them.
+inline constexpr int kExl3MoeSmsPerExpert = 8;
+inline constexpr int kExl3MoeMaxGroups = 64;
+inline constexpr int kExl3MoeTempRowsFused = 128;
+
+// `exl3_moe_max_concurrency` (`exl3_moe.cu:14-18`): how many expert groups a
+// device can run at once, which is also how many temp-buffer sets the caller
+// must allocate. Clamped to `kExl3MoeMaxGroups` (the scheduler's ticket array is
+// that long) and never below one.
+int Exl3MoeMaxConcurrency(int device_sms);
+
+// The host-side batching, ported from `block_sparse_mlp.py:1079-1105`. PURE, and
+// in `src/vt/exl3_policy.cpp` beside the shape table for the same reason: a
+// bincount and a grouping that only a device run could check is arithmetic
+// nobody checks.
+//
+//   topk_ids       [num_tokens * topk] the routed expert per assignment
+//   topk_weights   [num_tokens * topk] the routing weight per assignment
+//   expert_count   OUT [num_experts + 1]; the last slot is upstream's sentinel
+//                  for an assignment outside this shard and a single-shard load
+//                  never fills it
+//   token_sorted   OUT [num_tokens * topk] the token index, grouped by expert
+//   weight_sorted  OUT [num_tokens * topk] fp16, the same grouping
+//
+// Returns `num_active`: the number of experts with
+// `0 < count <= max_tokens_per_expert`, which is what sizes the launch
+// (`exl3_moe.cu:93-96`). An expert ABOVE that cut is skipped by the fused kernel
+// (`exl3_moe_kernel.cuh:66`) and the caller runs it per-expert, exactly as
+// upstream's caller does (`block_sparse_mlp.py:1141,1151-1156`).
+//
+// DEVIATION, recorded: a STABLE grouping where upstream calls the unstable
+// `Tensor.argsort`. The two agree on `expert_count` and on the multiset of each
+// segment; nothing downstream reads the within-segment order except which temp
+// row a token occupies, and the epilogue scatters back by token index.
+int Exl3MoeSortTokensByExpert(const int64_t* topk_ids, const float* topk_weights,
+                              int64_t num_tokens, int64_t topk, int64_t num_experts,
+                              int64_t max_tokens_per_expert, int64_t* expert_count,
+                              int64_t* token_sorted, uint16_t* weight_sorted);
+
+// The nine per-expert POINTER TABLES (`exl3_moe.cu:118-126`). Each is an i64
+// tensor of `num_experts` entries whose values are the ADDRESSES of that
+// expert's trellis / suh / svh buffers. Upstream passes exactly this, as tensors
+// of `void*`; the i64 spelling keeps them inside the vt Tensor world so the
+// device tagging and the contiguity checks apply to them like anything else.
+struct Exl3MoeExpertTables {
+  const Tensor* gate_trellis = nullptr;
+  const Tensor* gate_suh = nullptr;
+  const Tensor* gate_svh = nullptr;
+  const Tensor* up_trellis = nullptr;
+  const Tensor* up_suh = nullptr;
+  const Tensor* up_svh = nullptr;
+  const Tensor* down_trellis = nullptr;
+  const Tensor* down_suh = nullptr;
+  const Tensor* down_svh = nullptr;
+};
+
+// The batching triple `Exl3MoeSortTokensByExpert` produces (`exl3_moe.cu:103-105`).
+struct Exl3MoeRouting {
+  const Tensor* expert_count = nullptr;   // i64 [num_experts + 1]
+  const Tensor* token_sorted = nullptr;   // i64 [num_tokens * topk]
+  const Tensor* weight_sorted = nullptr;  // f16 [num_tokens * topk]
+};
+
+// The four staging buffers (`exl3_moe.cu:107-110`), each
+// [concurrency, max_tokens_per_expert, dim] fp16. `concurrency` is how many
+// expert groups run at once and `max_tokens_per_expert` is the cut above which
+// the fused arm declines an expert; both are READ OFF these shapes rather than
+// passed again, which is upstream's own arrangement (`:168-169`).
+struct Exl3MoeTemps {
+  Tensor* state_g = nullptr;
+  Tensor* state_u = nullptr;
+  Tensor* intermediate_g = nullptr;
+  Tensor* intermediate_u = nullptr;
+};
+
+struct Exl3MoeArgs {
+  int bits_gate = 0;  // K_gate / K_up / K_down; upstream keeps them separate and
+  int bits_up = 0;    // switches K at run time when they differ
+  int bits_down = 0;  // (exl3_moe_kernel.cuh:139-149)
+  // ONE codebook for all three, because `exl3_moe.cu:182-184` refuses a call
+  // whose gate/up/down disagree: three fields that must be equal are three
+  // chances to disagree. 1 == mcg, the only one this row decodes.
+  int codebook = 1;
+  Exl3MoeAct act = Exl3MoeAct::kSilu;
+  float act_limit = 0.0f;
+  // The number of experts the fused arm will process, which sizes the launch
+  // (`exl3_moe.cu:93-96,217-221`). -1 means unknown and takes the default
+  // group width; 0 means there is nothing to do and the call returns.
+  int num_active = -1;
 };
 
 // torch `nn.LayerNorm` arguments (opt.py:146-148,164-166,248-251 construct it
@@ -651,6 +849,35 @@ struct Conv2dArgs {
   int64_t groups = 1;
 };
 
+// --- General 3-D convolution args (LTX25-DEVICE-RESIDENCY W5, #1007). --------
+
+// torch `nn.Conv3d` arguments, in `(T, H, W)` axis order. Field names mirror the
+// constructor keywords 1:1, exactly as Conv2dArgs mirrors `nn.Conv2d`'s, so a
+// reader of `CausalConv3d.__init__` (Lightricks/LTX-2 @ fd4ded7f2,
+// packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:267-302) can map
+// every field by name.
+//
+// `padding` here is ZERO padding on both sides of an axis, and that is the whole
+// of what this op does: a non-zero `padding_mode` — LTX's `reflect` and
+// `replicate` — is realised by the CALLER materialising the padded volume and
+// passing pad 0, which is what torch itself does (`nn.Conv3d` with a non-`zeros`
+// `padding_mode` runs `F.pad` and then a zero-padded convolution). The LTX
+// decoder's asymmetric CAUSAL temporal pad is materialised the same way, and for
+// the same reason: upstream materialises it too, with a `torch.concatenate`
+// (convolution.py:305-311).
+struct Conv3dArgs {
+  int64_t stride_t = 1;
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t pad_t = 0;
+  int64_t pad_h = 0;
+  int64_t pad_w = 0;
+  int64_t dilation_t = 1;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  int64_t groups = 1;
+};
+
 // torch `nn.Conv1d(C, C, K, stride, padding, groups=C)` arguments — the
 // NON-CAUSAL depthwise conv1d of `ParakeetEncoderConvolutionModule`
 // (modeling_parakeet.py:116, ctor :138-146; padding = (K-1)//2 at :136). Not to
@@ -762,6 +989,270 @@ struct DFlashPagedBlockAttentionArgs {
   int64_t block_size = 0;         // rows per paged context page (>0)
 };
 
+// Arguments for vt::DFlashGroupedConv — the DFlash2 draft's GROUPED DYNAMIC
+// DEPTHWISE CONVOLUTION, wrapped around each attention and each MLP sublayer
+// (SPEC-DFLASH2 W2, #1314).
+//
+// BEYOND-PIN. Ported from `_grouped_conv` and `DFlashGroupedConv`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`); the parity pin `555967922` does
+// not carry the architecture at all and this op does NOT advance it.
+//
+// The math, in upstream's own terms:
+//
+//   out[i,c] = sum_{t=0..taps-1} (base[side,t,c] + delta[i,side,t,g(c)]) * x[i-t,c]
+//
+// with `g(c) = c / group_size` the channel's GROUP, and tap `t` contributing only
+// where `(i mod block_size) >= t`. That mask is what makes the op a BLOCK
+// convolution rather than a sequence one: a proposal position sees the positions
+// before it inside its own (1+k) query block and NOTHING across the block
+// boundary, which is how a DFlash2 draft gets causal structure without another
+// backbone pass. `i` is the GLOBAL row index, exactly as upstream's
+// `torch.arange(hidden_states.shape[0])` is, and it is the right one here for the
+// same reason it is there: every request's block is contiguous and
+// block_size-aligned, so `i mod block_size` IS the intra-block offset.
+//
+// Upstream computes that mask on a POWER-OF-TWO block as `position & (block-1)`
+// and otherwise as `position % block`. Both arms are mirrored, and both are
+// gated: the two published DFlash2 checkpoints ship block 8 and block 16 (both
+// power-of-two, `z-lab/Qwen3.8-27B-DFlash2` and `z-lab/Muse-Glimmer-30B-DFlash2`)
+// and upstream's own reference test parametrises 5 to reach the modulo arm.
+//
+// `block_size` is `1 + num_speculative_tokens`, NOT `dflash_config.block_size` —
+// upstream sizes the conv by the QUERY block (the bonus token plus the mask
+// tokens) rather than by the checkpoint key, which only supplies that value's
+// default (`DFlash2Qwen3DecoderLayer.__init__` @ that head).
+//
+// SIDES. `base_kernel` is `[2, taps, hidden]` and dim 0 is the SIDE — 0 =
+// `prepare` (before the sublayer), 1 = `finish` (after it) — NOT a tap. One
+// projection of the sublayer input produces BOTH sides' deltas
+// (`kernel_projection`: hidden -> 2*taps*num_groups), so `coefficients` is the
+// same buffer for both calls and `side` selects the half. Passing the whole
+// buffer rather than a slice mirrors upstream's `coefficients[:, side]` view
+// without materializing a copy of a non-contiguous slice.
+//
+// ACCUMULATION. Every intermediate is rounded to the tensor dtype after each
+// step, because upstream's chain materializes bf16 tensors at each one
+// (`base + delta`, `coefficients * blocks`, `output += ...`). This is elementwise
+// with no reduction-order freedom, so the CPU reference and the CUDA kernel are
+// specified BIT-IDENTICAL rather than within an envelope.
+//
+// WHAT IS ACTUALLY GATED, because the two halves of that sentence are not
+// equally proven. The per-step POLICY is pinned on CPU in bf16 by
+// `tests/vt/test_ops_dflash2_grouped_conv.cpp` — one hand-computed case with
+// literal expectations that differ from the rounded-once-at-the-end answer in
+// six of eight outputs, plus three shapes asserted bit-exact against a reference
+// that rounds where UPSTREAM materializes. On f32 this rounding is the identity
+// by construction, so no f32 case can see it and none is claimed to. The CPU ==
+// CUDA half is NOT proven: that case exists and is written to run, but it has
+// never compiled on a host without `nvcc` and reports `no CUDA backend;
+// skipping`. See `## Owed` O6 of `.agents/specs/dflash2-spec-decode.md`.
+struct DFlashGroupedConvArgs {
+  int64_t block_size = 0;   // 1 + num_speculative_tokens (the query block)
+  int64_t taps = 0;         // dflash_config.conv_kernel_size
+  int64_t num_groups = 0;   // hidden_size / conv_group_size
+  int64_t group_size = 0;   // dflash_config.conv_group_size
+  int64_t side = 0;         // 0 = prepare, 1 = finish (selects base/coefficient half)
+};
+
+// Arguments for vt::Dflash2SelectorEdges — the DFlash2 CANDIDATE SELECTOR's edge
+// lattice (SPEC-DFLASH2 W3, #1314).
+//
+// BEYOND-PIN. Ported from `_score_edges` and `CandidateSelector.forward`
+// (vllm/model_executor/models/qwen3_dflash2.py:208-276 @ vllm-project/vllm#52816
+// head `66e5414c6d75a8529473d977f7458c140bbab8a0`); the parity pin `555967922`
+// does not carry the architecture at all and this op does NOT advance it. The
+// PR head MOVED from `19c9351904df4c63042671bc67a866ca48dc7d6f` on 2026-08-19
+// (#1404); `_score_edges` and `CandidateSelector` are BYTE-IDENTICAL at the two
+// heads, and only the enclosing model's `set_model_tag` and the LM-head guard
+// changed, so this op cites the NEW head and its math is unaffected.
+//
+// The math, in upstream's own terms:
+//
+//   edge(b, l, p, c) = unary[b,l,c]
+//                    + sum_r (pred_codebook[pid(b,l,p), r] * hidden[b,l,r])
+//                            * succ_codebook[cand[b,l,c], r]
+//
+// where `pid(b,l,p)` is the PREDECESSOR token of slot `p` at step `l`: the
+// request's verified ANCHOR token at `l == 0` (the same token for every `p`,
+// upstream's `anchor_token_ids[:, None, None].expand(-1, 1, top_k)`), and
+// `cand[b, l-1, p]` at every later step. So `p` indexes the previous step's K
+// candidates and `c` this step's K candidates, which is exactly the transition
+// lattice the W4 path walk consumes.
+//
+// `unary` is the candidate VALUE from `compute_candidates` — the target head's
+// top-K logit AFTER `output_multiplier` and `final_logit_softcapping` — and it
+// is f32 there and f32 here. Upstream broadcasts it over `p`
+// (`unary_logits[:, :, None]`), so it is a per-CHILD bias and not a per-edge one.
+//
+// ACCUMULATION AND DTYPE. Upstream materializes two bf16 tensors inside the
+// einsum chain and then promotes: `predecessors * hidden[:, :, None]` is a bf16
+// tensor, the einsum's own output is a bf16 tensor, and `unary_logits + <bf16>`
+// promotes to f32 by torch's own type-promotion rule. This op mirrors that
+// placement exactly: the elementwise product rounds to the codebook dtype, the
+// rank reduction accumulates in f32 and rounds ONCE to the codebook dtype, and
+// only then is the f32 `unary` added. On f32 codebooks both roundings are the
+// identity, so the policy is observable ONLY in bf16 — which is where it is
+// gated, for the reason `## Owed` O6 records for the W2 convolution.
+//
+// The rank reduction IS a reduction, so unlike vt::DFlashGroupedConv this op is
+// NOT specified bit-identical across backends: a CUDA mirror is free to reduce
+// in a different order and is gated within an f32 envelope. That is a real
+// difference from W2 and is stated here rather than inherited by analogy.
+struct Dflash2SelectorEdgesArgs {
+  int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
+};
+
+// Arguments for vt::Dflash2PathWalk — the DFlash2 candidate selector's PATH WALK
+// (SPEC-DFLASH2 W4, #1314).
+//
+// BEYOND-PIN. Ported from `_selector_walk_kernel`
+// (vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:16-79 @
+// vllm-project/vllm#52816 head `66e5414c6d75a8529473d977f7458c140bbab8a0`).
+//
+// WHAT IT IS. The selector scores every (predecessor, child) transition of every
+// step; the walk turns that lattice into k tokens. It starts at the verified
+// anchor -- which the lattice already carries as EVERY predecessor slot of step
+// 0, so the walk enters at slot 0 -- takes the best child, and reads the NEXT
+// step's block at the predecessor row it just chose. The slot-to-slot dependency
+// is the whole shape of the problem: step l cannot start until step l-1 has
+// picked, so `L` steps are inherently sequential.
+//
+// ITS SHAPE IS UPSTREAM'S SHAPE, and that is a decision rather than a detail.
+// Upstream runs ONE program per request: the K scores of a slot stay in
+// registers and the step loop lives INSIDE the program, so `L` steps cost one
+// launch rather than `L`. Spec `## Risks/decisions` D3 requires the walk to be
+// on device from the first landing, because the identical sequential shape in
+// DSpark shipped host-side and measured 28% of the 27B draft step
+// (https://github.com/mudler/vllm.cpp/issues/436) before
+// `SampleSequentialDevice` moved it. The CUDA arm here is one block per request
+// with a shuffle argmax; the CPU arm is the authoritative reference.
+//
+// GREEDY IS THE ONLY ARM, and it is upstream's greedy arm exactly. At the moved
+// head the walk's two hand-written branches collapse into one
+// `gumbel_noised_argmax` call whose temperature argument is
+// `temperature if SAMPLE_PROBABILISTIC else 0.0`, and `SAMPLE_PROBABILISTIC` is
+// `self.draft_logits is not None`, which is set only for
+// `draft_sample_method == "probabilistic"`. At temperature 0 that helper divides
+// by nothing, adds no noise, and returns `tl.max(logits, axis=0,
+// return_indices=True)`; the `USE_FP64` cast it may apply is order-preserving on
+// fp32 inputs and cannot move a greedy answer. This engine refuses
+// `draft_sample_method: "probabilistic"` BY NAME at
+// `vllm::ParseSpeculativeConfigJson` (src/vllm/config/speculative.cpp) and
+// verifies accept-iff-equal, so no configuration can reach the noised arm and
+// nothing could consume the realized proposal distribution it exists to feed.
+// Landing that arm would be landing code no entry point can reach; it is owed,
+// with its layout, at `## Owed` of .agents/specs/dflash2-spec-decode.md.
+//
+// THE TIE-BREAK AND THE -inf ROW ARE PART OF THE CONTRACT. `tl.max(...,
+// return_indices=True)` resolves a tie to the LOWEST index, and upstream loads
+// masked lanes as -inf, so a row that is entirely -inf resolves to index 0
+// rather than to "no index". Both are pinned by literal cases and both arms
+// implement them identically: the reduction is seeded at -inf with slot index
+// `top_k`, keeps a candidate only when it STRICTLY exceeds the running best (so
+// a NaN never wins, on either arm), and collapses a `top_k` seed back to 0. A
+// different tie rule would pick a different PREDECESSOR for the next step, so it
+// moves the whole remaining path and not one token.
+//
+// UNLIKE vt::Dflash2SelectorEdges this op is specified BIT-EXACT across
+// backends. It performs no arithmetic -- only comparisons and one gather -- so
+// there is no reduction order for a backend to differ in.
+//
+// STRICTNESS IS THE WHOLE OF THAT CLAIM, and it was not free. W4's fresh review
+// measured the two arms apart on a NaN-bearing row: the CUDA per-lane scan
+// carried `|| (v == best && j < slot)` beside its strict `>`, a clause that is
+// unreachable once a lane has claimed anything (`j` only ascends) and whose one
+// effect was at the SEED -- a lane holding -inf compared equal to the -inf seed
+// and claimed a slot the CPU arm refuses. `[NaN,-inf]` read cpu 0 / cuda 1,
+// `[NaN,NaN,-inf]` read cpu 0 / cuda 2, and every NaN-free row agreed,
+// including the all -inf row and the forced tie group, so no fixture without a
+// NaN could see it. The clause is now DELETED rather than this claim narrowed,
+// and the lower-slot tie rule stays where it is needed: the cross-lane
+// butterfly, which combines lane winners out of slot order. BOTH HALVES OF
+// THAT DELETION ARE NOW COVERED, and #1518 corrects an earlier sentence here
+// saying it had never been compiled or run on a device. It COMPILES on every
+// pull request: `src/vt/cuda/cuda_ops.cu` is in the CUDA source list
+// (CMakeLists.txt, `target_sources(vllm PRIVATE ...)` under `if(VLLM_CPP_CUDA)`)
+// that CI's `build-cuda-fat` job builds for ten architectures
+// (`80;86;87;89;90a;100a;103a;110;120a;121a`). And it has RUN: the operator
+// executed this suite on `dgx:gpu0` (GB10, sm_121a) at the W4 merge commit,
+// reporting 83 assertions on device against 49 on CPU, `Status: SUCCESS!`, with
+// zero `no CUDA backend; skipping` lines -- the increment includes the NaN row
+// chained into the parity fixture, which is the row that measured the
+// divergence. What remains owed at `## Owed` O11 of
+// .agents/specs/dflash2-spec-decode.md is the rest of that entry, not this
+// deletion; the AUTHORING HOST still has no `nvcc` and still skips the case
+// locally. NO SHIPPED PATH FEEDS THIS OP A NaN:
+// the lattice comes from vt::Dflash2SelectorEdges over a target LM head, so the
+// row that measured the difference is synthetic, and it is a gap in the reach
+// of the contract rather than in any draft a user can obtain.
+struct Dflash2PathWalkArgs {
+  int64_t top_k = 0;  // dflash_config.selector_top_k (16 on both published drafts)
+};
+
+// Arguments for vt::TopKValuesIndices — the vocabulary top-k that EMITS the
+// surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2, #1314).
+//
+// BEYOND-PIN. Ported from `_topk`
+// (vllm/model_executor/models/qwen3_dflash2.py:60-64 @ vllm-project/vllm#52816
+// head `66e5414c6d75a8529473d977f7458c140bbab8a0`), which is `torch.topk(scores,
+// k, dim=-1)` off CUDA and FlashInfer's radix `top_k(..., sorted=True,
+// deterministic=True)` on it.
+//
+// WHY NOT FLASHINFER'S RADIX KERNEL. Spec `## Risks/decisions` D2: `topk.cuh` is
+// 3380 lines of general kernel (multi-CTA, deterministic mode, three tie-break
+// modes, dynamic shared-memory sizing) for a shape that is fixed and small here
+// — K = 16 over a 248320 vocabulary for `num_reqs * k` rows, about 224 at
+// concurrency 32. The CUDA arm instead extends the sort-free block-cooperative
+// pivot-bracket threshold search this repository already carries and gates
+// (`src/vt/cuda/cuda_sample.cu::ApplyTopKTopPRowKernel`, ported from the SAME
+// FlashInfer `TopK/TopPRenormProb` approach) so that it COMPACTS and ORDERS the
+// survivors instead of masking below the k-th largest.
+//
+// TIE-BREAK IS PART OF THE CONTRACT, not an implementation detail. The threshold
+// search finds an exact array VALUE, so it keeps whole tie groups atomically and
+// can leave more than k survivors; something then has to choose among equals.
+// This op returns exactly k pairs ordered by DESCENDING value with ties broken
+// by ASCENDING index, which is `torch.topk`'s CPU order and what FlashInfer's
+// `deterministic=True` exists to provide. A backend that broke ties differently
+// would reorder the selector's candidate slots and move acceptance without
+// raising anything, so the CPU reference pins it and the CUDA arm mirrors it.
+//
+// NaN IS THE ONE POINT WHERE THE TWO ARMS ARE NOT EQUAL, and this is stated here
+// because a contract that claimed otherwise would be a claim no shipped backend
+// delivers. The CPU arm orders NaN FIRST, which is `torch.topk(largest=True)`'s
+// own answer, and it is stated rather than left to the sort: leaving it implicit
+// made the CPU comparator an intransitive equivalence and therefore undefined
+// behaviour, not merely an unusual result. The CUDA arm DOES NOT ORDER NaN
+// FIRST and cannot as written -- `TopKValuesIndicesRowKernel`'s pivot bracket
+// uses `fmaxf`/`fminf`, which return the non-NaN operand, and its survivor pass
+// tests `r[j] > thr`, which is false for a NaN, so the search can never select
+// one. Measured on a GB10 on 2026-08-20 rather than argued:
+// [#1489](https://github.com/mudler/vllm.cpp/issues/1489), where the direct
+// cross-arm comparison read `gpu.indices[0] == cpu.indices[0]` as `2 == 1`.
+// Reconciling the kernel to NaN-first is owed to that issue; until it lands the
+// device gate is scoped to the rows the kernel implements. NO SHIPPED PATH FEEDS
+// THIS OP A NaN LOGIT -- the candidate values come from a target LM head -- so
+// the row that pins the CPU order is synthetic in the same sense the padding row
+// is, and the asymmetry is a gap in the contract's reach rather than in any
+// output a user can obtain.
+//
+// `num_org_vocab_padding` mirrors upstream's
+// `lm_head.shard_indices.num_org_vocab_padding`: that many columns at the END of
+// each row are forced to -inf BEFORE the search, so a padded head can never
+// contribute a candidate. It is 0 on every path this engine ships today (the
+// DFlash lane's lm_head is the raw unpadded checkpoint tensor and there is no
+// vocab-parallel sharding), and it is implemented and gated synthetically rather
+// than claimed as checkpoint coverage — the same posture `## Upstream chain`
+// records for the three output scalars. Upstream's companion
+// `org_vocab_start_index` is applied by the CALLER
+// (`vllm::Qwen3DFlash2Model::ComputeCandidates`), not here, because it is an
+// id-space rebase of the result rather than a property of the search.
+struct TopKValuesIndicesArgs {
+  int64_t k = 0;                        // dflash_config.selector_top_k
+  int64_t num_org_vocab_padding = 0;    // trailing columns forced to -inf first
+};
+
 // Backend-neutral local-attention window, matching FlashAttention's
 // `window_size=(left, right)` convention. The bounds are inclusive distances
 // from the bottom-right-aligned absolute query position: (W-1, 0) is a causal
@@ -813,7 +1304,7 @@ struct PagedAttentionArgs {
   // device read (companion to query_start_loc_host). 0 => that launcher falls
   // back to the D2H+sync.
   int32_t max_seq_len = 0;
-  // OPTIONAL fp8 KV-cache read (KV-FP8 W1). kAuto (default) => the cache holds
+  // OPTIONAL fp8 KV-cache read (KV-FP8 W1 CPU, W2 CUDA). kAuto (default) => the cache holds
   // the model float dtype and is read directly — every existing caller is
   // byte-identical. When != kAuto the K/V cache pages are 1-byte fp8 (DType::kI8
   // storage) and each read is DEQUANTIZED as Dequant(fp8) * k_scale|v_scale
@@ -821,9 +1312,24 @@ struct PagedAttentionArgs {
   // (scaled_vec_conversion<float,uint8_t>, quant_utils.cuh:302-308). k_scale /
   // v_scale are the per-tensor scales from BaseKVCacheMethod (kv_cache.py:108-191)
   // — 1.0 is the uncalibrated default. Per-head scales are a later brick.
+  // Implemented on CPU and CUDA. kMETAL/kROCM register kPagedAttention for the
+  // FLOAT path only, and because these fields are ADDITIVE the provider table
+  // cannot tell the two arms apart, so src/vt/ops.cpp refuses them by name.
   Fp8KVCacheDataType kv_cache_dtype = Fp8KVCacheDataType::kAuto;
   float k_scale = 1.0f;
   float v_scale = 1.0f;
+  // OPTIONAL spec-as-decode classification (SPEC-DFLASH2 W10, #1857): the
+  // batch's uniform speculative verify length, classified by the caller
+  // (`vllm::v1::SpecAsDecodeQueryLen` mirrors backend.py:718-736 @ b389ac2946,
+  // the 1 + 2*K reorder threshold for a parallel-drafting speculator), or 0.
+  // A ROUTING HINT, not a semantic change: the attention output is defined by
+  // the tensors + scale/causal/window exactly as before, so a backend that
+  // ignores the field (CPU, and every non-CUDA provider) is still correct —
+  // which is why, unlike `kv_cache_dtype`, this field extends no provider
+  // refusal. Only the CUDA kernel SELECTION reads it, to keep a uniform-qlen
+  // verify (q <= 1 + 2K) on the split-KV DECODE lane instead of the
+  // num_splits=1 prefill ladder (`include/vt/paged_attn_route.h`).
+  int32_t uniform_spec_query_len = 0;
 };
 
 // Arguments for vt::MlaDecodeAttention (MLA campaign W4). Mirrors the scalar
@@ -844,6 +1350,34 @@ struct MlaDecodeAttentionArgs {
   // used to derive `num_kv_splits` when that is 0; an upper bound is safe. When
   // both are 0 the impl falls back to 1 split.
   int32_t max_seq_len = 0;
+  // ─── the SLIDING-WINDOW decode arm (dots3-note W4b-2, #699) ───────────────
+  // OPTIONAL local-attention bounds, the same `AttentionWindow` convention
+  // `PagedAttentionArgs::window_size` already uses: for the bottom-right
+  // aligned absolute query position `p = seq_len - 1` (MLA decode is ONE query
+  // per row), visible keys are `[p - left, p + right]` intersected with
+  // `[0, seq_len)`. `std::nullopt` — every DeepSeek / MiniCPM3 / Kimi-Linear
+  // registration — leaves the full-context loop byte-identical: the window is
+  // not a mask applied afterwards, it is the loop's START BOUND, so an absent
+  // window is a NOT-TAKEN branch rather than a no-op.
+  //
+  // UPSTREAM. `TritonMLAImpl` itself REJECTS a sliding window
+  // (triton_mla.py:165-171); dots3-note SUBCLASSES it —
+  // `Dots3NoteTritonMLAImpl.__init__` passes `sliding_window=None` to super and
+  // keeps the value on itself (`vllm/models/dots3_note/nvidia/attention.py`
+  // :439-468 @ `bc2d63e650`), then `_forward_swa_mqa` (`:470-563`) gathers a
+  // window-bounded slice of the paged latent and masks the scores with
+  // `kv_positions >= query_position - WINDOW_SIZE + 1` (`:152`) and
+  // `kv_positions <= query_position` (`:151`). `WINDOW_SIZE` is
+  // `sliding_window_size` = 513, so `left == sliding_window - 1`, matching the
+  // `window_size=(sliding_window - 1, 0)` upstream hands FlashAttention on the
+  // PREFILL half (`:300`). The gather is upstream's Triton WORKSPACE strategy;
+  // the paged kernels here read the block table directly over the same key
+  // range, which is the same function with no gather and no mask.
+  //
+  // `right` must be 0: an MLA decode query IS the last position of its own
+  // sequence, so a positive right bound could only admit keys that do not
+  // exist. Anything else is refused BY NAME in ops.cpp rather than ignored.
+  std::optional<AttentionWindow> window_size = std::nullopt;
 };
 
 // Arguments for vt::MlaPrefillAttention (MLA campaign W5). Mirrors the scalar
@@ -866,6 +1400,26 @@ struct MlaPrefillAttentionArgs {
   // same fallback the FA-2 paged prefill launcher uses.
   int32_t max_seqlen_q = 0;
   int32_t max_seqlen_k = 0;
+  // ─── the SLIDING-WINDOW prefill arm (dots3-note W4b-2, #699) ──────────────
+  // OPTIONAL local-attention bounds, the `AttentionWindow` convention. Query
+  // `i` of a request whose query length is `Lq` and key length is `Lk` sits at
+  // the bottom-right aligned position `p = i + (Lk - Lq)`; visible keys are
+  // `[p - left, p + right]` intersected with `[0, Lk)`.
+  //
+  // UPSTREAM is literally this pair: `Dots3NoteFlashAttnPrefillBackend.
+  // run_sliding_window` calls `_flash_attn_varlen_diff_headdims(..., causal=
+  // True, window_size=(sliding_window - 1, 0))`
+  // (`vllm/models/dots3_note/nvidia/attention.py:279-305` @ `bc2d63e650`, the
+  // window at `:300`), so `left == sliding_window - 1` and `right == 0`.
+  //
+  // `causal` must be TRUE whenever this is set, and `right` must be 0. Both are
+  // refused BY NAME in ops.cpp rather than approximated: FlashAttention's local
+  // mask REPLACES the causal specialization (the adapter normalizes
+  // `is_causal = causal && !is_local`, cuda_flash_attn_fa2.cu:472-476), so a
+  // non-causal window would have to be spelled with an infinite right bound,
+  // which this struct cannot say. Upstream never asks for one — every windowed
+  // call it makes is the causal `(W-1, 0)` pair above.
+  std::optional<AttentionWindow> window_size = std::nullopt;
 };
 
 // Router SCORING function. softmax over all E is the Qwen3.6 / DeepSeek-V2
@@ -1065,6 +1619,16 @@ using AttnQkNormRopeFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
              const Tensor&, const RmsNormArgs&, const RopeArgs&);
 using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// MODEL-DSV4-EXL3 W2a/W2b. Both take their optional/small parameters through an
+// args struct rather than more Tensor arguments, because `pre_scale`/`post_scale`
+// are genuinely OPTIONAL (upstream's `c10::optional<at::Tensor>`,
+// hadamard.cuh:5-12) and `bits`/`codebook` are compile-time template parameters
+// on the device side that the host launcher dispatches on.
+using Exl3HadR128Fn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3HadArgs&);
+using Exl3GemmFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                            const Tensor&, Tensor&, const Exl3GemmArgs&);
+using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExpertTables&,
+                              const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -1172,6 +1736,9 @@ using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Te
 using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*weight*/, const Tensor* /*bias*/,
                                    const DepthwiseConv1dArgs&);
+// General 3-D convolution (#1007).
+using Conv3dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv3dArgs&);
 // BigVGAN / DAC vocoder 1-D convolutions (#672).
 using Conv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
                           const Tensor* /*bias*/, const Conv1dArgs&);
@@ -1189,6 +1756,15 @@ using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, con
                                              const Tensor&, const Tensor&, const Tensor&,
                                              const Tensor&, const Tensor&, const Tensor&,
                                              const DFlashPagedBlockAttentionArgs&);
+using DFlashGroupedConvFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                     const Tensor&, const DFlashGroupedConvArgs&);
+using Dflash2SelectorEdgesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Dflash2SelectorEdgesArgs&);
+using Dflash2PathWalkFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                   const Dflash2PathWalkArgs&);
+using TopKValuesIndicesFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
+                                     const TopKValuesIndicesArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -2760,6 +3336,53 @@ void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& ke
 void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
             const Conv2dArgs& args);
 
+// --- General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) --------------
+// Spec: .agents/specs/ltx25-device-residency.md `## W5`. Upstream mirror:
+// torch `nn.Conv3d` as `CausalConv3d` instantiates it — Lightricks/LTX-2 @
+// fd4ded7f2, packages/ltx-core/src/ltx_core/model/video_vae/convolution.py:292-302,
+// called once at :312, which is the WHOLE of the LTX-2.5 video VAE's arithmetic.
+//
+//   out    [Cout, Tout, Hout, Wout]
+//   x      [Cin,  Tin,  Hin,  Win ]
+//   weight [Cout * Cin/groups, KT, KH, KW]
+//   bias   optional rank-1 [Cout]
+// Tout = (Tin + 2*pad_t - dilation_t*(KT-1) - 1)/stride_t + 1, likewise H and W.
+// `groups` must divide both Cin and Cout; output channel oc reads input group
+// oc/(Cout/groups). Zero padding: taps outside the input extent are SKIPPED.
+//
+// BATCH 1, DELIBERATELY. torch's tensor is [N, Cin, T, H, W] and this one drops
+// the N axis, because `vt::Tensor` caps rank at 4 (include/vt/tensor.h:12) and
+// raising that cap changes the one struct every op in the tree passes. Batch 1
+// is what the video VAE decodes. A caller that needs N > 1 gets a refusal by
+// name from the wrapper, never a silently folded axis.
+//
+// THE WEIGHT'S TWO LEADING AXES ARE MERGED, for the same rank reason: torch's
+// [Cout, Cin/groups, KT, KH, KW] is rank 5, and [Cout * Cin/groups, KT, KH, KW]
+// is the same bytes in the same order. `Cout` comes from `out` and `Cin/groups`
+// from `x` and `args.groups`, so nothing is lost and the wrapper CHECKS the
+// product rather than trusting it.
+//
+// ACCUMULATION ORDER — CONTRACT, NOT DETAIL, AND NOT kConv2d's. Per output
+// element: one f32 accumulator seeded with the bias, then ONE f32 PARTIAL PER
+// INPUT CHANNEL walked strictly in (kt, kh, kw) order and added into it. That is
+// what torch's f32 convolution does — it is a blocked GEMM and sums one partial
+// per channel block — and it is what every committed LTX-2.5 video VAE golden
+// was taken through. kConv2d's single flat accumulator is a DIFFERENT number:
+// src/vllm/model_executor/models/ltx2_video_vae.cpp measures the flat order
+// pushing the non-causal tiled golden to 5.00679e-06 against a 5e-06 tolerance.
+// The two ops are siblings for exactly the reason kConv1d and kDepthwiseConv1d
+// are, and neither may be re-pointed at the other.
+//
+// The order is why the CPU and CUDA arms are BYTE-IDENTICAL rather than close:
+// the device kernel walks the same sweep with __fmul_rn/__fadd_rn, and the host
+// side is already pinned against FMA contraction by -ffp-contract=off
+// (CMakeLists.txt). tests/vt/test_ops_conv3d.cpp gates the order against an
+// independent in-test scalar reference.
+//
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv3dArgs& args);
+
 // P2 — NON-CAUSAL depthwise `nn.Conv1d(C, C, K, stride, padding, groups=C)`, the
 // conformer convolution module's temporal mixer.
 //   out    [N, C, Lout]
@@ -2819,26 +3442,46 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 //
 // THE NUMERIC CONTRACT, which is the load-bearing part.
 //
-// (1) Every output element owns ONE f64 accumulator. Not f32. The host
-//     reference these replace accumulated in double
-//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), every
-//     committed golden under `tests/parity/goldens/` for all four consumers was
-//     taken through it, and a narrower accumulator would move four shipped
-//     models at once. This is a DELIBERATE divergence from torch, which
-//     accumulates an f32 conv in f32; it is recorded rather than silently
-//     inherited because `.agents/porting.md` "Mirror the memory format" cuts
-//     both ways and a WIDER accumulator is exactly the class of divergence a
-//     token gate cannot see. Cost: the activations and weights stay f32 in
-//     memory, so nothing moves more bytes; only the register width differs.
+// (1) Every output element owns ONE f32 accumulator. Not f64. That is what
+//     torch accumulates a float convolution in, MEASURED rather than read: on a
+//     27-tap `[+1e8, 0.1 x 25, -1e8]` probe, where an f32 accumulator lands on
+//     exactly 0.0 in ANY summation order and an f64 one lands near 2.5,
+//     `F.conv1d` returns 0.0 at f32 and at bf16 and `F.conv_transpose1d`
+//     returns 0.0 at f32 (torch 2.11.0+cu130). vLLM owns neither op at the
+//     parity pin `555967922` — it drops the vocoder it would otherwise own,
+//     `qwen3_omni_moe_thinker.py:1975` — so torch is the reference here through
+//     the per-consumer secondary oracles, and where vLLM DOES own a convolution
+//     it states the same polarity itself (`csrc/cpu/mamba_kernels.hpp`,
+//     "Accumulate in float32 for precision").
+//
+//     THIS WAS f64 UNTIL VT-CONV1D-F32-ACC (#1474), justified by a claim that
+//     did not hold. The host reference these replaced did accumulate in double
+//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), but the
+//     goldens were never taken through it at that width: all four consumers'
+//     generators run torch in f32 (`scripts/gen-bigvgan-goldens.py:48` builds
+//     f64 and then calls `.float()`; `gen-ltx2-vae-goldens.py:223,234` and
+//     `gen-minimax-music3-acoustic-goldens.py:81,134` cast with
+//     `astype(np.float32)`), so this op was WIDER than the oracle its own
+//     goldens came from. The clause also cited `tests/parity/goldens/`, a
+//     directory that contains no vocoder, BigVGAN, LTX-2.5 VAE, FVQ or
+//     general-conv1d golden at all — they are `.inc` headers beside their tests
+//     (`tests/vllm/models/bigvgan_goldens.inc`, `ltx2_vae_goldens.inc`,
+//     `minimax_music3_acoustic_goldens.inc`). An uncheckable citation is how
+//     the first claim survived. Narrowing moved the port TOWARD its goldens:
+//     over 194 arms, 182 unchanged, 10 improved, 2 one ULP worse and three or
+//     more decimal orders inside their bounds.
+//     .agents/specs/vt-conv1d-f32-accumulator.md.
 //
 // (2) THE VISIT ORDER IS PINNED, not merely the value.
 //     Conv1d accumulates over (ic ascending, k ascending) with the bias seeded
 //     FIRST — `acc = bias; for ic: for k: acc += x*w`.
 //     ConvTranspose1d accumulates over (ic ascending, then input position t
 //     ascending, taking the single tap k with `t*stride + k*dilation == p`) with
-//     the bias added LAST. That is the exact sequence of additions the host
-//     scatter performed into each destination cell, which is what lets the
-//     gather-form kernels here be BIT-IDENTICAL to it rather than merely close.
+//     the bias added LAST. That is the sequence of additions the host scatter
+//     performed into each destination cell, which is what lets the gather-form
+//     kernels here be BIT-IDENTICAL to each other rather than merely close. The
+//     ORDER is the host loop's; since #1474 the WIDTH is not, so the identity
+//     holds between the providers here and not against that loop.
 //
 // (3) ConvTranspose1d SKIPS an input whose value compares equal to 0.0, exactly
 //     as the host loop did. That is not an optimisation that may be dropped: it
@@ -2847,16 +3490,26 @@ void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 //
 // Parallelism partitions OUTPUT elements only, so results do not depend on the
 // thread count or the launch geometry. Gated in
-// tests/vt/test_ops_conv1d_general.cpp against a verbatim copy of the pre-op
-// host loop, and in tests/vllm/models/test_host_parallel.cpp end to end.
+// tests/vt/test_ops_conv1d_general.cpp and tests/vllm/models/test_host_parallel.cpp
+// against in-test serial references that walk the declared order. Those
+// references were verbatim copies of the pre-op host loop until #1474 narrowed
+// them in lockstep with the kernels, so what they now assert is that the ORDER
+// did not move, not that the arithmetic matches a historical loop. Clause (1)
+// is what gates the WIDTH, and it is gated against torch's own answer rather
+// than against a copy of ourselves — `tests/vllm/models/test_host_parallel.cpp`,
+// `vocoder1d Conv1d / ConvTranspose1d accumulates in f32, which is what torch
+// does`, entering through the production `vllm::vocoder1d::*` entry point.
 //
 // (4) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE, not merely close.
-//     Both are one f64 accumulator per output element walked in the order
+//     Both are one f32 accumulator per output element walked in the order
 //     above; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56)
-//     and the device kernel uses `__dmul_rn`/`__dadd_rn`, so every operation on
-//     both arms is an IEEE double multiply or add with round-to-nearest-even on
+//     and the device kernel uses `__fmul_rn`/`__fadd_rn`, so every operation on
+//     both arms is an IEEE single multiply or add with round-to-nearest-even on
 //     the same values in the same sequence. The gate asserts `memcmp` equality,
-//     not a tolerance.
+//     not a tolerance. **UNVERIFIED at the narrowed width**: #1474 had no CUDA
+//     toolkit and no lease, so this clause rests on the construction and not on
+//     a run. Owed, and named as owed:
+//     .agents/specs/vt-conv1d-f32-accumulator.md §7.
 //
 // x/weight/bias/out are f32 only. f16/bf16 are REFUSED with a message naming
 // the gap rather than silently widened — no consumer has them and no golden
@@ -2940,6 +3593,46 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
 void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                          const Tensor& value, const AttentionArgs& args);
 
+// The head_dim domain AttentionDenseFlash can actually LAUNCH, as arithmetic a
+// host without a GPU can execute and a test can pin (#1544).
+//
+// The tiling is what bounds it: each CTA stages `kAttentionDenseFlashTileCols`
+// columns of BOTH K and V in dynamic shared memory, so it asks the driver for
+// `2 * cols * head_dim * sizeof(input element)` bytes. There is no
+// `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
+// anywhere in src/vt/cuda/, so that request is capped at CUDA's DEFAULT 48 KiB per
+// block on every architecture — not at the 256 the kernel's register blocking
+// allows, which is what this op used to advertise on its own. head_dim 256 in bf16
+// wants 64 KiB and in f32 wants 128 KiB; both are refused by the driver, and the
+// caller used to learn that from a bare launch error one `cudaGetLastError` later.
+//
+// This mirrors what vLLM makes every backend declare — `get_supported_head_sizes`
+// / `supports_head_size`, vllm/v1/attention/backend.py:155-163 @ 555967922 — where
+// the domain is consulted BEFORE dispatch rather than discovered by launching.
+// AttentionDenseFast (kAttentionDenseFast) uses NO shared memory and is the rung
+// that serves head_dim above the bound below.
+inline constexpr int64_t kAttentionDenseFlashTileCols = 64;
+// The register blocking: 8 elements per lane across 32 lanes.
+inline constexpr int64_t kAttentionDenseMaxHeadDim = 256;
+// CUDA's default per-block dynamic shared-memory cap, and it is INCLUSIVE. That
+// direction matters: head_dim 192 in bf16 lands on exactly 49152 bytes and launches
+// today, so an exclusive bound would refuse work that currently runs.
+inline constexpr int64_t kCudaDefaultDynamicSmemBytes = 49152;
+
+// Bytes of dynamic shared memory one CTA requests for `head_dim` at `elem_size`.
+constexpr int64_t AttentionDenseFlashSmemBytes(int64_t head_dim, int64_t elem_size) {
+  return 2 * kAttentionDenseFlashTileCols * head_dim * elem_size;
+}
+
+// The largest head_dim AttentionDenseFlash can launch for an input element size.
+// bf16 -> 192, f32 -> 96.
+constexpr int64_t AttentionDenseFlashMaxHeadDim(int64_t elem_size) {
+  if (elem_size <= 0) return 0;  // no element size, no admissible head_dim
+  const int64_t by_smem =
+      kCudaDefaultDynamicSmemBytes / (2 * kAttentionDenseFlashTileCols * elem_size);
+  return by_smem < kAttentionDenseMaxHeadDim ? by_smem : kAttentionDenseMaxHeadDim;
+}
+
 // Same contract as AttentionDenseFlash, but the CUDA impl runs the VENDORED
 // FlashAttention-2 forward (src/vt/cuda/flash_attn/) on its tensor cores instead of a
 // scalar per-warp recurrence — the kernel vLLM itself dispatches for dense non-causal
@@ -2949,9 +3642,12 @@ void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tenso
 // NOT bit-identical to AttentionDenseFast/Flash: `mma.sync` reassociates the QK^T and
 // PV reductions, so results differ within the bf16 envelope and adoption is gated on
 // the token-exact / ratified near-tie gate, never assumed. The FA-2 fast path applies
-// only to bf16, head_dim 64, non-causal, MHA (h_k == h) on CUDA with the vendored
-// kernels compiled; every other shape falls back to kAttentionDenseFlash, which is why
-// this op is safe to call generically. On CPU it dispatches to the SAME kernel as
+// only to bf16, head_dim 64 or 128, non-causal, MHA (h_k == h) on CUDA with the
+// vendored kernels compiled — that pair is the set of compiled NON-SPLIT
+// instantiations, `run_mha_fwd_<bfloat16_t, {64,128}, false>`, and the head dim is a
+// template parameter rather than an argument, so the set does not widen by editing a
+// comparison. Every other shape falls back to kAttentionDenseFlash, which is why this
+// op is safe to call generically. On CPU it dispatches to the SAME kernel as
 // Attention. Separate op so kAttention / kAttentionDenseFast / kAttentionDenseFlash
 // stay untouched.
 void AttentionDenseFa2(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
@@ -2990,6 +3686,57 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
                                const Tensor& block_table,
                                const DFlashPagedBlockAttentionArgs& args);
 
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314). See
+// DFlashGroupedConvArgs for the contract and the upstream anchor. Tensors:
+//   out           [T, H]                       the convolved sublayer stream
+//   x             [T, H]                       the sublayer input/output stream
+//   coefficients  [T, sides, taps, num_groups] the per-position kernel DELTAS
+//   base          [sides, taps, H]             the checkpoint's base_kernel
+// with H == num_groups * group_size and `args.side` in [0, sides). All four share
+// one float dtype (bf16 on every published checkpoint). CPU is the authoritative
+// reference; CUDA mirrors it bit-for-bit.
+void DFlashGroupedConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                       const Tensor& base, const DFlashGroupedConvArgs& args);
+
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314). See
+// Dflash2SelectorEdgesArgs for the contract and the upstream anchor. Tensors:
+//   scores          [B, L, K, K] f32   edge(b,l,predecessor,child)
+//   pred_codebook   [V, R]             candidate_selector.predecessor_codebook
+//   succ_codebook   [V, R]             candidate_selector.successor_codebook
+//   candidate_ids   [B, L, K] i64      compute_candidates' ids (target vocab)
+//   unary           [B, L, K] f32      compute_candidates' values
+//   hidden          [B, L, R]          hidden_projection(final hidden states)
+//   anchors         [B] i64            each request's verified anchor token
+// The two codebooks and `hidden` share one float dtype (bf16 on every published
+// checkpoint); `scores` and `unary` are always f32. CPU is the authoritative
+// reference.
+void Dflash2SelectorEdges(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                          const Tensor& succ_codebook, const Tensor& candidate_ids,
+                          const Tensor& unary, const Tensor& hidden, const Tensor& anchors,
+                          const Dflash2SelectorEdgesArgs& args);
+
+// DFlash2 candidate-selector PATH WALK (SPEC-DFLASH2 W4, #1314). See
+// Dflash2PathWalkArgs for the contract, the tie-break and the upstream anchor.
+// Tensors:
+//   tokens        [B, L] i64        the drafted token per (request, step)
+//   scores        [B, L, K, K] f32  vt::Dflash2SelectorEdges' output
+//   candidate_ids [B, L, K] i64     compute_candidates' ids (target vocab)
+// One request is one program: the step loop is INSIDE it, because step l reads
+// the predecessor row step l-1 chose.
+void Dflash2PathWalk(Queue& q, Tensor& tokens, const Tensor& scores,
+                     const Tensor& candidate_ids, const Dflash2PathWalkArgs& args);
+
+// Top-k that EMITS the surviving (id, value) pairs (SPEC-DFLASH2 W3 / D2,
+// #1314). See TopKValuesIndicesArgs for the contract, the tie-break and the
+// upstream anchor. Tensors:
+//   values   [rows, k] f32   the k largest logits of each row, DESCENDING
+//   indices  [rows, k] i64   their column indices, ties broken ASCENDING
+//   logits   [rows, V] f32   read-only (unlike vt::ApplyTopKTopP, which masks
+//                            its input in place)
+// `args.k` must be in [1, V - args.num_org_vocab_padding].
+void TopKValuesIndices(Queue& q, Tensor& values, Tensor& indices, const Tensor& logits,
+                       const TopKValuesIndicesArgs& args);
+
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;
 // the NHD cache layout is the one FlashAttentionBackend::get_kv_cache_shape
@@ -3018,9 +3765,10 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 // the fp8::scaled_convert scale convention, quant_utils.cuh:296-308) @ pin
 // 555967922. k_scale/v_scale are the per-tensor scales BaseKVCacheMethod loads
 // from the checkpoint (kv_cache.py:108-191); both must be > 0. Same shape/stride
-// contract as ReshapeAndCache; the ONLY difference is the fp8 store. CPU-only in
-// W1 (the CUDA fp8-KV store kernel is a named later brick); kFp8E5M2 CPU compute
-// is likewise a later brick.
+// contract as ReshapeAndCache; the ONLY difference is the fp8 store. Implemented
+// on CPU (W1, src/vt/cpu/cpu_cache.cpp) and CUDA (W2, src/vt/cuda/cuda_cache.cu,
+// gated byte-for-byte against the CPU arm); a backend that registers no provider
+// refuses by name in GetOp. kFp8E5M2 is a named later brick (spec W5).
 void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                         Tensor& v_cache, const Tensor& slot_mapping, Fp8KVCacheDataType kind,
                         float k_scale, float v_scale);
@@ -3295,6 +4043,19 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args);
 
+// SPEC-DFLASH2 W10 repair (#1865): process counter of spec-CLASSIFIED batches
+// arriving at the PagedAttention dispatch wrapper — a batch whose
+// `args.uniform_spec_query_len` passes `PagedAttnUniformSpecShape`. This is the
+// seam the W10 review named dead: deleting the model's
+// `pa.uniform_spec_query_len = meta.uniform_spec_query_len` threading redded
+// nothing on a CPU box, because the CUDA lane it feeds is `HasCuda`-gated and
+// the CPU kernel ignores the field. The counter makes the THREADING observable
+// on every backend: the production fixture asserts one arrival per uniform
+// verify step per full-attention layer. In-memory diagnostics, same shape as
+// v1::GraphDispatchStats; reset+read from one test at a time.
+uint64_t PagedAttnSpecClassifiedCount();
+void ResetPagedAttnSpecClassifiedCount();
+
 // --- V1 sampling ops (M1.7 Task 2). Ported from
 // vllm/v1/sample/ops/topk_topp_sampler.py + vllm/v1/sample/sampler.py @ e24d1b24.
 // The Sampler pipeline (M1.7 Task 4) composes these over the model's final
@@ -3555,5 +4316,276 @@ void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& 
 // sigmoid gate (moe-semantics.md §5), applied per token to the shared MLP
 // output. T inferred from out.shape[0], H = out.Numel()/T.
 void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
+
+// ─── EXL3 (exllamav3 trellis) reference dequant — CPU tier ───────────────────
+//
+// PORTED FROM exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT); vLLM
+// implements no EXL3 at the pin, so exllamav3 is the secondary oracle this
+// mirrors (.agents/specs/model-dsv4-exl3.md). Row MODEL-DSV4-EXL3 W1a.
+//
+// An EXL3 linear stores FOUR tensors and NO scales (`exl3.py:38`):
+//   trellis  int16 [k/16, n/16, 16*bits]  — 16x16 tiles of 256 codewords
+//   suh      fp16  [k]                    — left  sign/scale vector
+//   svh      fp16  [n]                    — right sign/scale vector
+//   mcg      int32 scalar                 — codebook marker, never read at
+//                                           inference (quantize.py:1414-1424)
+// and the full-weight reference is `LinearEXL3.get_weight_tensor`
+// (`exl3.py:227-237`): reconstruct -> blockwise Hadamard-128 on the left ->
+// `* suh[:,None]` -> blockwise Hadamard-128 on the right -> `* svh[None,:]`
+// (`exl3_lib/quantize.py:340-358`, both scaled by 1/sqrt(128); `had_k = had_n =
+// 128` at `quantize.py:15`). The RUNTIME instead transforms activations
+// (`had_r_128` in/out, `exl3.py:183-214`) — that arm is MODEL-DSV4-EXL3 W2.
+//
+// These are plain host functions, not OpProvider ops: they decode a CHECKPOINT
+// FORMAT at load time on the host, exactly like the GGUF/NVFP4 block dequants,
+// and W2's device kernels (`exl3_gemm`, `had_r_128`) are gated for byte parity
+// AGAINST them rather than dispatched beside them.
+
+// The 16-bit tail-biting codeword for weight `t` (0..255) of one packed tile.
+// `tile` is the tile's 16*bits int16 words as stored. Mirrors `dq`
+// (`exl3_dq.cuh:15-31`): the window ENDS at weight t, so t's own `bits` bits sit
+// in the low positions and weights t-1, t-2 … wrap around the tile above them.
+uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
+
+// The MCG codebook (cb == 1), three instructions (`codebook.cuh:67-75`):
+// `x *= 0xCBAC1FED; x = (x & 0x8fff8fff) ^ 0x3b603b60;` then the two fp16
+// halves summed in fp16. Returns that fp16 value widened to f32.
+float Exl3DecodeMcg(uint16_t codeword);
+
+// Row-major position (0..255) inside the 16x16 tile that codeword `t` decodes
+// into — upstream's `tensor_core_perm` (`exl3_lib/quantize.py:22-42`), which the
+// quantizer applies to a row-major tile before encoding.
+int Exl3TileRowMajorIndex(int t);
+
+// Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
+void Exl3DecodeTile(const uint16_t* tile, int bits, float* out256);
+
+// `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
+// reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
+// values. `k` and `n` must be multiples of 16.
+void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits,
+                          float* out);
+
+// `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
+// weight, f32 [k, n] row-major (k = in_features, both multiples of 128 because
+// both sides were Hadamard-transformed at quantization time). `suh`/`svh` are
+// the raw fp16 bit patterns as stored — they are NOT assumed to be signs; the
+// real DeepSeek-V4 checkpoint folds a per-channel scale into them.
+//
+// DEVIATION, recorded: upstream runs each 128-term Hadamard as an f32 GEMM;
+// this uses the fast Walsh-Hadamard butterfly, which is the same value in exact
+// arithmetic but a different f32 summation order. The fp16 round upstream
+// performs after each transform (`quantize.py:342-346,351-355` `.to(x_dtype)`)
+// absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
+// parity gate is stated against THIS function, not against torch.
+void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
+                       const uint16_t* svh, int64_t k, int64_t n, int bits,
+                       float* out);
+
+// ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────
+//
+// The W1a entries above decode a checkpoint FORMAT once, on the host, at load.
+// The two ops below run per FORWARD, on whatever device the queue names, and
+// are what makes the trellis tower fast rather than merely readable. The
+// contracts, the parity tiers, the output-dtype decision and the shape policy
+// are settled in `.agents/specs/model-dsv4-exl3.md` `## W2 design`; the summary
+// that a reader of this header needs is repeated at each declaration.
+//
+// DTYPE, stated once. `A`, `A_had`, `suh`, `svh` and (by default) `C` are
+// **fp16**, mirroring upstream's own memory format — `LinearEXL3
+// .default_out_dtype = out_dtype or torch.half` (`exl3.py:72`) and
+// `reconstruct_hgemm`'s `torch.empty(..., dtype = out_dtype or
+// self.default_out_dtype)` (`exl3.py:167`). `A` in particular has no freedom:
+// `ldmatrix.sync.aligned.m8n8.x4.shared.b16` +
+// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` (`ptx.cuh:52-74,203-212`)
+// read fp16 fragments. `C` may be f32, which is upstream's own `c_fp32` arm
+// (`exl3_gemm.cu:134` reads it off `C.dtype()`), kept because the MoE weighted
+// reduction earns the width — it is NOT the default, and it is NOT inherited
+// from `Exl3DequantLinear`'s `float* out`, which is a host decoder's carrier.
+//
+// The TRELLIS travels as `DType::kI8`, shape `[k/16, n/16, 32*bits]` BYTES —
+// the same opaque-storage idiom the fp8 KV pages use (`DType::kI8` storage,
+// see kFp8KvStore above). It is a packed bit stream, not an array of numbers,
+// and 32*bits bytes is upstream's `16*K` uint16 words per 16x16 tile.
+
+// `had_r_128` (`quant/hadamard.cu:88-110`):
+//   out = (in.view(-1, 128) @ H128) * (args.scale / sqrt(128))
+// with `args.pre_scale` multiplied in BEFORE the transform and
+// `args.post_scale` AFTER; at most one may be set. `in`/`out` are 2-D, same
+// dtype (f16 or f32), same shape, `cols % 128 == 0`, and `out` MAY alias `in`
+// (upstream: "Works inplace if y == x", `hadamard.cu:86`). The scale vectors are
+// fp16 with `cols` elements. H128 is the natural-order Sylvester matrix
+// (`util/hadamard.py:34-42` recurses to `hadamard_1.txt` = "+").
+//
+// PARITY: the CPU and CUDA arms are BYTE-IDENTICAL, not merely close. Both run
+// the same radix-2 FWHT in the same order — levels 1 and 2 on the four values a
+// lane holds (`hadamard_inner.cuh:118-129`), levels 4..64 as five xor-shuffle
+// steps (`shuffle_had_f4x32`, `:17-44`) — every operation in f32, one multiply
+// by `r_scale` at the end, one round to the destination dtype. It is NOT
+// bit-comparable to `Exl3DequantLinear`'s Hadamard, which rounds to fp16 after
+// every 128-block because it transforms WEIGHTS at quantization time.
+void Exl3HadR128(Queue& q, Tensor& out, const Tensor& in, const Exl3HadArgs& args);
+
+// `exl3_gemm` (`exl3_gemm.cu:110-309`): the fused EXL3 linear.
+//   C = had_r_128( had_r_128(A, pre_scale=suh) @ reconstruct(trellis),
+//                  post_scale=svh )
+// which is algebraically `A @ Exl3DequantLinear(trellis, suh, svh)` — the two
+// differ only in whether the Hadamards ride the activations or the weights
+// (`exl3.py:183-214` vs `:227-237`).
+//
+//   c        f16 or f32 [m, n], contiguous, need NOT be zeroed
+//   a        f16 [m, k], contiguous
+//   trellis  i8  [k/16, n/16, 32*bits] (bytes), contiguous
+//   suh      f16 [k]
+//   svh      f16 [n]
+//   a_had    f16 [m, k] scratch for the input transform; MAY alias `a`
+//   k % 16 == 0, n % 128 == 0, both % 128 for the Hadamards to be defined
+//
+// PARITY: the trellis DECODE is bit-exact against `Exl3DecodeTile`; the GEMM is
+// bounded, because `mma.m16n8k16`'s internal accumulation order is unspecified
+// by PTX and a split-K threadblock reduction sits on top. The bound is RMS
+// relative 1.0e-3 and 8 fp16 ulps of the output RMS elementwise, set by the fp16
+// destination (one store round is already 4.9e-4) and not by summation order
+// (f32 over k=4096 contributes 3.8e-6). It is stated here so no gate discovers
+// it; see the spec for why a wrong codeword misses by four orders more.
+void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+              const Tensor& suh, const Tensor& svh, Tensor& a_had,
+              const Exl3GemmArgs& args);
+
+// ─── The kernel-shape policy, as PURE HOST functions ─────────────────────────
+//
+// Ported verbatim from `exl3_kernel_map.cu:23-91,153-160` and the shape macros
+// at `exl3_kernel_map.cuh:53-60`. They are host functions with no CUDA in them
+// ON PURPOSE: the selection table is the part of W2b that can be gated on a
+// machine with no GPU, and a table that only a device run can check is a table
+// nobody checks.
+
+// Upstream's five-way compute-capability BUCKET (`exl3_devctx.cu:32-46`). Not a
+// new classification: `major >= 10` is Blackwell, so GB10 (sm_121) is
+// kBlackwell, and every threshold below is upstream's.
+enum class Exl3Cc : int {
+  kOld = 1,
+  kAmpere = 2,
+  kAda = 3,
+  kHopper = 4,
+  kBlackwell = 5,
+};
+Exl3Cc Exl3CcFromSm(int sm_major, int sm_minor);
+
+// One row of the shape table (`exl3_kernel_map.cuh:53-60`). `shape_idx` is
+// 1-based; index 0 is upstream's `nullptr` slot and has no geometry.
+struct Exl3GemmShape {
+  int tile_m = 0;
+  int tile_k = 0;
+  int tile_n = 0;
+  int sh_stages = 0;
+  int frag_stages = 0;
+  int block_dim = 0;
+};
+int Exl3GemmNumShapes();
+Exl3GemmShape Exl3GemmShapeParams(int shape_idx);
+
+// `select_gemm_shape` (`exl3_kernel_map.cu:23-75`). Returns a 1-based shape
+// index, or 0 when the bucket has no rule (upstream's fallthrough). `multi` is
+// upstream's mgemm flag; this wave always passes false (the fused MoE mgemm is
+// W2d), and the parameter is kept so the ported table stays readable against its
+// anchor.
+int Exl3SelectGemmShape(Exl3Cc cc, int size_m, int size_k, int size_n, int bits,
+                        bool multi);
+
+// `exl3_gemm_shape_compat` (`exl3_kernel_map.cu:86-91`). DEVIATION, recorded:
+// upstream's signature also takes `size_m` and `K` and reads NEITHER, so they
+// are dropped here rather than carried as unused parameters that `-Werror`
+// would then have to be told about.
+bool Exl3GemmShapeCompat(int shape_idx, int size_k, int size_n);
+
+// The empty-block clamp (`exl3_kernel_map.cu:153-160`): a launch never gets more
+// blocks than there are k x n tiles to give them, and never fewer than one.
+int Exl3GemmNumSms(int shape_idx, int size_k, int size_n, int device_sms);
+
+// ─── The m<=8 GEMV envelope, also PURE HOST — MODEL-DSV4-EXL3 W2c ────────────
+//
+// Ported from `exl3_gemv.cu:29-42,46-72,110-114`. Host functions for the same
+// reason the shape table is: this is where the arm is CHOSEN, and a choice only
+// a device run can inspect is a choice nobody inspects. It matters more here,
+// because the sentence this arm is usually dismissed with — "Ada/Blackwell are
+// memory-bound here and keep the regular kernel" — describes a guard that is
+// COMMENTED OUT at `exl3_gemv.cu:53` (and again at `:119`). No
+// compute-capability test is live; the shape envelope alone decides.
+
+// `EXL3_GEMV_MAX_M` (`exl3_gemv_kernel.cuh:31`). Above it the kernel has no
+// fragment rows to put the extra tokens in.
+inline constexpr int kExl3GemvMaxM = 8;
+
+// The HARD constraints (`exl3_gemv.cu:108-114`), free integer tests that run
+// before any environment read or device query. `has_su_sv` is upstream's own
+// precondition that the call carries suh, A_had and svh: the GEMV kernel does
+// the input and output Hadamards itself and has no arm without them.
+bool Exl3GemvHardEligible(int size_m, int size_k, int size_n, int bits, int codebook,
+                          bool has_su_sv);
+
+// `exl3_gemv_cfg` (`exl3_gemv.cu:46-72`). Returns -1 (not eligible), 0 (the
+// narrow config: 512 threads, one block per 32 output columns) or 1 (the wide
+// config: 256 threads, 64 columns).
+//
+// `narrow_coresident` is `cudaOccupancyMaxActiveBlocksPerMultiprocessor(narrow,
+// 512) * num_sms` (`exl3_gemv.cu:127-142`) — a DEVICE query, and a PARAMETER
+// here rather than a call made inside, which is what makes the envelope
+// gateable with no GPU. For this checkpoint it is also the only input that
+// decides anything: w2 (k=2048, n=4096) is eligible without it, and w1/w3
+// (k=4096, n=2048) rest entirely on whether it reaches 2048/32 = 64.
+//
+// `mode` is `VT_EXL3_GEMV` (see Exl3GemvParseMode).
+int Exl3GemvSelectConfig(Exl3Cc cc, int size_m, int size_k, int size_n, int bits, int codebook,
+                         int mode, int narrow_coresident);
+
+// `VT_EXL3_GEMV`, mirroring upstream's `EXL3_GEMV` (`exl3_gemv.cu:29-34`):
+// 0 off, 1 or unset the heuristic, 2 wherever the hard constraints allow,
+// 3 force narrow, 4 force wide. The parse is separated from the getenv so it is
+// unit-testable without touching the environment.
+int Exl3GemvParseMode(const char* env_value);
+int Exl3GemvMode();  // the process-cached read of VT_EXL3_GEMV
+
+// `VT_EXL3_GEMV_SMEM`, mirroring `EXL3_GEMV_SMEM` (`exl3_gemv.cu:37-42`):
+// -1 or unset the per-bits default, 0 force shuffle extraction, 1 force
+// shared-memory staging.
+int Exl3GemvParseSmemMode(const char* env_value);
+int Exl3GemvSmemMode();
+
+// ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
+//
+// `exl3_moe` (`exl3_moe.cu:99-301`): ONE call runs gate, activation and down for
+// every routed expert of every token in a block, where `Exl3Gemm` alone costs
+// one call per (token, expert, projection). Per expert the kernel gathers that
+// expert's tokens through `token_sorted`, applies the input Hadamard while
+// gathering, runs the gate and up GEMMs into the intermediate buffers, fuses the
+// output Hadamards with the activation and the down input Hadamard in one pass,
+// runs the down GEMM, and scatter-adds the weighted result into `output_state`.
+//
+//   output_state    **f32** [bsz, hidden], ZERO-INITIALIZED, ACCUMULATED into
+//   hidden_state    f16 [bsz, hidden]
+//   tables          nine i64 [num_experts] pointer arrays (Exl3MoeExpertTables)
+//   routing         expert_count / token_sorted / weight_sorted
+//   temps           four f16 [concurrency, max_tokens_per_expert, dim] buffers
+//   hidden % 128 == 0 and intermediate % 128 == 0 (both sides carry a blockwise
+//   Hadamard-128, the same rule Exl3Gemm states)
+//
+// `output_state` IS f32 and that is upstream's own width
+// (`TORCH_CHECK_DTYPE(output_state, kFloat)`, `exl3_moe.cu:151`), not a
+// widening: the epilogue accumulates one contribution per (token, active
+// expert) with an atomicAdd (`hadamard_inner.cuh:469-472`), and an fp16
+// accumulator over six weighted contributions loses bits a token gate can see.
+// Everything else stays fp16.
+//
+// PARITY: tiers 1 and 2 are unchanged, because the fused kernel calls the same
+// tile loop and the same 128-point butterfly. Against the per-expert
+// `Exl3Gemm` loop the bound is TIER 4 — 2.0e-2 relative RMS — and the reason is
+// the ACTIVATION, not the GEMM: the loop arm rounds the intermediate to f32,
+// activates in f32 and rounds back, while the fused arm keeps it fp16
+// throughout as upstream does, and the down projection then sums `intermediate`
+// of them. See the spec's `## W2cd design` W2d-7 for the arithmetic.
+void Exl3MoeMlp(Queue& q, Tensor& output_state, const Tensor& hidden_state,
+                const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
+                const Exl3MoeTemps& temps, const Exl3MoeArgs& args);
 
 }  // namespace vt

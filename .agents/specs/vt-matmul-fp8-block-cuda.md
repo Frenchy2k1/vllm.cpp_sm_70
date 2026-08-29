@@ -27,9 +27,14 @@ TMA-aligned activation-scale LAYOUTS that `vt::QuantFp8Group` could emit
 directly (see `## Owed`); and any speed claim, which needs hardware this row
 does not take.
 
-**No GPU lease is taken and no on-hardware run is performed.** The fleet is
-contended. What this row establishes is the compile leg and the host-side
-dispatch decision; §`## Owed` states plainly what is not established.
+**This row's landed change took no GPU lease and performed no on-hardware run.**
+The fleet was contended. What that change establishes is the compile leg and the
+host-side dispatch decision. Two on-hardware runs came later, both under
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437) and both recorded in
+§`## Owed`: the first FAILED, and the second MATCHES the CPU reference on the
+seven shapes it was run on. That section states plainly what is and is not
+established after them. The token gate was not one of them; it ran separately on
+2026-08-23 and passed, under `GATE-QWEN38-27B-FP8-BLOCK`.
 
 ## Which implementation actually runs, and why
 
@@ -157,14 +162,21 @@ its f32 sinks, and recorded here for the same reason: nothing widens the GEMM,
 the extra width buys no precision, and a reader must not mistake the f32 sink
 for an f32 compute path. One instantiation per config, three in total.
 
-### Ragged edges — supported, with the refusal upstream itself takes
+### Ragged edges — refused by name, at two different floors
 
-**Ragged block boundaries are SUPPORTED.** `tile_atom_to_shape_SFB` sizes the
-scale grid with `ceil_div(N, 128)`, so a short final N-block is expressible and
-CUTLASS predicates it. That is not inference: upstream's own CUTLASS test is
-`M=32, N=576, K=7168` — `576 = 4*128 + 64` — chosen because DSV3's
-`kv_a_proj_with_mqa` has that shape, and it asserts against the same reference
-this arm is measured against. G2 ports that case whole.
+**Ragged block boundaries are REFUSED on sm120, and this section said the
+opposite until [#1437](https://github.com/mudler/vllm.cpp/issues/1437).**
+`tile_atom_to_shape_SFB` does size the scale grid with `ceil_div(N, 128)`, so a
+short final N-block is EXPRESSIBLE — that part was right, and it is why the
+error looked safe. It is not sufficient: `sm120_mma_tma_blockwise_scaling.hpp`'s
+`can_implement` refuses the configuration three lines further down, requiring
+`N % ScaleGranularityN == 0` and `K % size<2>(TileShape{}) == 0`, and the sm90
+sibling requires neither. Upstream's own CUTLASS test is `M=32, N=576, K=7168` —
+`576 = 4*128 + 64` — chosen because DSV3's `kv_a_proj_with_mqa` has that shape,
+and on sm120 that shape cannot reach the GEMM at all. The full derivation, per
+config, is in `## Owed` below; `kScaleBlockN` and `kTileK` are that refusal, G4
+pins both by message and G6 pins the grid's partition. G2 ports upstream's case
+as a REFUSAL plus upstream's fixture on the nearest servable `N`.
 
 **The CUTLASS ALIGNMENT floor is refused by name.** `AlignmentA` and
 `AlignmentB` are `128 / sizeof_bits<e4m3>` = 16 elements, and both operands
@@ -197,6 +209,19 @@ blockwise config is built at `(1, 128, 128)` or `(128, 1, 128)`. The loader
 already refuses a `weight_block_size` other than `[128, 128]` at load
 (#1189 M3), so this is the same refusal restated where the kernel can see it,
 not a new limit.
+
+**`Fp8BlockScaledRefusalFor` takes `(n, k, block_n, block_k)` and cannot ask
+about `m`.** That is correct today and it is a claim about the CONFIGS, not
+about the predicate: `can_implement` meets `m` at granularity 1 on the unswapped
+path and at granularity 1 under swap, so there is nothing for a fourth parameter
+to ask. A fourth config with `ScaleGranularityM != 1` unswapped — or
+`ScaleGranularityN != 1` swapped — would bind `m`, and the signature would then
+have to change. That condition is not left to a comment:
+`cuda_matmul_fp8_block_cutlass.cu` `static_assert`s it against the three
+configs' own granularities and against `size<2>(TileShape{})`, the same
+expression `can_implement` uses, so the constant cannot agree with the config by
+having been copied from it. A config that broke the tie fails the build rather
+than the fleet.
 
 ### The host-side decision is a pure function, and it is where the gate lands
 
@@ -243,8 +268,19 @@ kernel keeps refusing rather than falling through to the host reference tier
 and dereferencing device pointers.
 
 It also means a `sm_12xa` CUDA user stops being refused and starts running a
-kernel **that has never executed**. `docs/USAGE.md` and `docs/FEATURES.md` say
-so in this change, in those words, and `## Owed` is the record.
+kernel that, **at M5's landing**, had never executed. `docs/USAGE.md` and
+`docs/FEATURES.md` said so in that change, in those words, and `## Owed` was the
+record.
+
+**SUPERSEDED, and the rest of this section is kept as the reasoning taken at M5
+rather than as a current description.** The kernel has since executed on
+`dgx:gpu0` twice. The first run FAILED; after the intervening repair it MATCHES
+the CPU reference on the shapes it was run on. Neither run adjudicated a token
+against any oracle and neither produced a speed number -- see `## Owed` and
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437). Both pages were
+corrected in the change that recorded each run and no longer carry a
+never-executed label, so any sentence below asserting that they do is history.
+The design decision itself is unchanged and is not being re-argued here.
 
 ### Why it ships registered rather than behind an opt-in flag
 
@@ -259,12 +295,25 @@ with no premise, and this tree already carries several of those.
 The honest control is a LABEL rather than a flag, and the tree has one:
 `cmake/CudaArchFeatures.cmake` already ships `scaledmm-c3x-sm90` and
 `cutlass-nvfp4-sm100` as `DERIVED+BUILD-VERIFIED (testing-welcome)` — compiled
-and gencode-proven, never run on the board they target. This arm is in exactly
-that state and is described in exactly those words in `docs/USAGE.md`,
-`docs/FEATURES.md`, the commit body, the pull request body and `## Owed`. What
-makes that acceptable rather than reckless is that the first person to run it
-gets a written, registered test that says what to compare against and what the
-criterion is, instead of a kernel and a shrug.
+and gencode-proven, never run on the board they target. That label remains
+correct for those two features. At M5's landing this arm was in the same state
+and was described in those words in `docs/USAGE.md`, `docs/FEATURES.md`, the
+commit body, the pull request body and `## Owed`. **It no longer is**: the runs
+under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) took it first to
+RUN AND FAILING and then, once
+[#1453](https://github.com/mudler/vllm.cpp/pull/1453) had encoded the shape
+partition, to RUN AND MATCHING THE CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN
+ON, with no token gate at that date. **That position has since been superseded
+on both live surfaces**, because the token gate ran on 2026-08-23 and passed:
+`docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which
+[#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of
+`docs/USAGE.md` into `docs/models/qwen3-8-27b.md`, were both corrected in the
+change that recorded the pass. What made the label
+acceptable rather than reckless was that the first person to run it would get a
+written, registered test saying what to compare against and what the criterion
+is, instead of a kernel and a shrug. That is what happened twice over: the test
+produced the throw the first run recorded, and the same test produced the
+comparison the second one records.
 
 ### `check-cuda-op-arch-gate`: checked, and correctly NOT extended
 
@@ -284,7 +333,7 @@ TU present and that the new registration is the only one for its OpId.
 |---|---|
 | the activation scale is passed row-major, so every element after the first K-block reads the wrong scale | G3 pins both deduced layout formulas against a hand-derived table taken from `blockwise_scale_layout.hpp`, not from the implementation; G2 would fail on hardware |
 | the transpose is skipped for `k_tiles == 1`, where row-major and column-major coincide, and the bug hides | G3's table includes `k_tiles == 1` AND `k_tiles > 1`, and the kernel has no `k_tiles == 1` special case to skip |
-| a ragged N silently mis-slices | ragged N is supported and G2 is upstream's own `N=576` case; G4 asserts no refusal for it |
+| a ragged N silently mis-slices | AT M5: ragged N is supported and G2 is upstream's own `N=576` case; G4 asserts no refusal for it. FALSIFIED by [#1437](https://github.com/mudler/vllm.cpp/issues/1437), and the control is now the opposite one. Raggedness IS the cause and it is isolated by source: `sm120_mma_tma_blockwise_scaling.hpp::can_implement` requires `N % ScaleGranularityN == 0` and `K % size<2>(TileShape{}) == 0`, the sm90 sibling requires neither, and `N=576` is `4*128+64`. `Fp8BlockScaledRefusalFor` now REFUSES `N % 128 != 0` and `K % 128 != 0` by name, G4 pins both refusals and their messages, and G6 pins the grid's partition |
 | a misaligned K takes the kernel anyway and reads past a tile | refused by name; G4 asserts the refusal for `K=3884` and that the message names K and its remainder |
 | the M heuristic drifts from upstream, so decode silently stops using `swapab` | G1 pins all three boundaries by value, including `M=1`, `M=64`, `M=65`, `M=66`, `M=68`, `M=256`, `M=257` |
 | a block size other than 128x128 reaches a collective built for 128 | refused by name; G4 |
@@ -292,7 +341,7 @@ TU present and that the new registration is the only one for its OpId.
 | the f32 sink is read as an f32 compute path | recorded above and in the TU's header comment; the collective is instantiated for bf16 only |
 | a grown workspace is freed while a captured graph still holds its pointer | `RetireGraphScratch`, the same discipline both sibling CUTLASS TUs use |
 | the counter advances on a call that then throws, overstating dispatch | incremented after `run` returns `kSuccess`, and G5 asserts the ordering by counting a refused call |
-| a reader believes this arm was measured | `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all say it was not |
+| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the surfaces that still carry the claim have to keep saying exactly how far it reaches. Those are `## Owed`, `docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of `docs/USAGE.md` into `docs/models/qwen3-8-27b.md`; the M5 commit and pull request bodies are history and cannot be corrected. How far it reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO speed number. The TOKEN GATE is no longer part of this caveat: it ran on 2026-08-23 and passed, under `GATE-QWEN38-27B-FP8-BLOCK`, and the surfaces above were corrected in the same change |
 
 ## Tests
 
@@ -318,9 +367,16 @@ machine including this one**, registered in `tests/CMakeLists.txt` with
   and a transpose bug is invisible.
 - **G4** the refusals, each by name and each with the message asserted:
   `K % 16 != 0` (upstream's `K=3884`), `N % 16 != 0`, `block_n != 128`,
-  `block_k != 128`, and the three shapes that must NOT be refused —
-  `N=576` ragged, `K=7168`, and the target checkpoint's `q_proj`
-  `N=12288, K=5120`.
+  `block_k != 128`, and — since [#1437](https://github.com/mudler/vllm.cpp/issues/1437) —
+  the sm120 collective's own two floors, `K % 128 != 0` (`kTileK`) and
+  `N % 128 != 0` (`kScaleBlockN`), with `N=576` in the REFUSED half rather than
+  the accepted one. The shapes that must NOT be refused are the target
+  checkpoint's `q_proj` `N=12288, K=5120`, its transpose, and `N=128, K=128`.
+  The `% 16` floor is asked FIRST although `% 128` is stricter, because the two
+  answer to different authorities — `% 16` is vLLM's own reroute line
+  (`_custom_ops.py`, `cutlass_compatible_b`) and `% 128` is CUTLASS's sm120
+  line, which vLLM never reaches because it never asks — and each message names
+  the other, so no answer sends a reader to a shape that is still refused.
 - **G5** the counter's accounting: it advances per config, by one per
   dispatch, on the config the heuristic named; a refusal advances the refusal
   counter and no config counter; and the four counters are read as one
@@ -336,16 +392,43 @@ a hardcoded path would be a second, weaker copy of it.
 with no device, and a skip is not a pass.** The file is registered so that CI
 builds it and a leased box runs it.
 
-- **G2** upstream's `test_w8a8_block_fp8_cutlass_matmul` ported whole:
-  `M=32, N=576, K=7168`, `block_size=[128,128]`, `out_dtype=bf16`, scales
-  `U(0,1) * 1e-2`, compared against **M2's CPU arm on a CPU queue in the same
-  process** with upstream's own criterion, `rel_diff < 0.001`, computed by
-  upstream's own formula. Plus a per-element bound and a vacuity guard, because
-  a mean-relative criterion cannot see a single wrong element and an all-zero
-  output passes any ratio of means.
+- **G2** upstream's `test_w8a8_block_fp8_cutlass_matmul`, `M=32, N=576,
+  K=7168`, `block_size=[128,128]`, `out_dtype=bf16`, scales `U(0,1) * 1e-2`,
+  compared against **M2's CPU arm on a CPU queue in the same process** with
+  upstream's own criterion, `rel_diff < 0.001`, computed by upstream's own
+  formula. Plus a per-element bound and a vacuity guard, because a
+  mean-relative criterion cannot see a single wrong element and an all-zero
+  output passes any ratio of means. **ONE ADAPTATION, forced by the arch and
+  documented at the case** ([#1437](https://github.com/mudler/vllm.cpp/issues/1437)):
+  upstream's `N=576` cannot reach this collective at all, so the case asserts
+  the NAMED REFUSAL for upstream's exact shape — on the host predicate
+  everywhere, and on a device with the message and the counter — and then runs
+  upstream's fixture, criterion and formula on `N=512`, the nearest servable N.
+  Upstream's own test cannot pass on sm120 either: it gates the module only at
+  `get_device_capability() < (9, 0)` (`test_block_fp8.py`), which cc 12.1
+  passes.
+- **G6** the grid's PARTITION against a hand-written `expect` column, not "the
+  arm accepts everything". The old wording is the defect #1437 found: G6 passed
+  while three grid shapes threw. It also asserts that both lanes are non-empty,
+  that the servable half still covers all three tile configs, and that the
+  refused half spans the swapped AND the unswapped path — the last being what
+  makes "the swap is the bug" falsifiable rather than merely unasserted.
+  **The servable half reaches `N = 128`, and that entry is what binds
+  OVER-refusal.** A grid whose every servable `N` is 512 cannot tell 128 from
+  256, because `512 % 256 == 0`: raising `kFp8BlockScaledScaleBlockN` to 256 —
+  a predicate that turns away shapes the collective CAN implement — left this
+  whole file green at `37 | 37 passed`, and only one host-tier boundary
+  assertion caught it. `{200, 128, 1024}` is servable, sits at the collective's
+  own floor of one complete scale block, reuses an `M` already in the sweep so
+  it adds no new `M` behaviour, and fails the moment the predicate refuses more
+  than `can_implement` does. G6 asserts that such an entry EXISTS, so it cannot
+  silently drift out of the grid again.
 - **G7** the M sweep: `M` at 1, 7, 8, 32, 83, 200, 512 against the same
   reference, so all three configs are exercised, with the counter asserted to
-  show the config `Fp8BlockScaledConfigFor` predicted for each.
+  show the config `Fp8BlockScaledConfigFor` predicted for each. Since #1437 the
+  sweep also DRIVES each unservable shape and asserts a named refusal, no
+  dispatch and one counted refusal. It no longer aborts at `Grid()[0]`, which is
+  how seven of eight shapes went unattempted on the first hardware run.
 - **G8** the f32 sink equals the bf16 result cast up, elementwise.
 - **G9** the refusals from §Ragged, on a device, with the message.
 
@@ -361,27 +444,301 @@ builds it and a leased box runs it.
 | the arch gate | `python3 scripts/check-cuda-op-arch-gate.py` |
 | record | `scripts/agent-preflight.sh --fail-on-skip` |
 | **compile leg** | CI `cuda-fat-build`, which configures `120a;121a` among ten archs with `-DVLLM_CPP_CUTLASS_FETCH=ON` and audits per-source gencode |
-| **the on-hardware leg** | NOT RUN. See `## Owed`. |
+| **the on-hardware leg** | RUN TWICE on `dgx:gpu0`, both on 2026-08-20. At `63d87805c` it FAILED with two throws. At `7481a2eec`, which carries [#1453](https://github.com/mudler/vllm.cpp/pull/1453), the same suite run UNPATCHED reports 5 cases, 136 assertions, 0 failed, and zero reference-tier lines. No command is named here because the run needs a lease and hardware this table cannot invoke. See `## Owed` and [#1437](https://github.com/mudler/vllm.cpp/issues/1437). |
 
 ## Owed
 
-- **No on-hardware run.** This kernel has never executed. G2, G7, G8 and G9 are
-  written, registered and RED-by-absence: on this host they report a skip, and a
-  skip is not a pass. What is established here is that the TU compiles for
-  `sm_120a`/`sm_121a` in CI and that the host-side dispatch decision is
-  correct against upstream's own source. What is NOT established is that the
-  kernel produces the reference's numbers, or any numbers.
-- **No token gate.** `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned
-  oracle on this arm, on any device.
-- **No speed claim.** None is made anywhere in this change. The row takes no
-  lease, so it has no denominator, no clock state and no contention record —
-  the three things `.agents/benchmarking.md` requires before a ratio means
-  anything.
+- ~~**No on-hardware run.**~~ ~~**RUN, AND FAILING.**~~ **RUN, AND MATCHING THE
+  CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN ON.** Two runs, both 2026-08-20, and the
+  second one is the current position: read the FIRST RUN and the ROOT CAUSE
+  below as the history that produced it, and `CONFIRMED ON HARDWARE` at the end
+  as where this row stands.
+
+  **FIRST RUN, AND FAILING.** Measured 2026-08-20 on
+  `dgx:gpu0` (NVIDIA GB10, driver 580.173.02, compute capability 12.1) in an
+  `rc` lease, at tree `63d87805c`, CUDA 13.0 Release,
+  `-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_FETCH=ON`. The kernel
+  executed. **G2 and G7 THROW `cutlass Invalid status`** from
+  `gemm_op.can_implement(args)`
+  (`src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:362`) on upstream's own ported
+  case, M=32 N=576 K=7168. G6, G8 and G9 pass, and the two failures are throws
+  rather than value mismatches.
+
+  What proves this was an EXECUTION and not a skip is the throw text, not the
+  assertion count. `vt cuda: matmul_fp8_block_scaled: cutlass Invalid status` is
+  assembled by this file's own `VT_CUTLASS_CHECK`
+  (`src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:103-110`), and the prefix
+  `matmul_fp8_block_scaled: cutlass ` appears in NO other translation unit -- the
+  per-tensor sibling `cuda_matmul_fp8_cutlass.cu` defines a macro of the same
+  name but writes a different message -- in a TU the build compiles only when
+  CUTLASS is found, so the string cannot be produced by a host fallback. Two
+  independent controls agree: the run logged ZERO `[vt reference-tier]` lines, so
+  the op was registered and nothing quietly ran on CPU, and provenance was
+  checked on the artifact rather
+  than on the log -- `cuda_matmul_fp8_block_cutlass.cu.o` exists and
+  `cuobjdump --list-elf` reports
+  `cuda_matmul_fp8_block_cutlass.cu.1.sm_121a.cubin`.
+
+  The suite line reads 5 cases, 3 passed, 2 failed, **34 assertions, 0 failed**.
+  That number is recorded but is the WEAKEST evidence here, and it is attributed
+  so that nobody rests the execution claim on it: **27** of the 34 are G6, which
+  carries no `HasCuda()` guard and prints identically on a box with no device
+  (8 grid entries x 3 `CHECK`, plus the 3 tile-config `CHECK`s); the
+  device-only remainder is G8's **2** and G9's **5**. A pure skip of this file
+  printed 27 AT THAT TREE. #1453 later grew the host tier to 41, which is the
+  baseline the second run below is measured against; the two numbers describe
+  two trees and do not disagree.
+
+  This is a WORSE position than the sentence it replaces, not a better one. The
+  row was "unmeasured"; it is now "measured and failing". Tracked by
+  [#1437](https://github.com/mudler/vllm.cpp/issues/1437).
+
+  **ROOT CAUSE, ISOLATED BY SOURCE, AND THE HOST-SIDE HALF FIXED.** The
+  ragged-N hypothesis is confirmed and it is no longer a hypothesis. CUTLASS's
+  sm120 blockwise collective refuses a shape without complete scale blocks --
+  `include/cutlass/gemm/collective/sm120_mma_tma_blockwise_scaling.hpp`,
+  `can_implement`, three lines that the TMA-alignment checks above them do not
+  imply:
+
+  ```cpp
+  // Ensure complete scale blocks
+  implementable = implementable && (M % ScaleGranularityM == 0);
+  implementable = implementable && (N % ScaleGranularityN == 0);
+  // We expect full tiles in K
+  implementable = implementable && (K % size<2>(TileShape{}) == 0);
+  ```
+
+  The sm90 sibling
+  `sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp` has NO such
+  block -- four `check_alignment` calls and nothing about scale-block
+  completeness -- so this is an sm120 property, not a property of block-wise
+  FP8. Read in CUTLASS 4.5.0, which this tree builds against; the same lines are
+  byte-identical at upstream's pinned `CUTLASS_REVISION "v4.4.2"`, so the
+  version is not the cause and downgrading is impossible anyway
+  (`CMakeLists.txt` requires >= 4.5.0 for the sm120a NVFP4 fp4xfp4 GEMM).
+
+  **The constrained extent is N in all three configs, and the swap does not move
+  it.** The collective reads its granularities off the deduced scale layouts
+  (`ScaleGranularityM = size<0,0>(LayoutSFA)`,
+  `ScaleGranularityN = size<0,0>(LayoutSFB)`, the same file `:129-131`), and
+  `RunBlockwiseGemm` builds the problem shape as `(m,n,k)` unswapped and
+  `(n,m,k)` under swap:
+
+  | config | tile | granularities | problem shape | the lines that bind |
+  |---|---|---|---|---|
+  | default | 128x128x128 | `(1,128,128)` | `(m,n,k)` | `N % 128` -> `n`; `K % 128` -> `k` |
+  | pingpong | 64x128x128 | `(1,128,128)` | `(m,n,k)` | `N % 128` -> `n`; `K % 128` -> `k` |
+  | swapab | 128x32x128 | `(128,1,128)` | `(n,m,k)` | `M % 128` -> `n`; `K % 128` -> `k` |
+
+  So `n` is constrained in every config -- as the collective's N unswapped and
+  as its M under swap -- `m` is constrained in none, and `TileShape_K` is 128 in
+  all three. Same number, different slot. `M=32, N=576, K=7168` takes `swapab`
+  because `M <= 64`, and `576 % 128 = 64` fails `M % ScaleGranularityM`; the
+  unswapped path fails the identical arithmetic one slot over.
+
+  **The defect that was OURS, and is now repaired.** Not the port: the TU
+  matches upstream's `scaled_mm_blockwise_sm120_fp8_dispatch.cuh` at the pin
+  line for line, including both clauses of the heuristic, all three configs and
+  every `conditional_t` switch. The defect is that `Fp8BlockScaledRefusalFor`
+  ACCEPTED these shapes, so the user-visible answer was a raw
+  `cutlass Invalid status` -- a string that names no dimension, no granularity
+  and no architecture -- instead of a refusal that names the missing part, which
+  this project requires of an unimplemented arm. G6 asserted that every shape
+  the file drives is accepted and therefore PASSED while the kernel threw on
+  three of them: the predicate and `can_implement` disagreed, and the
+  precondition agreed with the wrong side. The predicate now carries
+  `kScaleBlockN` (`N % 128 != 0`) and `kTileK` (`K % 128 != 0`); G4 pins both by
+  name and by message on a device-free host, G6 pins the grid's partition, and
+  G2/G7 drive each unservable shape to its named refusal.
+
+  **AT THAT POINT THIS FIXED THE MESSAGE, NOT THE KERNEL.** The number of shapes
+  on which this kernel's output had been compared with the CPU reference was
+  still ZERO. A user on `sm_12xa` got a refusal that says which dimension and
+  which granularity instead of `Invalid`, and that was the whole of the
+  improvement. **That sentence is no longer the position** -- the second run
+  below is what closed it, and it is recorded here rather than deleted because
+  the repair and the measurement of the repair are two different events.
+
+  **The capability gap this makes explicit.** DSV3's `kv_a_proj_with_mqa` is
+  `N=576`, and this arm CANNOT serve it on sm120 -- not as a defect of this
+  tree, and not repairable here, until CUTLASS's sm120 collective supports
+  partial scale blocks. A user learns this from three places, and the first is
+  the one they will actually hit: the runtime refusal message, which names
+  `kv_a_proj_with_mqa`, the arithmetic `576 = 4*128 + 64`, the sm90 contrast and
+  this issue. The other two are `docs/FEATURES.md`'s block-wise FP8 row and the
+  block-wise FP8 section of this model's user-facing page -- in
+  `docs/models/qwen3-8-27b.md` since
+  [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved the public
+  documentation out of `docs/USAGE.md`. Any model whose block-wise FP8
+  projections are not all multiples of 128 wide is affected the same way.
+
+  What the first run left established was the compile leg and the host-side
+  dispatch decision. What it did NOT establish was that the kernel produces the
+  reference's numbers on **ANY** shape: the only two cases that compare device
+  output against the CPU reference are G2 and G7, and both threw before their
+  first assertion; G7's sweep aborted at `Grid()[0]` -- the same M=32 N=576
+  K=7168 case, as its `CAPTURE` output records -- so its remaining shapes,
+  including the second ragged-N entry M=8 N=576 K=1024, were never attempted.
+  The one shape the kernel ran to completion was G8's M=8 N=512 K=1024, and G8
+  compares a device f32 out against a device bf16 out, which is the kernel
+  against itself and never against `ReferenceBf16`. **That debt is what the
+  second run closed.**
+
+  **CONFIRMED ON HARDWARE, AND THE ZERO-COMPARISON DEBT IS CLOSED.** Measured
+  2026-08-20 on `dgx:gpu0` (NVIDIA GB10, driver 580.173.02, compute capability
+  12.1) in an `rc` lease, at tree
+  `7481a2eecbb26b3d5c977e8707b0384994caf136` -- an ancestor of `main`, and one
+  that carries [#1453](https://github.com/mudler/vllm.cpp/pull/1453), which the
+  job asserted by grepping for `kFp8BlockScaledScaleBlockN` before it built.
+  CUDA 13.0 Release, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+  -DVLLM_CPP_CUTLASS_FETCH=ON`. **The suite ran UNPATCHED**, so the tree's own
+  `expect` column was the prediction rather than a hand-edited probe:
+
+  ```text
+  [doctest] test cases:   5 |   5 passed | 0 failed | 0 skipped
+  [doctest] assertions: 136 | 136 passed | 0 failed |
+  [doctest] Status: SUCCESS!
+  REFERENCE_TIER_LINES=0   TEST_RC=0
+  ```
+
+  **Why this is an execution and not a skip wearing a pass.** A device-free run
+  of this file prints **41** assertions, and that number is derived from the
+  source rather than assumed: G6 carries no `HasCuda()` guard and contributes 40
+  (10 grid entries x 3 `CHECK`, then 4 partition, 3 tile-config, 1 N-floor and 2
+  swapped/unswapped checks), and G2's host half contributes the 1 `CHECK` that
+  precedes its guard, while G7, G8 and G9 return before their first assertion.
+  So **95 of the 136 ran on the board**, and that delta -- 136 against 41 -- is
+  the discriminator. **The job's own assertion floor is INERT and is not
+  evidence.** `run5.sh` exits `RESULT=VOID` below 38, a number sized for the
+  27-assertion skip of the pre-#1453 file; #1453 grew the host tier to 41, which
+  clears 38, so the guard can no longer fire on this file. A run whose
+  `nvidia-smi` succeeds on the host while the CUDA backend throws inside the
+  container would print 41 assertions, `TEST_RC=0`, `REFERENCE_TIER_LINES=0` and
+  `RESULT=CONFIRMED`, and only the 136-against-41 delta separates that from this
+  one. The verdict stands on the delta; the floor is recorded as inert so that
+  nobody credits it twice. **Zero
+  `[vt reference-tier]` lines**, so the op was registered and nothing fell
+  through to the portable host kernel -- the failure mode that produced a
+  SIGSEGV and a wrong headline on an earlier attempt at this measurement. The
+  configure step aborts on `CUTLASS headers NOT found`, so the TU cannot have
+  quietly left the build. Evidence: `run5.log`, `test5.out`, `configure5.log`
+  and `build5.log` in the job's `fp8block-g2` output directory, written by
+  `run5.sh`, which also records the prediction it was testing.
+
+  **The root cause is confirmed.** #1453 encoded the prediction into the tree:
+  `Grid()` carries a hand-written `expect` column derived from CUTLASS's source,
+  G6 asserts the grid's PARTITION rather than "everything is accepted", and G7
+  drives every unservable shape to a named refusal instead of aborting at entry
+  zero. All four unservable entries came back refused BY NAME -- the three
+  ragged-N shapes `{32,576,7168}`, `{8,576,1024}` and `{512,576,1024}`, which
+  between them span the swapped and the unswapped path, and the ragged-K shape
+  `{8,512,1088}`, which fails a DIFFERENT line of `can_implement` and is
+  therefore the independent check rather than a repetition -- and every
+  complete-scale-block entry was served. A wrong reading of the collective would
+  have failed G6's partition and said which entry.
+
+  **SEVEN shapes are now compared against the CPU reference, where the count was
+  ZERO.** G7 compared its six servable grid entries -- `{1,512,1024}`,
+  `{7,512,1024}`, `{83,512,1024}`, `{200,512,1024}`, `{512,512,1024}` and the
+  N-floor probe `{200,128,1024}`, which between them exercise all three tile
+  configs -- and G2 ran upstream's own fixture, criterion and formula on
+  `{32,512,7168}`, the nearest servable N to upstream's 576. **This is the first
+  evidence that this kernel computes correct values on any shape.**
+
+  **What the run does NOT establish, stated so that no later reader widens it.**
+  It is **not a token gate**: it compares this arm against the CPU reference on
+  seven shapes and adjudicates no token against any oracle. The token gate is a
+  separate measurement, it RAN on 2026-08-23 and it PASSED, and this run is not
+  what established it -- see
+  [`gate-qwen38-27b-fp8-block.md`](gate-qwen38-27b-fp8-block.md). There is **no speed claim of any kind**: the lease took no
+  clock control, recorded no contention and had no denominator, so per
+  `.agents/benchmarking.md` no ratio from this run would mean anything. It is
+  **not "correct on every shape"** -- it is correct on this grid, which spans
+  all three tile configs and both the swapped and the unswapped path, and it
+  says nothing about a shape outside it. And the **capability gap STANDS**:
+  DSV3's `kv_a_proj_with_mqa` is `N=576` and remains unservable by this arm on
+  sm120 until CUTLASS's sm120 collective supports partial scale blocks, which is
+  an upstream limitation and not a defect in this tree.
+- **A CUDA build without CUTLASS headers SEGFAULTS on this path rather than
+  refusing by name.** Found in the same session and tracked by
+  [#1435](https://github.com/mudler/vllm.cpp/issues/1435): with the TU absent,
+  `kMatmulFp8BlockScaled` is unregistered for `kCUDA`, a device tensor reaches
+  the portable host kernel, and the process dies -- while the reference tier
+  prints "correct but slow". `VLLM_CPP_CUTLASS_FETCH` defaults `OFF` and CUTLASS
+  is not a submodule, so a plain clone plus `-DVLLM_CPP_CUDA=ON` reproduces it.
+  The same issue records that `vt_cuda_report_feature` prints
+  `cutlass-fp8: ENABLED` for a build in which no FP8 CUTLASS TU is compiled.
+- ~~**No token gate.**~~ **DISCHARGED 2026-08-23.**
+  `Qwen/Qwen3.8-27B-FP8` HAS now been run against the pinned oracle on this arm,
+  on `dgx:gpu0`: seven prompts x 16 tokens, greedy, both arms on the same staged
+  bytes, six token-identical at all 16 positions and the seventh adjudicated
+  `IN_BAND` at rank 1 with a logprob difference of exactly 0.
+  `TOKEN_VERDICT=PASS`, `RESULT=PASS`, `DONE_MARKER rc=0`, with
+  `REFERENCE_TIER_LINES=0`, an `sm_121a` cubin read off the artifact, and
+  `bytes_per_element=1.000000` over 400 resident tensors. `GATE-QWEN38-27B-FP8-BLOCK`
+  owns it and [`gate-qwen38-27b-fp8-block.md`](gate-qwen38-27b-fp8-block.md)
+  carries every number. **The pass bounds itself**: it dispatched swap_ab only,
+  because decode runs at `M = 1`, so pingpong and default stay unexercised on the
+  model path and this file's seven-shape comparison remains their only coverage.
+  And it produced NO speed number, so the confirmation run's caveat on that axis
+  is unchanged.
+- ~~**Comments in `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` still say the arm
+  has never run on a device.**~~ **CORRECTED**, under
+  [#1490](https://github.com/mudler/vllm.cpp/issues/1490). Six sites asserted
+  the pre-measurement position after the confirmation run had closed it: the
+  FILE HEADER, which opened "THIS FILE HAS NEVER RUN AGAINST A DEVICE" and added
+  that "no number produced here appears in any document as a measurement" --
+  doubly false, because the 5/136/0 result appears both in this section and on
+  the user-facing page -- `docs/USAGE.md` when the six sites were enumerated,
+  `docs/models/qwen3-8-27b.md` since
+  [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved it; G2's header
+  block, which read "Half 2 is NOT evidence that
+  the arm works: it has never run on a device"; and the four `NO CUDA DEVICE`
+  messages that G2, G7, G8 and G9 print, each of which read "#1189 M5's
+  on-hardware leg is OWED, not passed". They stood because the change that
+  recorded the second run under
+  [#1437](https://github.com/mudler/vllm.cpp/issues/1437) is records-only and
+  edits no compiled or test source.
+
+  The correction is comment-and-message text only: no assertion was deleted,
+  weakened or added, and the device-free assertion count is unchanged at 41. The
+  four `MESSAGE` strings keep their job -- on a device-free host the case
+  genuinely did not run and a skip is not a pass -- and now say the case did not
+  run HERE and name where the on-hardware result is recorded, instead of
+  claiming the leg is still owed. The header and G2's block carried three
+  caveats unweakened at that date: NO token gate, NO speed claim of any kind, and
+  correctness established on the SEVEN shapes actually run rather than on a
+  class, together with the standing `kv_a_proj_with_mqa` N=576 capability gap.
+  **The first of those three has since been discharged and the header was
+  corrected again**, in the change that recorded the 2026-08-23 token-gate pass;
+  the header now says this FILE is not a token gate and names the row that is.
+  The other two caveats are unchanged. A seventh site
+  was found by sweeping the file rather than by working the list: the header's
+  "WHAT IT MEASURES WHEN IT DOES RUN" was the conditional framing that paired
+  with the removed headline, and it now reads "WHAT IT MEASURES ON A DEVICE".
+  One occurrence was deliberately LEFT: G7's "seven of eight shapes were never
+  attempted at all" is correct past-tense narrative about the FIRST run's abort
+  at `Grid()[0]`, at a tree whose grid held eight entries.
+- **No speed claim.** None is made anywhere in this row. Both hardware runs
+  above took a lease for CORRECTNESS only: neither took clock control, neither
+  recorded contention and neither had a denominator — the three things
+  `.agents/benchmarking.md` requires before a ratio means anything.
 - **A `sm_12xa` CUDA user is no longer refused.** Registering the arm narrows
-  M4's `Prepare` refusal automatically. Until the run above happens, the arm is
-  BUILD-VERIFIED ONLY, in the same sense `cmake/CudaArchFeatures.cmake` already
-  labels `scaledmm-c3x-sm90` and `cutlass-nvfp4-sm100`. `docs/USAGE.md` and
-  `docs/FEATURES.md` carry that label rather than a capability claim.
+  M4's `Prepare` refusal automatically. Both runs above have now happened, so
+  BUILD-VERIFIED ONLY is not the right label and neither is RUN AND FAILING;
+  the user-facing page and `docs/FEATURES.md` are corrected in the same change
+  that records each run. Those corrections landed in `docs/USAGE.md`, and
+  [#1491](https://github.com/mudler/vllm.cpp/pull/1491) has since moved that
+  page's block-wise FP8 section to `docs/models/qwen3-8-27b.md`, which is where
+  the user-facing claim lives now. Both say that the arm serves only
+  `N % 128 == 0` and `K % 128 == 0`, that it MATCHES the CPU reference on the
+  seven shapes it was run on, and that it has NO speed number. **Both were
+  updated again** when the token gate passed on 2026-08-23, so neither still says
+  the arm has none.
+  Whichever page carries this arm's user-facing claim may not state one wider
+  than that -- the constraint binds the claim, not the path, because this is the
+  second time in one day that a path in this spec has gone stale under a
+  concurrent landing.
 - **The column-major and TMA-aligned activation-scale layouts**
   (`utils/fp8_utils.py:610-628`), which `vt::QuantFp8Group` could emit and does
   not. M1 shipped row-major only and recorded both as owed; M2 repeated it.
@@ -469,6 +826,14 @@ alone**. G2, G7, G8 and G9 each report `assertions: 0` under a `-tc` filter and
 each printed `NO CUDA DEVICE: ... #1189 M5's on-hardware leg is OWED, not
 passed.` **`assertions: 0` is a skip wearing a pass**, and it is recorded here as
 the measurement it is: the load-bearing comparison of this row did not run.
+
+This whole section is the `27d5432f9` HOST run and stays as written. It is not
+superseded by the two later device runs in `## Owed`; it is the CONTROL for the
+FIRST of them. The 27-assertion figure here is the measured pure-skip count of
+this file **at `27d5432f9`**, which is why `## Owed` can say that 27 of the
+first device run's 34 assertions prove nothing about a device. It is NOT the
+control for the second run: #1453 grew the host tier of this file to 41, and
+that is the baseline the second run's 136 is measured against.
 
 | Block | Cases | Assertions | What that means |
 |---|---:|---:|---|

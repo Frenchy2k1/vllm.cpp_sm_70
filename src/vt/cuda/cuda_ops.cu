@@ -3230,12 +3230,24 @@ void AttentionDenseFastKernelCuda(Queue& q, Tensor& out, const Tensor& query, co
 // untouched. One q-head per CTA (all warps share the same GQA kv-head g).
 constexpr int kFlashBr = 16;  // query-warps per CTA (= K/V global-read reuse factor)
 constexpr int kFlashBc = 64;  // key/value columns streamed per shared-memory tile
+// The register blocking: head_dim elements each of the 32 lanes holds. It lives at
+// file scope rather than inside the kernel body precisely so the static_assert below
+// can READ it -- a per-kernel local is invisible here, and asserting the literal 8
+// instead would compare the header's constant against a number nothing else uses.
+constexpr int kFlashMaxPerLane = 8;  // head_dim up to 8 * 32
+// The head_dim bound this kernel advertises is computed in include/vt/ops.h so a box
+// with no GPU can execute it. These tie the two together: change the tile width or the
+// register blocking here and the arithmetic there stops describing this kernel, which
+// is how the op came to advertise a head_dim it could not launch (#1544).
+static_assert(kFlashBc == kAttentionDenseFlashTileCols,
+              "AttentionDenseFlashSmemBytes must use this kernel's tile width");
+static_assert(kFlashMaxPerLane * 32 == kAttentionDenseMaxHeadDim,
+              "kFlashMaxPerLane * warp size must equal the advertised register bound");
 
 template <typename Tin, typename Tout>
 __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin* key,
                                           const Tin* value, int64_t hq, int64_t hk, int64_t d,
                                           int64_t t, float scale, bool causal) {
-  constexpr int kMaxPerLane = 8;  // head_dim up to 256
   extern __shared__ __align__(16) char flash_smem[];
   Tin* sK = reinterpret_cast<Tin*>(flash_smem);
   Tin* sV = sK + static_cast<int64_t>(kFlashBc) * d;
@@ -3250,10 +3262,10 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
   const int npl = static_cast<int>((d + 31) / 32);  // head_dim elements this lane owns
 
   // This warp's query row, in registers (identical layout to AttentionWarpKernel).
-  float qreg[kMaxPerLane];
-  float acc[kMaxPerLane];
+  float qreg[kFlashMaxPerLane];
+  float acc[kFlashMaxPerLane];
 #pragma unroll
-  for (int k = 0; k < kMaxPerLane; ++k) {
+  for (int k = 0; k < kFlashMaxPerLane; ++k) {
     qreg[k] = 0.0f;
     acc[k] = 0.0f;
   }
@@ -3294,7 +3306,7 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
       const int64_t base = j * d;
       float part = 0.0f;
 #pragma unroll
-      for (int k = 0; k < kMaxPerLane; ++k) {
+      for (int k = 0; k < kFlashMaxPerLane; ++k) {
         const int e = lane + 32 * k;
         if (k < npl && e < d) part += qreg[k] * Load(sK, base + e);
       }
@@ -3305,7 +3317,7 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
       const float corr = expf(m - m_new);
       const float p = expf(s - m_new);
 #pragma unroll
-      for (int k = 0; k < kMaxPerLane; ++k) {
+      for (int k = 0; k < kFlashMaxPerLane; ++k) {
         const int e = lane + 32 * k;
         if (k < npl && e < d) acc[k] = acc[k] * corr + p * Load(sV, base + e);
       }
@@ -3328,10 +3340,40 @@ void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query,
   const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
   const int64_t hk = key.shape[1];
   if (t == 0 || hq == 0 || d == 0) return;
-  VT_CHECK(d <= 256, "cuda attention-dense-flash: head_dim <= 256 only");
+  // The honest bound, not the register bound. `kFlashMaxPerLane` allows head_dim 256, but
+  // the K/V tile below asks for `2*kFlashBc*d*sizeof(Tin)` bytes of DYNAMIC shared
+  // memory, and no `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemory
+  // Size, ...)` exists anywhere in src/vt/cuda/ — so the driver caps the request at
+  // its default 48 KiB and the real ceiling is 192 (bf16) / 96 (f32). This op used to
+  // advertise `d <= 256` and hand a wider caller a bare launch failure from the
+  // `cudaGetLastError` at the bottom of this function, naming nothing it could do
+  // about it (#1544). REFUSING here rather than falling back to AttentionDenseFast is
+  // deliberate: that rung re-reads K and V from global once per (query, head), which
+  // is the exact redundancy this kernel exists to remove, so taking it silently would
+  // be an unannounced slowdown. Name it and let the caller choose.
+  const int64_t dmax = AttentionDenseFlashMaxHeadDim(static_cast<int64_t>(sizeof(Tin)));
+  VT_CHECK(d <= dmax,
+           std::string("cuda attention-dense-flash: head_dim ") + std::to_string(d) +
+               " needs " +
+               std::to_string(AttentionDenseFlashSmemBytes(
+                   d, static_cast<int64_t>(sizeof(Tin)))) +
+               " bytes of dynamic shared memory, over CUDA's default cap of " +
+               std::to_string(kCudaDefaultDynamicSmemBytes) +
+               "; this kernel serves head_dim <= " + std::to_string(dmax) +
+               " for this input dtype. Use vt::AttentionDenseFast, which uses no "
+               "shared memory and serves head_dim <= " +
+               std::to_string(kAttentionDenseMaxHeadDim));
   const unsigned nblk = static_cast<unsigned>((t + kFlashBr - 1) / kFlashBr);
   const dim3 grid(nblk, static_cast<unsigned>(hq));
-  const size_t shmem = static_cast<size_t>(2) * kFlashBc * d * sizeof(Tin);  // sK + sV
+  // The request the guard above admitted. They are two functions, and
+  // AttentionDenseFlashMaxHeadDim RE-DERIVES the division rather than inverting
+  // AttentionDenseFlashSmemBytes, so agreement is a property to be tested, not one
+  // the code makes structural. tests/vt/test_ops_attention.cpp pins it in both
+  // directions at the inclusive edge; mutating the `2 *` in SmemBytes to `3 *` turns
+  // those cases RED, which is what keeps the two halves honest. Open-coding the byte
+  // count here instead is how this contract drifted the first time.
+  const size_t shmem = static_cast<size_t>(
+      AttentionDenseFlashSmemBytes(d, static_cast<int64_t>(sizeof(Tin))));  // sK + sV
   switch (out.dtype) {
     case DType::kF32:
       AttentionDenseFlashKernel<Tin, float><<<grid, kFlashBr * 32, shmem, s>>>(
@@ -3369,12 +3411,34 @@ void AttentionDenseFlashKernelCuda(Queue& q, Tensor& out, const Tensor& query, c
 // serial-latency-bound; FA-2 replaces that with an `mma.sync` block reduction, and it
 // is the kernel vLLM itself dispatches for this shape.
 //
-// The fast path is deliberately NARROW — bf16, head_dim 64, non-causal, MHA, and the
-// vendored kernels compiled in — because head_dim 64 non-split is the only extra
-// instantiation this change compiles. Anything else falls through to
-// AttentionDenseFlash, so callers get the best available kernel for their shape rather
-// than a hard refusal, and every non-encoder caller of this op is byte-identical to
+// The fast path is bf16, head_dim 64 or 128, non-causal, MHA, and the vendored
+// kernels compiled in — the set of compiled NON-SPLIT instantiations, which is
+// `run_mha_fwd_<bfloat16_t, {64,128}, false>` and nothing else. head_dim 64 came
+// with the Whisper encoder (multimodal-speed §17); head_dim 128 came with the
+// LTX-2.5 DiT (#1551), whose video stream is 32 heads x 128 over 2352 tokens and
+// which could not reach a tensor core until it existed. Anything outside that set
+// falls through to AttentionDenseFlash, and every such caller is byte-identical to
 // the flash-tiled path by construction.
+//
+// WIDENING THIS GATE IS NOT FREE AND MUST NOT BE GUESSED. The head dim is a
+// template parameter: admitting one the vendored TU does not instantiate is a link
+// error at best, and admitting a shape the launcher's other guards do not cover is
+// a wrong answer. Add the instantiation and its CMake entry first, then this test.
+//
+// The fall-through is not a promise that every shape runs. AttentionDenseFlash has
+// its own head_dim domain — the K/V tile's shared-memory request against CUDA's
+// default 48 KiB cap, so 192 in bf16 and 96 in f32 (#1544) — and refuses above it
+// naming vt::AttentionDenseFast. A shape wider than that reaches a NAMED refusal
+// through here, not a kernel.
+//
+// The two domains are NOT nested, and #1551 is what makes that matter. The vendored
+// launcher raises its own dynamic shared-memory cap
+// (flash_attn/src/flash_fwd_launch_template.h:85-88), so the FA-2 arm has no 48 KiB
+// bound at all, while the fall-through arm does. bf16 head_dim 128 is inside both.
+// f32 head_dim 128 is inside NEITHER — f32 is not an FA-2 shape and its 65,536 B
+// tile does not fit — so it reaches AttentionDenseFlash's named refusal. That is
+// the LTX-2.5 f32 parity arm at production geometry, already disclosed and owned by
+// #1612; production renders bf16.
 #ifdef VLLM_CPP_FLASH_ATTN
 // Same-binary A/B + RED knob, mirroring VT_FA2_PREFILL / VT_FA2_DECODE
 // (cuda_paged_attn.cu): VT_FA2_DENSE=0 restores the scalar flash-tiled kernel so both
@@ -3389,9 +3453,10 @@ bool Fa2DenseEnabled() {
 void AttentionDenseFa2KernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                  const Tensor& value, const AttentionArgs& args) {
 #ifdef VLLM_CPP_FLASH_ATTN
+  const int64_t fa2_d = query.shape[2];
   const bool fa2_shape = query.dtype == DType::kBF16 && key.dtype == DType::kBF16 &&
                          value.dtype == DType::kBF16 && out.dtype == DType::kBF16 &&
-                         query.shape[2] == 64 && key.shape[1] == query.shape[1] &&
+                         (fa2_d == 64 || fa2_d == 128) && key.shape[1] == query.shape[1] &&
                          value.shape[1] == query.shape[1] && !args.causal;
   if (fa2_shape && Fa2DenseEnabled()) {
     // args.causal is false here (fa2_shape requires !args.causal); it is threaded
@@ -3553,6 +3618,246 @@ void FusedChainKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& 
   }
 }
 
+// ---------------------------------------------------------------------------
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314) — the
+// CUDA MIRROR of the CPU reference `DFlashGroupedConvKernel` (cpu_ops.cpp),
+// which carries the full port note and the upstream anchor.
+//
+// One thread per (row, channel). Every step is elementwise, so this kernel has
+// NO reduction-order freedom and is asserted BIT-IDENTICAL to the CPU reference
+// rather than within an envelope
+// (tests/vt/test_ops_dflash2_grouped_conv.cpp).
+//
+// The two rounding helpers are `__fadd_rn`/`__fmul_rn` rather than `+`/`*` on
+// purpose: on the f32 arm `ResRound` is the identity, so `acc + k * x` is an
+// FMA contraction pattern and nvcc would fuse it by default, which the CPU
+// reference (built with `-ffp-contract=off`) does not. The intrinsics forbid
+// the contraction, so the two arms answer the same bits.
+template <typename T>
+__global__ void DFlashGroupedConvKernel(T* out, const T* x, const T* coefficients, const T* base,
+                                        int64_t rows, int64_t h, int64_t taps, int64_t groups,
+                                        int64_t gsize, int64_t sides, int64_t side,
+                                        int64_t block, bool pot) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * h) return;
+  const int64_t i = idx / h;
+  const int64_t c = idx - i * h;
+  const int64_t g = c / gsize;
+  const int64_t pos = pot ? (i & (block - 1)) : (i % block);
+  float acc = 0.0f;
+  for (int64_t t = 0; t < taps && t <= pos; ++t) {
+    const float b = Load(base, (side * taps + t) * h + c);
+    const float d = Load(coefficients, ((i * sides + side) * taps + t) * groups + g);
+    const float k = ResRound<T>(__fadd_rn(b, d));
+    const float term = ResRound<T>(__fmul_rn(k, Load(x, (i - t) * h + c)));
+    acc = (t == 0) ? term : ResRound<T>(__fadd_rn(acc, term));
+  }
+  Store(out, idx, acc);
+}
+
+void DFlashGroupedConvKernelCuda(Queue& q, Tensor& out, const Tensor& x,
+                                 const Tensor& coefficients, const Tensor& base,
+                                 const DFlashGroupedConvArgs& args) {
+  const int64_t rows = x.shape[0];
+  const int64_t h = args.num_groups * args.group_size;
+  const int64_t sides = coefficients.shape[1];
+  const int64_t n = rows * h;
+  if (n == 0) return;
+  constexpr int kBlock = 256;
+  const int64_t grid = (n + kBlock - 1) / kBlock;
+  const bool pot = (args.block_size & (args.block_size - 1)) == 0;
+  cudaStream_t s = AsStream(q);
+  switch (x.dtype) {
+    case DType::kF32:
+      DFlashGroupedConvKernel<float><<<static_cast<unsigned>(grid), kBlock, 0, s>>>(
+          out.Ptr<float>(), x.Ptr<float>(), coefficients.Ptr<float>(), base.Ptr<float>(), rows, h,
+          args.taps, args.num_groups, args.group_size, sides, args.side, args.block_size, pot);
+      break;
+    case DType::kBF16:
+      DFlashGroupedConvKernel<__nv_bfloat16><<<static_cast<unsigned>(grid), kBlock, 0, s>>>(
+          out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(), coefficients.Ptr<__nv_bfloat16>(),
+          base.Ptr<__nv_bfloat16>(), rows, h, args.taps, args.num_groups, args.group_size, sides,
+          args.side, args.block_size, pot);
+      break;
+    default:
+      VT_CHECK(false, "cuda dflash2-grouped-conv: unsupported dtype (f32/bf16 only)");
+  }
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-grouped-conv: launch failed");
+}
+
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314) — the CUDA
+// MIRROR of the CPU reference `Dflash2SelectorEdgesKernel` (cpu_ops.cpp), which
+// carries the full port note and the upstream anchor.
+//
+// One block per (request, step, predecessor slot). The block first materializes
+// upstream's `predecessors * hidden[:, :, None]` for its own slot into dynamic
+// shared memory — rounded to the codebook dtype, because upstream materializes
+// that tensor — and then block-reduces one rank contraction per child candidate.
+//
+// UNLIKE vt::DFlashGroupedConv this kernel is NOT bit-identical to the CPU
+// reference and is not specified to be: the rank contraction is a REDUCTION, and
+// this tree reduction sums in a different order than the CPU reference's serial
+// loop. It is gated within an f32 envelope. The two ROUNDING PLACEMENTS are
+// still exact — the elementwise product and the single round of the completed
+// sum — because those are what upstream's materializations pin.
+template <typename T>
+__global__ void Dflash2SelectorEdgesKernel(float* scores, const T* pred_codebook,
+                                           const T* succ_codebook, const int64_t* cand,
+                                           const float* unary, const T* hidden,
+                                           const int64_t* anchors, int64_t L, int64_t K,
+                                           int64_t R) {
+  extern __shared__ float gated[];
+  const int64_t slot = blockIdx.x;
+  const int64_t p = slot % K;
+  const int64_t idx = slot / K;  // flattened (b, l)
+  const int64_t b = idx / L, l = idx - b * L;
+  const int64_t pid = (l == 0) ? anchors[b] : cand[(b * L + (l - 1)) * K + p];
+  for (int64_t r = threadIdx.x; r < R; r += blockDim.x)
+    gated[r] = ResRound<T>(__fmul_rn(Load(pred_codebook, pid * R + r),
+                                     Load(hidden, idx * R + r)));
+  __syncwarp();
+  for (int64_t c = 0; c < K; ++c) {
+    const int64_t cid = cand[idx * K + c];
+    float acc = 0.0f;
+    for (int64_t r = threadIdx.x; r < R; r += blockDim.x)
+      acc += gated[r] * Load(succ_codebook, cid * R + r);
+    // ONE WARP per block, so the contraction reduces with __shfl_xor_sync and
+    // needs no shared scratch and no __syncthreads inside this loop.
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    if (threadIdx.x == 0)
+      scores[idx * K * K + p * K + c] = unary[idx * K + c] + ResRound<T>(acc);
+  }
+}
+
+void Dflash2SelectorEdgesKernelCuda(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                                    const Tensor& succ_codebook, const Tensor& candidate_ids,
+                                    const Tensor& unary, const Tensor& hidden,
+                                    const Tensor& anchors,
+                                    const Dflash2SelectorEdgesArgs& args) {
+  const int64_t B = candidate_ids.shape[0], L = candidate_ids.shape[1];
+  const int64_t K = args.top_k, R = pred_codebook.shape[1];
+  const int64_t blocks = B * L * K;
+  if (blocks == 0) return;
+  constexpr int kThreads = 32;  // ONE warp: the contraction reduces by shuffle
+  const size_t shared = static_cast<size_t>(R) * sizeof(float);
+  cudaStream_t s = AsStream(q);
+  switch (pred_codebook.dtype) {
+    case DType::kF32:
+      Dflash2SelectorEdgesKernel<float>
+          <<<static_cast<unsigned>(blocks), kThreads, shared, s>>>(
+              scores.Ptr<float>(), pred_codebook.Ptr<float>(), succ_codebook.Ptr<float>(),
+              candidate_ids.Ptr<int64_t>(), unary.Ptr<float>(), hidden.Ptr<float>(),
+              anchors.Ptr<int64_t>(), L, K, R);
+      break;
+    case DType::kBF16:
+      Dflash2SelectorEdgesKernel<__nv_bfloat16>
+          <<<static_cast<unsigned>(blocks), kThreads, shared, s>>>(
+              scores.Ptr<float>(), pred_codebook.Ptr<__nv_bfloat16>(),
+              succ_codebook.Ptr<__nv_bfloat16>(), candidate_ids.Ptr<int64_t>(),
+              unary.Ptr<float>(), hidden.Ptr<__nv_bfloat16>(), anchors.Ptr<int64_t>(), L, K, R);
+      break;
+    default:
+      VT_CHECK(false, "cuda dflash2-selector-edges: unsupported dtype (f32/bf16 only)");
+  }
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-selector-edges: launch failed");
+}
+
+// MIRROR of the CPU reference `Dflash2PathWalkKernel` (cpu_ops.cpp), which
+// carries the full port note. `Dflash2PathWalkArgs` (include/vt/ops.h) carries
+// the contract.
+//
+// ONE BLOCK PER REQUEST, which is upstream's own grid: `_selector_walk_kernel`
+// launches `(num_reqs,)` programs with `num_warps=1` and keeps the step loop
+// INSIDE the program, so a k-token block costs one launch instead of k. Spec
+// `## Risks/decisions` D3 requires that shape from the first landing -- the same
+// sequential walk shipped host-side in DSpark and measured 28% of the 27B draft
+// step (#436) before it was moved.
+//
+// The block is one warp. `previous` is a per-thread register that every lane
+// computes identically from the same shuffle reduction, so the carry needs no
+// shared memory and no __syncthreads: after the __shfl_xor_sync butterfly every
+// lane holds the same winner.
+//
+// BIT-EXACT with the CPU arm by construction, unlike Dflash2SelectorEdgesKernel:
+// there is no arithmetic here to reorder, only comparisons and a gather. The
+// reduction is seeded the same way on both arms (-inf with slot index `top_k`,
+// strict `>`), which is what makes the all -inf row, the tie rows and a
+// NaN-bearing row agree rather than merely usually agreeing.
+//
+// WHERE THE TIE RULE LIVES IS NOT ARBITRARY. The per-lane scan is STRICT ONLY,
+// because `j` ascends within a lane and a strict `>` therefore already keeps
+// the LOWEST-indexed maximum -- the CPU arm's answer, reached the CPU arm's
+// way. The lower-slot preference belongs to the cross-lane BUTTERFLY, which
+// combines lane winners in no particular slot order and would otherwise resolve
+// a tie by lane geometry. Until W4's fresh review the lane scan ALSO carried
+// `|| (v == best && j < slot)`. That clause is unreachable once a lane has
+// claimed anything, so its only effect was at the SEED: a lane holding -inf
+// compared equal to the -inf seed and claimed a slot, which the CPU arm's
+// strict scan refuses. On a NaN-bearing row the arms then answered differently
+// (`[NaN,-inf]` read cpu 0 / cuda 1) while every NaN-free row still agreed, so
+// no fixture without a NaN could see it. The clause is deleted rather than the
+// bit-exactness claim narrowed. THE DELETION IS VERIFIED, and #1518 corrects an
+// earlier sentence here calling it unverified: this translation unit is
+// compiled for ten architectures by CI's `build-cuda-fat` job on every pull
+// request, and the operator RAN `test_ops_dflash2_path_walk` on `dgx:gpu0`
+// (GB10, sm_121a) at the W4 merge commit -- 83 assertions on device against 49
+// on CPU, `Status: SUCCESS!`, zero `no CUDA backend; skipping` lines, the NaN
+// row among them. The AUTHORING HOST has no `nvcc` and still skips the case
+// locally, and the remainder of `## Owed` O11 in
+// .agents/specs/dflash2-spec-decode.md stands.
+__global__ void Dflash2PathWalkKernel(int64_t* tokens, const float* scores,
+                                      const int64_t* cand, int64_t L, int64_t K) {
+  const int64_t b = blockIdx.x;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int width = static_cast<int>(blockDim.x);
+  int64_t previous = 0;
+  for (int64_t l = 0; l < L; ++l) {
+    const int64_t flat = b * L + l;
+    const float* row = scores + (flat * K + previous) * K;
+    float best = -CUDART_INF_F;
+    int slot = static_cast<int>(K);
+    for (int64_t j = lane; j < K; j += width) {
+      const float v = row[j];
+      // STRICT `>` and nothing else, which is the CPU arm's own scan: `j`
+      // ascends, so the first maximum a lane meets is the lowest-indexed one it
+      // holds. A `v == best` arm here would let a lane claim a slot on the -inf
+      // seed, which is where the two arms used to part on a NaN row.
+      if (v > best) {
+        best = v;
+        slot = static_cast<int>(j);
+      }
+    }
+    // The lower slot wins an exact tie HERE, because lanes combine out of slot
+    // order. `best == -inf` implies `slot == top_k` on every lane (the strict
+    // scan above never claims on -inf), so the tie arm compares real slots or
+    // two seeds and never a real slot against a seed.
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+      const int os = __shfl_xor_sync(0xFFFFFFFFu, slot, off);
+      if (ov > best || (ov == best && os < slot)) {
+        best = ov;
+        slot = os;
+      }
+    }
+    if (slot == static_cast<int>(K)) slot = 0;  // an all -inf (fully masked) row
+    previous = slot;
+    if (lane == 0) tokens[flat] = cand[flat * K + slot];
+  }
+}
+
+void Dflash2PathWalkKernelCuda(Queue& q, Tensor& tokens, const Tensor& scores,
+                               const Tensor& candidate_ids,
+                               const Dflash2PathWalkArgs& args) {
+  const int64_t B = candidate_ids.shape[0], L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  if (B == 0 || L == 0) return;
+  constexpr int kThreads = 32;  // ONE warp: the argmax reduces by shuffle
+  Dflash2PathWalkKernel<<<static_cast<unsigned>(B), kThreads, 0, AsStream(q)>>>(
+      tokens.Ptr<int64_t>(), scores.Ptr<float>(), candidate_ids.Ptr<int64_t>(), L, K);
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-path-walk: launch failed");
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -3604,6 +3909,15 @@ struct Registrar {
                    static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernelCuda)));
     RegisterOp(OpId::kFusedChain, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernelCuda)));
+    RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernelCuda)));
+    RegisterOp(OpId::kDflash2PathWalk, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2PathWalkFn>(&Dflash2PathWalkKernelCuda)));
+    RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernelCuda)));
   }
 } registrar;
 

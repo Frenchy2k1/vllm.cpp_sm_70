@@ -58,6 +58,13 @@ class Qwen3_5DenseLoadedModel final : public LoadedModel {
   bool supports_mtp_draft() const override { return true; }
   // SPEC-DFLASH / SPEC-DSPARK: this forward routes to ForwardDeviceMultiTap.
   bool supports_aux_multi_tap() const override { return true; }
+  // #1946: LEND the embedding table to a block drafter that shares it, so the
+  // DFlash/DFlash2 draft runs the target's own OwnedTensor and `ResidentWeight`
+  // uploads it once instead of once per tensor. Null before a loader has filled
+  // the table, so a half-built model lends nothing.
+  const OwnedTensor* shared_embed_tokens() const override {
+    return weights_->embed_tokens.Empty() ? nullptr : &weights_->embed_tokens;
+  }
   void AttachMtpDraftWeights(Qwen3_5MTPWeights weights) override {
     mtp_draft_weights_ = std::move(weights);
   }
@@ -109,8 +116,9 @@ void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
   // question is asked at `ModelRegistry::Prepare` — called by every runner
   // before the first forward and before graph capture — so a CUDA user is told
   // here rather than inside the first GEMM or, worse, inside a capture. Inert
-  // on CPU and on every other checkpoint. Milestone M5 removes this with the
-  // kernel it names.
+  // on CPU and on every other checkpoint. M5 (`489a9a4c0`) narrowed rather than
+  // removed it: the CUTLASS kernel covers `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a)
+  // only, and a CUDA arch outside that cell is still refused here by name.
   RefuseUnrunnableQwen3_5DenseFp8Block(
       ModelAs<Qwen3_5DenseLoadedModel>(model,
                                         "Qwen3_5ForConditionalGeneration")

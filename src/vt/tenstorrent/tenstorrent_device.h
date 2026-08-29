@@ -4,7 +4,10 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
+#include <cstdlib>
 #include <memory>
+#include <string_view>
 
 // ttnn::MeshDevice (ttnn/api/ttnn/device.hpp) is a `using` alias for this real
 // type, brought into ttnn:: scope via `using namespace device;` there — the
@@ -13,6 +16,13 @@
 namespace tt::tt_metal::distributed {
 class MeshDevice;
 }  // namespace tt::tt_metal::distributed
+
+// Forward declarations: this header stays light (the backend TU includes
+// only vt/backend.h); the definition links against vt/ops.h types.
+// MSVC C4099 (W-X): the real definitions are structs (vt/tensor.h:15,
+// vt/device.h:107); forward-declaring them as class breaks /WX builds on
+// windows the moment a TU includes vt/ops.h before this header.
+namespace vt { struct Tensor; struct Queue; }
 
 namespace vt::tenstorrent {
 
@@ -24,6 +34,14 @@ using MeshDevice = tt::tt_metal::distributed::MeshDevice;
 // so a Tenstorrent-enabled build on a host with no Blackhole card registers
 // nothing instead of throwing during static init.
 bool DeviceAvailable();
+
+// True iff host-free decode is enabled. Default ON; VT_TT_HOST_FREE_DECODE=0
+// opts out (reproduces the pre-flip default path). No function-local static
+// caching: tests toggle this env per case in one process (#1604).
+inline bool HostFreeDecodeEnabled() {
+  const char* e = std::getenv("VT_TT_HOST_FREE_DECODE");
+  return e == nullptr || std::string_view(e) != "0";
+}
 
 // Opens (lazily, once) and returns the single process-wide mesh device this
 // W0 skeleton targets — device index 0 only, no multi-device mesh. Throws if
@@ -40,6 +58,24 @@ MeshDevice& SharedMeshDevice();
 // cached ttnn::Tensor that still owns device pages for that host pointer.
 // No-ops until the ops registrar has loaded (static init order: backend may
 // Free before ops if a test tears down early — Unregister is tolerant).
+// Defined in tenstorrent_ops.cpp (needs ttnn). Declared here so model TUs
+// can ask for a device-side readback of a staged tensor without linking
+// ttnn themselves. `Queue`/`Tensor` are vt types (vt/ops.h is in scope
+// wherever this header is included after it).
+std::vector<float> DebugDeviceReadbackF32(Queue& q, const Tensor& t);
+// TRUSTED dump: whole tensor, typed header, dual-read verified (see ops.cpp).
+void TrustDump(Queue& q, const char* dir, const char* name, const Tensor& t);
+// Review finding F1 (#1715): these two are defined only in the TT-gated ops
+// TU, but model TUs call them under a RUNTIME env check. Follow the
+// WarmPagedKvShadow pattern: inline no-ops when the backend is not linked,
+// so a default (non-tt-metal) configure of examples still links.
+#ifdef VLLM_CPP_TENSTORRENT
+#else
+inline std::vector<float> DebugDeviceReadbackF32(Queue&, const Tensor&) {
+  return {};
+}
+inline void TrustDump(Queue&, const char*, const char*, const Tensor&) {}
+#endif
 void RegisterHostBuffer(void* host, size_t bytes);
 void UnregisterHostBuffer(void* host);
 // Host bytes at `host` (or any interior pointer into that allocation) were
@@ -116,14 +152,21 @@ inline void WarmPaMeta(const int32_t*, int64_t, int64_t, int64_t, int64_t,
 #endif
 
 // R2 (on-device state advance): seed the persistent cur_pos device tensor
-// (= seq_lens - 1) for this step. Called on the capture/warm step (re-seed),
-// NOT every replay step — the captured plus_one advances it on-device.
-// Also warms the plus_one program (program cache) so CaptureDecodePosAdvance
-// can run inside the trace without a "load new binaries during capture" fatal.
+// (= seq_lens - 1) for this step. Called on every cold/warm/capture step
+// (re-seed), never on a replay step — the captured plus_one advances it
+// on-device. Also warms the plus_one program (program cache) so
+// CaptureDecodePosAdvance can run inside the trace without a "load new
+// binaries during capture" fatal.
 #ifdef VLLM_CPP_TENSTORRENT
-void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs);
+// replay_regime=true: this step replays a captured trace whose plus_one owns
+// the cur_pos advance — do not touch the tensor. replay_regime=false (cold,
+// warm, or capture step): re-seed cur_pos = seq_lens-1 for THIS step. The
+// re-seed is what makes a RE-capture correct (#1476): Reset() releases the
+// trace but the cold eager step that follows runs no plus_one, so without a
+// re-seed the newly captured trace reads cur_pos one position behind.
+void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime);
 #else
-inline void WarmDecodePos(const int32_t*, int64_t) {}
+inline void WarmDecodePos(const int32_t*, int64_t, bool) {}
 #endif
 
 // R2: capture ttnn::plus_one(cur_pos) at the END of the trace body (after all
@@ -187,5 +230,26 @@ void TraceReplay();               // replay the single-slot id
 void* TraceEndCaptureGraph();     // returns an opaque MeshTraceId* (caller owns)
 void TraceReplayGraph(void* graph);
 void TraceDestroyGraph(void* graph);
+
+// ---- BACKEND-TENSTORRENT-GDN W2: GDN state/conv-shadow PCIe traffic counters
+// The spec's Evidence gate requires the "no per-token state round-trip" claim
+// PROVEN by a counter, not assumed. The counters cover ONLY the state /
+// conv-state caches the GDN ops own (decode state, conv state, the gather /
+// scatter cache): bytes the ops themselves upload (h2d) or download (d2h), and
+// one step per kGdnDecode / kCausalConv1dUpdate invocation. A decode replay of
+// T tokens must show steps == T, h2d == exactly ONE upload of the cache, and
+// d2h == 0. Implemented in tenstorrent_ops.cpp; ttnn-free on the no-op arm.
+struct GdnShadowTraffic {
+  uint64_t state_h2d_bytes = 0;  // state/conv cache host→device uploads
+  uint64_t state_d2h_bytes = 0;  // state/conv cache device→host downloads
+  uint64_t decode_steps = 0;     // kGdnDecode + kCausalConv1dUpdate calls
+};
+#ifdef VLLM_CPP_TENSTORRENT
+GdnShadowTraffic GetGdnShadowTraffic();
+void ResetGdnShadowTraffic();
+#else
+inline GdnShadowTraffic GetGdnShadowTraffic() { return {}; }
+inline void ResetGdnShadowTraffic() {}
+#endif
 
 }  // namespace vt::tenstorrent

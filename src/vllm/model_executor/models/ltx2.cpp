@@ -956,6 +956,13 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
       vt::AttentionArgs a;
       a.scale = scale;
       a.causal = false;
+      // VT-ATTN-NAIVE: this is the HOST arm and it is CPU-only by construction —
+      // it computes into `std::vector<float>` — and on CPU `kAttention` and
+      // `kAttentionDenseFlash` are the SAME registered function
+      // (src/vt/cpu/cpu_ops.cpp:3750-3761), so routing it to the fast op would be
+      // a byte-identical no-op that moved the L2 parity reference off the
+      // reference op. The device arm is the one that was slow, and it is swapped
+      // (ltx2_device.cpp, #1549).
       vt::Attention(q, to_t, tq_t, tk_t, tv_t, a);
     } else {
       vt::AttentionCrossArgs a;

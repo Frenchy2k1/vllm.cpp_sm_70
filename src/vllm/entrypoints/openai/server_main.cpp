@@ -10,6 +10,7 @@
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
 //          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
+//          [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]
 //          [--max-num-seqs N] [--max-num-batched-tokens N]
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
@@ -68,7 +69,9 @@
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/config/offload.h"
+#include "vllm/http_transport_abi.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/transformers_utils/model_resolver.h"
 #include <fstream>
 #include "vllm/entrypoints/openai/server_main.h"
 #include "vllm/entrypoints/openai/api_server.h"
@@ -170,6 +173,18 @@ int RunFfmpegArgv(const std::vector<std::string>& args) {
 
 struct Args {
   std::string model_dir;
+  // ENG-HF-MODEL-DOWNLOAD W4 (#1280): what the user TYPED after `--model`,
+  // kept because the resolver replaces `model_dir` with a cache path and the
+  // served model name still defaults to the name the user asked for, exactly
+  // as vLLM's `served_model_name` defaults to `model` (`arg_utils.py:839`).
+  std::string model_argument;
+  // vLLM's own `--revision` (`arg_utils.py:839`, `config/model.py:183`).
+  // Applies to both HuggingFace forms. There is deliberately no inline
+  // `org/repo@rev` syntax, because vLLM does not spell it that way.
+  std::string revision;
+  // vLLM's own `--download-dir` (`config/model.py:183`): the directory that
+  // holds the `models--org--repo` folders.
+  std::string download_dir;
   std::string host = "0.0.0.0";
   int port = 8000;
   std::string tokenizer_config;  // default: <model_dir>/tokenizer_config.json
@@ -190,6 +205,14 @@ struct Args {
   // double pre-filled with 0.92 could not express the difference.
   std::optional<double> gpu_memory_utilization = std::nullopt;
   long long kv_cache_memory_bytes = 0;
+  // --kv-cache-dtype: vLLM CacheConfig.cache_dtype (config/cache.py:19-36,76).
+  // "auto" (the default) uses the model dtype and is byte-identical to before
+  // the flag existed; "fp8"/"fp8_e4m3" stores the paged K/V as 1-byte fp8, which
+  // HALVES the bytes per KV block and so doubles the pool at the same
+  // --kv-cache-memory. The value is resolved against the checkpoint's own
+  // `kv_cache_quant_algo` inside LoadedEngine::FromModelDir, and an explicit
+  // value always beats the checkpoint (torch_utils.py:380-381).
+  std::string kv_cache_dtype = "auto";
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
@@ -256,8 +279,14 @@ struct Args {
   // default → /abort_requests 404s. Enables the /abort_requests production wiring.
   bool enable_server_dev_mode = false;
   bool verbose = false;
-  // Gemma4 HF/vLLM: --default-chat-template-kwargs enable_thinking (default OFF).
-  bool enable_thinking = false;
+  // Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking`.
+  // TRI-STATE, and the third state is the default and the point (#1681):
+  // upstream's own default is `None`, so unless somebody asks, `enable_thinking`
+  // is not a template variable at all and a template that gates on
+  // `{% if enable_thinking is undefined %}` gets its own answer. Storing a plain
+  // `false` here made that test permanently false and silently inverted the
+  // Qwen3.8 family's reasoning default against vLLM and SGLang.
+  std::optional<bool> enable_thinking;
   // Request logging (Python vLLM --enable-log-requests parity). Default ON.
   bool enable_log_requests = true;
   bool enable_log_outputs = false;
@@ -319,6 +348,13 @@ struct Args {
   // an empty map resolve to the 999-per-modality default, so a server started
   // without either flag refuses nothing it used to serve.
   vllm::MultiModalConfig multimodal;
+  // ── The `clip` multimodal projector (row `LOAD-GGUF-MMPROJ`, #821) ────────
+  // llama.cpp's `--mmproj`: the SECOND GGUF file, beside a `.gguf` --model.
+  // Empty (default) == no projector == every load that existed before the row.
+  // Deliberately explicit: a sibling `mmproj*.gguf` is NOT auto-discovered,
+  // because a directory holding two unrelated models must not silently fuse
+  // them.
+  std::string mmproj_path;
 };
 
 // ── Accepted-and-inert serve arguments (SERVE-RECIPE-ARGS, #606) ────────────
@@ -329,11 +365,13 @@ struct Args {
 // argument guard below before a single weight was read.
 //
 // THIS IS NOT A CATCH-ALL, and that is the whole point. A flag that is inert
-// because we LACK the capability -- --tensor-parallel-size, the EP flags,
-// --mm-encoder-tp-mode -- keeps aborting, because silently swallowing it would
-// let a user believe they got tensor parallelism. Only a flag that is inert BY
-// CONSTRUCTION earns an entry, and the per-entry `reason` is the enforcement:
-// an entry that cannot state an honest reason cannot be written.
+// because we LACK the capability -- the EP flags, --mm-encoder-tp-mode --
+// keeps aborting, because silently swallowing it would let a user believe
+// they got the parallel path. (--tensor-parallel-size is no longer on that
+// list: it is parsed and validated below, and tp>1 serve is opt-in via the
+// VT_TP_ALLOW G1 guard.) Only a flag that is inert BY CONSTRUCTION earns an
+// entry, and the per-entry `reason` is the enforcement: an entry that cannot
+// state an honest reason cannot be written.
 //
 // Inert is also not UNVALIDATED. --enable-auto-tool-choice is recorded on Args
 // and still checked against --tool-call-parser after the loop, mirroring
@@ -388,6 +426,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "[--num-blocks N] [--max-model-len N]\n"
          "               [--gpu-memory-utilization F] "
          "[--kv-cache-memory BYTES]\n"
+         "               [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]\n"
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--device auto|cpu|cuda]\n"
@@ -397,6 +436,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--enable-force-include-usage]\n"
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
+         "               [--revision REF] [--download-dir DIR]\n"
          "               [--verbose]\n"
          "               [--enable-thinking|--no-enable-thinking]\n"
          "               [--enable-log-requests|--disable-log-requests]\n"
@@ -414,6 +454,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--tensor-parallel-size N]\n"
          "               [--[no-]language-model-only]\n"
          "               [--limit-mm-per-prompt '<json>']\n"
+         "               [--mmproj <mmproj-*.gguf>]\n"
          "               [--speech-model <checkpoint-dir>] "
          "[--speech-family <name>]\n"
          "               [--speech-device 0|1]\n"
@@ -438,6 +479,11 @@ Args ParseArgs(int argc, char** argv) {
     const std::string flag = argv[i];
     if (flag == "--model") {
       a.model_dir = NextArg(argc, argv, i, argv[0]);
+      a.model_argument = a.model_dir;
+    } else if (flag == "--revision") {
+      a.revision = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--download-dir") {
+      a.download_dir = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--host") {
       a.host = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--port") {
@@ -462,6 +508,8 @@ Args ParseArgs(int argc, char** argv) {
       a.gpu_memory_utilization = std::stod(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--kv-cache-memory") {
       a.kv_cache_memory_bytes = std::stoll(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--kv-cache-dtype") {
+      a.kv_cache_dtype = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--max-model-len") {
       a.max_model_len = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-num-seqs") {
@@ -543,7 +591,7 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--enable-thinking") {
       a.enable_thinking = true;
     } else if (flag == "--no-enable-thinking") {
-      a.enable_thinking = false;
+      a.enable_thinking = false;  // an EXPLICIT false, unlike passing neither
     } else if (flag == "--enable-log-requests") {
       a.enable_log_requests = true;
     } else if (flag == "--disable-log-requests") {
@@ -614,6 +662,15 @@ Args ParseArgs(int argc, char** argv) {
         Usage(argv[0], 2);
       }
       a.tensor_parallel_size = n;
+    } else if (flag == "--mmproj") {
+      // llama.cpp's own spelling for the second file (`b10451`
+      // `tools/mtmd/mtmd-cli.cpp`). NOT validated here: unlike the JSON flags
+      // above, whose value can be refused without touching the disk, this is a
+      // path whose contents decide the answer — and the loader already refuses
+      // it BY NAME before the tokenizer and before any language weight byte, so
+      // a second check here would be a second implementation of the same
+      // refusal rather than an earlier one.
+      a.mmproj_path = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--language-model-only" ||
                flag == "--no-language-model-only") {
       // arg_utils.py:1276 over a bool field, which _compute_kwargs gives
@@ -801,6 +858,43 @@ Args ParseArgs(int argc, char** argv) {
 }
 
 
+// ENG-HF-MODEL-DOWNLOAD W4 (#1280): turn what the user typed after `--model`
+// into a path the loader can open, fetching the checkpoint when it names a
+// HuggingFace repository.
+//
+// THIS IS THE PRODUCTION CALL SITE, and the ONLY one. `vllm-server` reaches
+// `--model` through `VllmServerMain`, so a repository identifier that is not
+// resolved here is not resolved anywhere. Deleting this call leaves the loader
+// opening `org/repo` as a relative path, which is the behavior this row
+// replaces, and the end-to-end case in
+// `tests/vllm/entrypoints/openai/test_serve_hf_model.cpp` turns red.
+//
+// `vllm-cli` deliberately does NOT reach it. That example includes `vllm.h` and
+// nothing else, because an example is an application binary interface client
+// only, and this row adds no ABI function, so `vllm-cli --model org/repo` still
+// takes a local path. It is recorded under `## Owed` in
+// `.agents/specs/hf-model-download.md`.
+//
+// An existing directory and an existing `.gguf` file come back unchanged and
+// open no socket, so a local run is byte-identical to the one before this row.
+void ResolveModelArgument(Args& a) {
+  if (a.model_dir.empty()) return;
+  vllm::transformers_utils::ModelResolveOptions opts;
+  opts.revision = a.revision;
+  opts.download_dir = a.download_dir;
+  opts.verbose = a.verbose;
+  const std::string resolved =
+      vllm::transformers_utils::ResolveModelPath(a.model_dir, opts);
+  if (resolved == a.model_dir) return;
+  // The SERVED name stays the name the user asked for. Without this the
+  // default would become the 40 character commit directory the cache happens
+  // to hold, and no client could name the model it just started.
+  if (a.served_model_name.empty()) a.served_model_name = a.model_argument;
+  std::cerr << "server: --model " << a.model_argument << " resolved to "
+            << resolved << "\n";
+  a.model_dir = resolved;
+}
+
 }  // namespace
 
 namespace vllm {
@@ -809,11 +903,24 @@ namespace openai {
 
 int VllmServerMain(int argc, char** argv) {
   try {
-    const Args args = ParseArgs(argc, argv);
+    // ENG-HF-MODEL-DOWNLOAD W5 (#1280). BEFORE anything is parsed, bound or
+    // fetched: `CPPHTTPLIB_OPENSSL_SUPPORT` is a whole-header switch that
+    // changes the layout of `httplib::Result`, and this binary carries both a
+    // listener and a hub client compiled from that one header. A build that
+    // defined it for some translation units and not for others LINKS CLEANLY
+    // and then corrupts every response object handed across the seam. Refusing
+    // here is the only place a user finds out before a wrong answer.
+    const std::string transport_mismatch = vllm::HttpTransportAbiMismatch();
+    if (!transport_mismatch.empty()) {
+      std::cerr << transport_mismatch << "\n";
+      return 2;
+    }
+    Args args = ParseArgs(argc, argv);
     if (args.verbose) {
       SetEnvironment("VT_SERVER_VERBOSE", "1");
       std::cerr << "server: verbose stage logging enabled (debug_stages)\n";
     }
+    ResolveModelArgument(args);
     {
       vllm::entrypoints::openai::RequestLogConfig log_cfg;
       log_cfg.enable_log_requests = args.enable_log_requests;
@@ -1160,6 +1267,7 @@ int VllmServerMain(int argc, char** argv) {
     engine_params.num_blocks = args.num_blocks;
     engine_params.gpu_memory_utilization = args.gpu_memory_utilization;
     engine_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+    engine_params.kv_cache_dtype = args.kv_cache_dtype;
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
@@ -1227,6 +1335,9 @@ int VllmServerMain(int argc, char** argv) {
     // the byte-identical no-offload path.
     engine_params.offload_config = parsed_offload_config;
     engine_params.weight_residency = parsed_weight_residency;
+    // --mmproj: the second GGUF (LOAD-GGUF-MMPROJ, #821). Empty leaves the
+    // loader on its single-file path, byte-identically.
+    engine_params.mmproj_path = args.mmproj_path;
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The
     // parse validates method/k here; n_predict + the resolved k are finalized in
@@ -1245,6 +1356,24 @@ int VllmServerMain(int argc, char** argv) {
     std::cerr << "server: prefix caching "
               << (loaded->prefix_caching_enabled() ? "enabled" : "disabled")
               << "\n";
+    // #607 L3: what the zero limits actually FREED, read back off the loaded
+    // MODEL rather than off `args`. The limits line above says what was asked
+    // for; this one says what happened, and until L3 the two could differ
+    // completely — the flag was accepted, every limit went to 0, and the tower
+    // was loaded anyway. Printing from `args` would restore exactly that gap,
+    // which is the mistake the weight-residency line records having made
+    // (model_loader.cpp, `ActiveWeightResidencyConfig`). Silent when nothing was
+    // skipped, so a text model and a multimodal model at their default limits
+    // both print nothing new.
+    {
+      const std::vector<std::string> skipped = loaded->skipped_towers();
+      if (!skipped.empty()) {
+        std::cerr << "server: multimodal towers NOT loaded (every modality they "
+                     "serve is at limit 0):";
+        for (const std::string& stage : skipped) std::cerr << " " << stage;
+        std::cerr << "\n";
+      }
+    }
     // W2: the production server uses AsyncLLM over EngineCoreProc's dedicated
     // engine thread. HTTP workers submit independently and stream from their
     // per-request collectors; no server-wide engine mutex remains.
@@ -1287,14 +1416,17 @@ int VllmServerMain(int argc, char** argv) {
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
       const std::string eos =
           tokenizer.EosId() >= 0 ? tokenizer.Decode({tokenizer.EosId()}) : "";
-      chat_prompt_fn =
-          vllm::entrypoints::MakeChatTemplatePromptFn(
-              chat_template, bos, eos, args.enable_thinking);
+      chat_prompt_fn = vllm::entrypoints::MakeChatTemplatePromptFn(
+          chat_template, bos, eos,
+          vllm::entrypoints::DefaultChatTemplateKwargs(args.enable_thinking));
       std::cerr << "server: using chat template (" << chat_template.size()
                 << " chars) from " << tokenizer_config_path
                 << " or sibling chat_template.jinja"
                 << " enable_thinking="
-                << (args.enable_thinking ? "true" : "false") << "\n";
+                << (args.enable_thinking.has_value()
+                        ? (*args.enable_thinking ? "true" : "false")
+                        : "unset (the template's own default)")
+                << "\n";
     } catch (const std::exception& e) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";
